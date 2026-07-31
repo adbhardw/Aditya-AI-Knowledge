@@ -1,0 +1,248 @@
+Billing Event Publish — How It Works for a Hybrid Question Run
+Date: 2026-06-29
+Author: Aditya Bhardwaj
+Context: Understanding pegleg's existing GCP Pub/Sub publish and how billing is generated
+         for a hybrid question running on MEDIUM compute (t-shirt size).
+
+------------------------------------------------------------------------
+
+THE EXAMPLE
+
+  Clean room type:    HYBRID (AWS Databricks TEE)
+  Compute size:       MEDIUM
+  Airflow DAG:        hybrid-aws-databricks-tee-crqr-clean-compute
+
+MEDIUM t-shirt spark config (from tee_util.py):
+  - Initial executors:  30
+  - Max executors:      60
+  - Executor memory:    48g
+  - Executor cores:     4
+  - Driver memory:      24g
+  - Driver cores:       3
+
+------------------------------------------------------------------------
+
+STEP 1 — SPARK JOB RUNS AND WRITES STATS FILE TO S3
+
+  After the Spark query finishes, tee-spark writes a stats .txt file to S3:
+
+    s3://{output-bucket}/tee-output/
+      cleanroom={cleanRoomId}/
+        question={cleanRoomQuestionId}/
+          run={runId}/
+            stats/*.txt
+
+  The stats file is a JSON structure (RunStatistics) containing:
+
+    {
+      "metaDataJson": {
+        "metrics": {
+          "coreHourUsage":    "12.4",        <- CPU core-hours used by all executors
+          "memoryGbHour":     "595.2",       <- GB-hours of memory used
+          "totalInputBytes":  4831838208,    <- bytes read from source datasets
+          "totalOutputBytes": 1048576        <- bytes written to output
+        },
+        "conf": { ... spark config key-values ... },
+        "applicationInfo": {
+          "attempts": [{ "duration": 44700000 }]   <- run duration in ms
+        }
+      },
+      "applicationInfos": [ ... spark app info ... ],
+      "resourceProfiles":  [ ... executor resource info ... ],
+      "explainPlan":       "== Physical Plan == ...",
+      "rowCounts": {
+        "dataset_a": { "count": 1200000, "clientExecution": false },
+        "dataset_b": { "count": 800000,  "clientExecution": false }
+      }
+    }
+
+------------------------------------------------------------------------
+
+ANSWERS TO FOLLOW-UP QUESTIONS (2026-06-30)
+
+Q: Who writes the stats file to S3 — tee-spark or cacofonix/pegleg?
+A: tee-spark writes it. The Spark job writes stats/*.txt to S3 as the last act
+   of the query execution, before it exits. pegleg only READS the file afterward
+   (see HybridTeePostRunConfigService.getRunStatistics() — it is a pure S3 read).
+
+Q: Is PostRunConfigService called from cacofonix?
+A: Yes. cacofonix/habuairflow/dags/tee/aks/meta_tee_crqr.py (line 105) defines:
+     post_query = HabuKubernetesPodOperator(
+         task_id="post_query",
+         cmds=["java", "-cp", ".../pegleg-latest-jar-with-dependencies.jar",
+               "com.habu.pegleg.commands.tee.TeePostRunConfigCommand"]
+     )
+     initialize >> is_run_active() >> query >> post_query
+   Airflow waits for the Spark (query) task to finish, then spawns a Kubernetes
+   pod that runs TeePostRunConfigCommand -> PostRunConfigService.postCRQRunProcess().
+   Same pattern in every TEE DAG (hybrid, AKS, Microsoft, LinkedIn).
+
+Q: Who calls the billing DAG?
+A: It is a SEPARATE cacofonix DAG: send_unsent_metrics_to_billing
+   File: cacofonix/habuairflow/dags/billing/send_unsent_metrics_to_billing.py
+   schedule=None — NOT on a cron (daily midnight is commented out).
+   Triggered manually or by external orchestration, independent of the question
+   run DAG. Runs SendUnsentMetricsToBillingCommand -> BillingService.submitUnsentMetricsToBilling().
+
+Q: If query is complex and processes same rows multiple times, does LR lose on compute?
+A: Yes — this is a real tension. MAX(record_count) per dataset only protects against
+   Spark retries writing duplicate stats entries for the same run. A genuinely complex
+   query (self-joins, window functions, multiple aggregation passes) costs Habu more
+   in AWS compute (extra executors, longer runtime) but the bill to Adidas stays at
+   the same rowAccessCount. Habu absorbs compute variance. The business bet: average
+   query complexity is low and row-based margin covers outliers. The compute metrics
+   (cpuHour, memoryHour, durationMs) are stored in unhygienix but never flow into
+   the billing Pub/Sub payload.
+
+------------------------------------------------------------------------
+
+STEP 2 — PEGLEG POSTRUNCONFIG READS STATS AND STORES THEM IN UNHYGIENIX
+
+  File: pegleg-backend/.../tee/PostRunConfigService.java
+        pegleg-backend/.../tee/TeeUtil.java (captureRunStats)
+
+  After the Spark job completes, pegleg's PostRunConfigService runs:
+
+    1. Reads the stats .txt file from S3 (via HybridTeePostRunConfigService.getRunStatistics)
+    2. Calls unhygienix.endCleanRoomRun(..., "COMPLETED", outputPath)
+       -> this is where the FLOW_RUN state change happens (relevant for orinix)
+    3. Calls TeeUtil.captureRunStats() which extracts from the stats file:
+         - cpuHour       <- metrics.coreHourUsage
+         - memoryHour    <- metrics.memoryGbHour
+         - durationMs    <- applicationInfo.attempts[0].duration
+         - inputBytes    <- metrics.totalInputBytes
+         - outputBytes   <- metrics.totalOutputBytes
+         - explainPlan   <- physical query plan
+         - datasetStats  <- per-dataset row counts
+    4. Calls unhygienix.CreateCleanRoomQuestionRunStatistics(...) to store all of
+       the above in the unhygienix DB as a run statistics record.
+
+  NOTE: At this point billing is NOT yet sent. Run stats are stored in unhygienix.
+  Billing is a separate async step that runs later.
+
+------------------------------------------------------------------------
+
+STEP 3 — UNHYGIENIX STORES BILLING METRICS
+
+  unhygienix tracks a billing_metrics table per question run.
+  The key billing field is: rowAccessCount (total rows accessed across all datasets).
+
+  For our MEDIUM example:
+    rowAccessCount = 1200000 + 800000 = 2,000,000 rows
+
+  unhygienix also tracks:
+    - orgID                    <- Habu org ID
+    - cleanRoomID
+    - cleanRoomQuestionID
+    - runID
+    - timestamp
+    - billable (true/false)    <- whether this org/run is billable
+    - billingStatus.ID         <- unique ID for tracking delivery
+
+------------------------------------------------------------------------
+
+STEP 4 — BILLING SERVICE PUBLISHES TO GCP PUB/SUB
+
+  File: pegleg-backend/.../billing/BillingService.java
+        pegleg-backend/.../billing/BillingMessagePublisherHelper.java
+
+  A separate billing command/DAG calls BillingService.submitUnsentMetricsToBilling(orgId).
+
+  Flow:
+    1. Fetch unsent metrics from unhygienix (ListBillingMetrics where sent=false)
+    2. For each QuestionRunMetric, resolve Habu orgID -> LiveRamp orgID
+       (via LiveRamp API — billing uses LR org IDs, not Habu org IDs)
+    3. Build BillingEvent payload
+    4. Publish to GCP Pub/Sub: liveramp-events-prod / billing_v2-raw-metrics
+    5. After ACK received from Pub/Sub, mark metric as sent in unhygienix
+
+  Credentials pattern:
+    - Fetches static JSON service account key from Primage (secrets manager)
+    - GoogleCredentials.fromStream(jsonKey)
+    - FixedCredentialsProvider — static key, not Workload Identity Federation
+
+------------------------------------------------------------------------
+
+WHAT IS ACTUALLY SENT TO PUB/SUB (BillingEvent JSON)
+
+  For our MEDIUM hybrid question run example:
+
+  {
+    "version":     2,
+    "ts":          1751234567890,          <- unix ms timestamp of the run
+    "product":     "clean-room",
+    "system":      "pricing_hub",
+    "entity_type": "cac_organization",
+    "entity_id":   "LR-ORG-abc123",       <- LiveRamp org ID (NOT Habu org ID)
+    "group_type":  "question_run",
+    "group_id":    "crqr-uuid-...",        <- clean room question run ID
+    "group_name":  "Adidas Q1 Analysis / Run 2026-06-29",
+    "metric_type": "usage",
+    "units":       2000000,                <- rowAccessCount (the billable unit)
+    "billable":    true,
+    "ui_groups": [
+      { "id": "cr-uuid",  "type": "clean_room",          "name": "Adidas Clean Room" },
+      { "id": "crq-uuid", "type": "clean_room_question",  "name": "Q1 Revenue Analysis" },
+      { "id": "user@co.com", "type": "user",             "name": "Jane Smith" }
+    ],
+    "metadata": {
+      "habu_account_id":   "acct-uuid",
+      "habu_account_name": "Adidas",
+      "created_by":        "user@adidas.com",
+      "owner":             true,           <- true if org = clean room owner org
+      "owner_org_id":      "owner-org-uuid"
+    },
+    "custom_fields": {}
+  }
+
+------------------------------------------------------------------------
+
+KEY OBSERVATIONS
+
+1. BILLING UNIT IS ROW ACCESS COUNT — NOT COMPUTE
+   The "units" field is rowAccessCount (rows touched by the query), not CPU hours
+   or memory hours. CPU/memory hours are stored in unhygienix as run statistics
+   but are NOT published to the billing Pub/Sub topic.
+
+2. TWO SEPARATE STEPS
+   Run completion (endCleanRoomRun) and billing publish are decoupled:
+     - endCleanRoomRun fires immediately when Spark finishes -> this is the hook
+       for the orinix FLOW_RUN completed event
+     - Billing publish is async, happens later via a separate billing DAG/command
+
+3. ORG ID MAPPING STEP
+   Billing requires a LiveRamp org ID, not a Habu org ID. BillingService calls
+   the LiveRamp API to resolve this mapping. If the mapping doesn't exist, the
+   metric is skipped (logged as a warning, not an error).
+
+4. CREDENTIAL PATTERN IS STATIC KEY (contrast with orinix recommendation)
+   BillingMessagePublisherHelper fetches a JSON service account key from Primage.
+   This is the fragile pattern — key rotation requires Primage update + redeploy.
+   For orinix observability delivery, Workload Identity Federation is preferred
+   (no static key anywhere). But the GCP Pub/Sub SDK (com.google.cloud.pubsub.v1)
+   is already proven in production via this billing path.
+
+------------------------------------------------------------------------
+
+CONNECTION TO CNCF / ORINIX OBSERVABILITY WORK
+
+  Josh's point about "pegleg listens to change data capture" maps to this:
+
+  PostRunConfigService.postCRQRunProcess() is the natural hook for FLOW_RUN events.
+  It already calls unhygienix.endCleanRoomRun() which drives the state change.
+  Adding a 3-line hevent publish to habu-observability-events SNS topic RIGHT AFTER
+  endCleanRoomRun would fire the FLOW_RUN completed CloudEvent that XMI needs for
+  flow chaining.
+
+  The billing path also proves that pegleg can already publish to GCP Pub/Sub.
+  The same google-cloud-pubsub SDK dependency is in the pegleg pom.xml.
+  The difference for orinix is credential approach (WIF) and payload schema (CloudEvents).
+
+  Timeline for a single question run:
+    T+0s    Airflow triggers DAG
+    T+Nmin  Spark job finishes, writes stats to S3
+    T+Nmin  pegleg PostRunConfig reads stats, calls endCleanRoomRun -> COMPLETED
+            *** orinix FLOW_RUN completed CloudEvent fires HERE ***
+    T+Nmin  pegleg calls CreateCleanRoomQuestionRunStatistics -> stores in unhygienix
+    T+later Billing DAG runs, fetches unsent metrics, publishes rowAccessCount to
+            liveramp-events-prod/billing_v2-raw-metrics

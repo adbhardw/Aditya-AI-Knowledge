@@ -1,0 +1,163 @@
+4. Future Extension: Audit Logging
+
+[Info panel] Proposed extension. Not in current V1 / V2 / V3 scope or
+this quarter's XMI delivery.
+
+--------------------------------------------------------------------
+
+The Opportunity
+
+orinix's object_events already captures a curated stream of cleanroom
+mutations. Separately, Habu's shared Hank library already produces an
+exhaustive audit trail — every CREATE / UPDATE / DELETE across 90+
+entity types in unhygienix, forebitt, and primage.
+
+orinix can become the single home for both, instead of a second
+audit-logging service being built later in a separate repo.
+
+--------------------------------------------------------------------
+
+Why This Shape
+
+1. Industry Standard
+
+No platform keeps unlimited audit history in one live queryable table.
+
+Datadog forwards logs to a customer-owned bucket as they're ingested,
+and rehydrates a time range back into the searchable index only when
+needed.
+
+GitHub streams its Enterprise audit log to a customer-owned S3 /
+Splunk destination for retention beyond its own default window.
+
+Stripe's Events API is a 30-day live window only — full detail and
+resend for 15 days, payload-only for 16-30 days, summary past that.
+
+2. Solves the Retention Conflict
+
+object_events' current retention job hard-deletes rows after 90 days.
+
+Audit-grade retention needs months to years, driven by compliance —
+not compatible with a hard delete.
+
+A two-tier model — short-retention hot table, long-retention cold
+archive — resolves this without changing what object_events is good at.
+
+3. Solves the Scale Conflict
+
+Hank's audit volume (90+ entity types, all CRUD) is far higher than
+object_events' curated set.
+
+Routing that volume into the same live Postgres table does not scale.
+
+Keeping it in a separate append-only archive does.
+
+--------------------------------------------------------------------
+
+What Extends Today vs. What's New
+
+Extends cleanly, no migration:
+
+Method / RPC route -> new key in the existing context_fields JSONB
+
+Actor detail (who performed the action) -> existing performed_by column
+
+New work, not yet wired:
+
+Hank's audit hooks are log-only today — no DB write, no event publish,
+confirmed by reading the library directly.
+
+Getting audit data into any durable store requires new instrumentation:
+either per-mutation-point publishing, or a change to Hank's shared
+hooks. Real tradeoff, not yet decided.
+
+--------------------------------------------------------------------
+
+Proposed Architecture
+
+Hot Tier — object_events (Postgres, exists today)
+
+Curated business events, current + planned resource types
+
+Extended context_fields (method, actor detail)
+
+Serves live use cases: webhook / Pub-Sub push, cursor pull API,
+Activity Feed UI
+
+Retention job changes from hard-delete to archive-then-delete
+
+Cold Tier — object storage archive (S3 / GCS, new)
+
+Partitioned by cleanroom + date
+
+Receives object_events rows aged out of the hot tier
+
+Receives the full Hank audit stream directly (log-forwarding pipeline,
+never through the live Postgres table)
+
+Long retention, cost driven by a compliance decision, not an
+engineering constraint
+
+Queried via a partitioned query engine (Athena / BigQuery-style) for
+interactive "older history" access, not real-time-indexed like the
+hot tier
+
+One Read API
+
+Recent activity resolves from the hot tier
+
+Older / compliance queries route to the cold tier
+
+Same model as GitHub's own audit log — one mental model for the caller
+regardless of which tier answers
+
+--------------------------------------------------------------------
+
+Phase
+
+Deliverable
+
+Recommendation
+
+M2
+
+Extend context_fields; switch retention job to archive-then-delete
+
+Recommended next step — no new infrastructure
+
+M3
+
+Cold-storage archive + Hank forwarding pipeline; resolve hooks-wiring
+decision; unified read API
+
+Full audit-log expansion
+
+--------------------------------------------------------------------
+
+Open Items
+
+Compliance retention window (months vs. years) — needed from Legal /
+Compliance before M3 is sized.
+
+Hank hooks wiring — per-mutation-point instrumentation vs. a shared-
+hook change. Real tradeoff, both viable.
+
+Archive bucket ownership — almost certainly LiveRamp's existing AWS
+org, exact account to confirm with infra.
+
+Chained-entity events (e.g. credential change affecting a data
+connection) — recommendation is one event per row that actually
+changed, with references to affected resources carried in
+context_fields, not synthetic events on unchanged rows.
+
+--------------------------------------------------------------------
+
+Sources
+
+Datadog Log Archives — docs.datadoghq.com/logs/log_configuration/archives/
+
+Datadog Rehydration — docs.datadoghq.com/logs/log_configuration/rehydrating/
+
+GitHub audit log streaming — docs.github.com/en/enterprise-cloud@latest/admin/monitoring-activity-in-your-enterprise/reviewing-audit-logs-for-your-enterprise/streaming-the-audit-log-for-your-enterprise
+
+Stripe event retention — support.stripe.com/questions/stripe-event-retention-period

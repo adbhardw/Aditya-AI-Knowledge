@@ -1,0 +1,184 @@
+CORRECTION + THE REAL SHAPE: SIDECAR-PER-SERVICE VS CENTRALIZED (MOONRAKER)
+Follow-up to 2026-07-21_does_cac_do_authn_and_authz.txt — that doc overstated
+one thing, corrected below with the actual MCS deployment config as proof.
+Date: 2026-07-21
+
+
+===========================================================
+CORRECTION: authn-proxy is NOT universal. MCS doesn't even run it.
+===========================================================
+
+Source: LiveRamp/measurement-control-service,
+kubernetes-helm-deployment/measurement-control-service/base-values.yaml,
+lines 149-172:
+
+    kongSidecars:
+      kongGatekeeper:
+        enabled: false
+      authnProxy:
+        enabled: false          <- MCS does NOT run this sidecar
+      accessTokenGetter:
+        enabled: true           <- MCS DOES run this one
+        args:
+          - "--creds-file-path=/secrets/api/credentials.json"
+          - "--unix-socket-file-path=/token-getter-unix-socket/sock.sock"
+
+Both sidecars are OPT-IN per service via a Helm toggle, not automatically
+applied everywhere. MCS only has the token-ISSUING sidecar (for when MCS
+calls someone else, like VMA). It does NOT have the token-VERIFYING sidecar.
+
+So the clean 3-layer story from the previous doc (issue / verify / authorize
+as 3 separate pieces) is accurate for LiveRamp's NEWER platform
+(agentic-core / Aegra agents), but MCS — the actual service in our
+MCS<->VMA example — predates that pattern and does something a bit
+different for the "verify" half.
+
+
+===========================================================
+WHAT MCS ACTUALLY DOES INSTEAD (no authn-proxy)
+===========================================================
+
+Since there's no local sidecar to verify an incoming token's signature, MCS
+just forwards the RAW incoming token straight to CAC over the network
+(cac.py: `client.check_permission(auth_token, lr_org_id, permission)`), with
+zero local pre-checking. CAC's response (`allAllowed: true/false`) is the
+ONLY signal MCS ever gets back. If the token were garbage/forged, CAC would
+have to catch that itself as part of answering the permission question —
+there's nothing else in MCS's path that would catch it.
+
+CONCLUSION: for MCS specifically, CAC is doing BOTH jobs (verify the token
+is real, AND check the permission) in a single network round-trip, from
+MCS's point of view. The clean "authn-proxy verifies, CAC only authorizes"
+split is real for the agentic-core platform, but not universally true across
+every LiveRamp service — MCS is the counter-example, and MCS is exactly the
+service in our own worked example (MCS<->VMA).
+
+
+===========================================================
+SO THERE ARE ACTUALLY THREE PATTERNS IN USE, NOT TWO
+===========================================================
+
+1. Habu/moonraker (fully centralized):
+   One central service both ISSUES tokens (at login) and VALIDATES them
+   (every subsequent call). Every authenticated operation, anywhere in Habu,
+   makes a network call to moonraker.
+
+2. LiveRamp MCS/VMA (issuance decentralized, verify+authorize centralized):
+   Token ISSUANCE is decentralized — each service has its own
+   access-token-getter sidecar + its own service-account credentials, no
+   shared issuing service. But VERIFICATION + PERMISSION CHECK both still
+   happen in one network hop to CAC, every request. Closer to moonraker's
+   shape than you'd think, just with issuance split out.
+
+3. LiveRamp agentic-core (fully decentralized except the permission lookup):
+   Same issuance sidecar as #2, PLUS a separate authn-proxy sidecar that
+   verifies the token's signature locally, in-pod, with no network call.
+   Only the actual PERMISSION decision (does this identity hold this scope)
+   still goes to a central CAC service. This is the most "spread out"
+   version — LiveRamp's newest platform, and the direction they're moving.
+
+The pattern got progressively more decentralized over time (1 -> 2 -> 3).
+That's a real signal about which way LiveRamp itself thinks is better at
+growing scale — but they still run all three, on different services, today.
+
+
+===========================================================
+YOUR QUESTION: WHICH IS BETTER, CENTRALIZED (MOONRAKER) OR SIDECAR-PER-SERVICE?
+===========================================================
+
+Neither is unconditionally better — it's a scale/maturity tradeoff, and
+here's the honest version of each side, in plain terms:
+
+CENTRALIZED (moonraker, or "CAC does both" for MCS):
+  + Simple to build and reason about — one thing to patch, one thing to
+    audit, one place all the logic lives.
+  + Consistent everywhere by construction — nobody can implement it wrong
+    per-service, because there's only one implementation.
+  - Every single authenticated request anywhere in the whole system now
+    depends on this one service being up and fast. If it's slow, everything
+    gets slower. If it's down, everything that needs auth is down too.
+  - It has to scale its own capacity to match the TOTAL request volume of
+    every service that depends on it, combined.
+
+DECENTRALIZED (sidecar-per-service, LiveRamp's agentic-core pattern):
+  + No network hop for the most frequent operation (verifying a token) —
+    it happens locally, in-pod, so it's fast and doesn't depend on any
+    other service being reachable.
+  + No single point of failure for the whole company — if one team's pod
+    has a problem, it's isolated to that one service, not everyone.
+  + Scales for free — every new pod just brings its own sidecar with it,
+    no separate capacity planning for a shared central service.
+  - More moving parts — many small identical containers to deploy, patch,
+    and monitor across the whole fleet instead of one thing.
+  - Slightly more setup per new service (need to provision a service
+    account, wire up the sidecar) rather than "just call the existing
+    service."
+
+WHAT THIS MEANS FOR US, CONCRETELY: you do NOT need the fancy fully-
+decentralized version to be "doing it right." MCS — LiveRamp's actual
+production, business-critical service — still uses the simpler "forward the
+token to a central CAC service and trust its answer" pattern today, same
+shape as moonraker. That's proven, working, and good enough for a service at
+MCS's scale. The fully decentralized authn-proxy version only becomes worth
+the extra complexity once request volume/latency sensitivity gets high
+enough that the network hop starts to actually hurt (which is why LiveRamp
+built it for their AI agent platform specifically — lots of tool calls per
+conversation, very latency-sensitive). For orinix->XMI, mirroring the
+simpler MCS-style pattern (own token-issuing sidecar + forward to CAC) is
+the right level of complexity to start with, not the newer agentic-core one.
+
+
+===========================================================
+IS THE SIDECAR SHARED ACROSS ALL LIVERAMP SERVICES, OR DOES EACH SERVICE
+HAVE ITS OWN?
+===========================================================
+
+Both, in different senses — worth being precise here:
+
+  - The SOFTWARE (the Docker image
+    `access-token-getter`) is shared/reused — the exact same artifact is
+    deployed by dozens of unrelated LiveRamp services (MCS, VMA,
+    billing_service, segment, ppr_service, aif_connector_service, and more,
+    confirmed by grepping the LiveRamp org).
+  - The RUNNING INSTANCE is NOT shared. Every service gets its OWN private
+    copy of that container, running inside its OWN pod, backed by ITS OWN
+    service account's credentials (mounted from Vault, specific to that one
+    service). MCS's sidecar can only ever mint tokens proving "I am MCS" —
+    it has no ability to mint a token for VMA or anyone else.
+
+Analogy: everyone uses the same brand/model of lock (shared design), but
+everyone has their own physical lock and their own key (private instance).
+It is NOT one shared locksmith service that every app calls over the
+network to get a key cut each time — that would be the moonraker model.
+This distributed-instance design is exactly why a compromised MCS pod can't
+leak VMA's (or anyone else's) service-account credentials — each pod only
+ever has access to its own.
+
+
+===========================================================
+DIRECT ANSWERS TO YOUR FOUR QUESTIONS
+===========================================================
+
+Q1. Does authn-proxy sit in front of ALL services?
+    No. It's opt-in via a Helm toggle per service. MCS has it OFF.
+
+Q2/Q3. For MCS<->VMA, does MCS have both sidecars?
+    No — MCS only has the token-ISSUING sidecar (accessTokenGetter),
+    not the verifying one (authnProxy). For incoming requests, MCS skips
+    local verification entirely and just forwards the raw token to CAC,
+    which does verification + permission check together, in one hop.
+
+Q4. Moonraker (centralized) vs every-service-runs-a-sidecar — which is
+    better?
+    Neither, universally. Centralized is simpler and is what MCS itself
+    still uses (mirroring moonraker's shape for the verify+authorize step).
+    Fully decentralized (sidecar for verify too) is what LiveRamp built for
+    their higher-QPS, latency-sensitive AI agent platform. Pick based on
+    your service's actual request volume and failure-isolation needs, not
+    because one is "more modern."
+
+Q5. Is the sidecar shared across LiveRamp, or does each service have its
+    own?
+    The image/software is shared. The running instance and credentials are
+    private per service — MCS has its own, VMA has its own, neither can
+    impersonate the other.

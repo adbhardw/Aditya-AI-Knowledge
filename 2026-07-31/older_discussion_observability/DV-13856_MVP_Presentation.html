@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DV-13856 — Clean Room Observability MVP</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0f1e;color:#e2e8f0;height:100vh;overflow:hidden;display:flex;flex-direction:column;}
+
+/* ── Controls ── */
+.controls{background:#111827;padding:10px 24px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #1f2937;flex-shrink:0;}
+.ctrl-group{display:flex;align-items:center;gap:10px;}
+.counter{font-size:12px;color:#4b5563;min-width:48px;text-align:center;}
+.slide-label-top{font-size:12px;color:#6b7280;font-weight:500;}
+.btn{background:#2563eb;color:#fff;border:none;padding:7px 18px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;transition:background .15s;}
+.btn:hover{background:#1d4ed8;}
+.btn:disabled{background:#1f2937;color:#374151;cursor:not-allowed;}
+.btn-ghost{background:transparent;border:1px solid #374151;color:#6b7280;}
+.btn-ghost:hover{background:#1f2937;}
+.nav-dots{display:flex;gap:6px;align-items:center;}
+.dot{width:7px;height:7px;border-radius:50%;background:#1f2937;cursor:pointer;transition:background .15s;}
+.dot.active{background:#2563eb;}
+.dot:hover:not(.active){background:#374151;}
+
+/* ── Slide shell ── */
+.deck{flex:1;overflow:hidden;position:relative;}
+.slide{position:absolute;inset:0;display:none;flex-direction:column;overflow-y:auto;}
+.slide.active{display:flex;}
+.inner{flex:1;padding:40px 60px;display:flex;flex-direction:column;}
+.inner.center{align-items:center;justify-content:center;text-align:center;}
+
+/* ── Type scale ── */
+.kicker{font-size:11px;font-weight:700;letter-spacing:.1em;color:#3b82f6;text-transform:uppercase;margin-bottom:10px;}
+h1{font-size:38px;font-weight:800;line-height:1.15;color:#f9fafb;}
+h2{font-size:26px;font-weight:700;color:#f9fafb;margin-bottom:6px;}
+h3{font-size:16px;font-weight:700;color:#f9fafb;margin-bottom:6px;}
+.sub{font-size:16px;color:#9ca3af;margin-top:14px;line-height:1.55;}
+.muted{font-size:13px;color:#4b5563;}
+p{color:#9ca3af;line-height:1.65;font-size:14px;}
+code{font-family:'SF Mono',Menlo,monospace;font-size:12px;color:#60a5fa;background:#0f172a;padding:1px 5px;border-radius:3px;}
+
+/* ── Badges ── */
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.05em;}
+.bv1{background:#1e3a8a;color:#93c5fd;}
+.bv2{background:#7c2d12;color:#fdba74;}
+.bv3{background:#14532d;color:#86efac;}
+.bq{background:#1e3a8a33;color:#93c5fd;border:1px solid #1e3a8a66;}
+.bdc{background:#06402833;color:#6ee7b7;border:1px solid #06402866;}
+.bex{background:#4c1d9533;color:#c4b5fd;border:1px solid #4c1d9566;}
+
+/* ── Grid ── */
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:20px;}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:20px;}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;}
+
+/* ── Card ── */
+.card{background:#111827;border:1px solid #1f2937;border-radius:10px;padding:20px;}
+.card.accent-blue{border-top:2px solid #3b82f6;}
+.card.accent-orange{border-top:2px solid #f97316;}
+.card.accent-green{border-top:2px solid #22c55e;}
+.card p{font-size:13px;}
+
+/* ── Section header ── */
+.sh{margin-bottom:22px;}
+
+/* ── Divider ── */
+hr{border:none;border-top:1px solid #1f2937;margin:20px 0;}
+
+/* ── Highlight colors ── */
+.hl-blue{color:#60a5fa;}
+.hl-orange{color:#fb923c;}
+.hl-green{color:#4ade80;}
+.hl-purple{color:#a78bfa;}
+
+/* ── Browser mockup ── */
+.browser{background:#111827;border:1px solid #1f2937;border-radius:10px;overflow:hidden;display:flex;flex-direction:column;flex:1;min-height:0;}
+.brow-chrome{background:#060d1b;padding:9px 14px;display:flex;align-items:center;gap:6px;border-bottom:1px solid #1f2937;flex-shrink:0;}
+.brow-dot{width:10px;height:10px;border-radius:50%;}
+.brow-url{background:#111827;border-radius:5px;padding:4px 10px;font-size:11px;color:#374151;flex:1;margin-left:6px;}
+.app-topbar{background:#020617;padding:0 20px;display:flex;align-items:center;gap:20px;border-bottom:1px solid #0f172a;flex-shrink:0;}
+.app-logo{font-size:14px;font-weight:800;color:#3b82f6;padding:13px 0;margin-right:6px;letter-spacing:-.5px;}
+.app-nav-link{display:inline-block;padding:13px 0;margin-right:18px;font-size:12px;color:#374151;}
+.cr-hdr{padding:13px 20px;border-bottom:1px solid #0f172a;flex-shrink:0;}
+.cr-name{font-size:15px;font-weight:700;color:#f9fafb;}
+.cr-meta{font-size:11px;color:#374151;margin-top:3px;}
+.tabs{background:#020617;padding:0 20px;display:flex;border-bottom:1px solid #0f172a;flex-shrink:0;}
+.tab{padding:10px 14px;font-size:12px;color:#374151;cursor:pointer;border-bottom:2px solid transparent;margin-right:2px;white-space:nowrap;}
+.tab.on{color:#3b82f6;border-bottom-color:#3b82f6;}
+.feed{padding:14px 20px;overflow-y:auto;flex:1;}
+.filter-row{display:flex;gap:8px;align-items:center;margin-bottom:12px;}
+.fsel{background:#060d1b;border:1px solid #1f2937;color:#6b7280;padding:5px 10px;border-radius:5px;font-size:11px;}
+.flabel{font-size:11px;color:#374151;}
+.evt-list{display:flex;flex-direction:column;gap:7px;}
+.evt{background:#060d1b;border:1px solid #0f172a;border-radius:7px;padding:11px 13px;display:flex;align-items:flex-start;gap:11px;transition:border-color .12s;cursor:pointer;}
+.evt:hover{border-color:#1f2937;}
+.evt.hi{border-color:#1d4ed8;background:#0a1628;}
+.evt-ico{width:32px;height:32px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex-shrink:0;}
+.ico-q{background:#1e3a8a33;color:#93c5fd;}
+.ico-dc{background:#06402833;color:#6ee7b7;}
+.ico-ex{background:#4c1d9533;color:#c4b5fd;}
+.ico-del{background:#7f1d1d33;color:#fca5a5;}
+.evt-body{flex:1;min-width:0;}
+.evt-name{font-size:13px;font-weight:700;color:#f9fafb;}
+.evt-desc{font-size:12px;color:#4b5563;margin-top:2px;}
+.evt-meta{display:flex;align-items:center;gap:6px;margin-top:5px;flex-wrap:wrap;}
+.tag{font-size:10px;font-weight:600;padding:2px 7px;border-radius:3px;}
+.tag-q{background:#1e3a8a22;color:#93c5fd;border:1px solid #1e3a8a55;}
+.tag-dc{background:#06402822;color:#6ee7b7;border:1px solid #06402855;}
+.tag-ex{background:#4c1d9522;color:#c4b5fd;border:1px solid #4c1d9555;}
+.tag-upd{background:#1f2937;color:#6b7280;border:1px solid #374151;}
+.tag-del{background:#7f1d1d22;color:#fca5a5;border:1px solid #7f1d1d55;}
+.evt-who{font-size:10px;color:#374151;}
+.evt-time{font-size:10px;color:#1f2937;}
+
+/* ── Architecture flow ── */
+.flow{display:flex;align-items:center;gap:0;flex-wrap:wrap;margin:14px 0;}
+.fbox{background:#111827;border:1px solid #1f2937;border-radius:7px;padding:10px 14px;font-size:12px;color:#f9fafb;text-align:center;min-width:100px;}
+.fbox small{display:block;font-size:10px;color:#4b5563;margin-top:2px;}
+.fbox.fv1{border-color:#1d4ed8;}
+.fbox.fv2{border-color:#c2410c;}
+.fbox.fsh{border-color:#7c3aed;}
+.farr{color:#1f2937;font-size:16px;padding:0 6px;flex-shrink:0;}
+
+/* ── Q&A ── */
+.qa{background:#111827;border-left:3px solid #3b82f6;border-radius:0 8px 8px 0;padding:14px 18px;margin-bottom:14px;}
+.qa-q{font-size:14px;font-weight:700;color:#93c5fd;margin-bottom:7px;}
+.qa-a{font-size:13px;color:#9ca3af;line-height:1.65;}
+
+/* ── Roadmap ── */
+.roadmap{display:flex;gap:14px;margin-top:20px;}
+.rphase{flex:1;background:#111827;border:1px solid #1f2937;border-radius:10px;padding:18px;}
+.rphase.rv1{border-top:3px solid #3b82f6;}
+.rphase.rv2{border-top:3px solid #f97316;}
+.rphase.rv3{border-top:3px solid #22c55e;}
+.rsprint{font-size:10px;color:#4b5563;font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;}
+.rtitle{font-size:15px;font-weight:800;margin-bottom:12px;}
+.ritem{font-size:12px;color:#4b5563;padding:3px 0 3px 12px;position:relative;}
+.ritem::before{content:'→';position:absolute;left:0;color:#1f2937;}
+.rnote{margin-top:12px;font-size:11px;color:#374151;background:#060d1b;border-radius:5px;padding:7px 10px;}
+
+/* ── V2 summary box ── */
+.v2box{background:linear-gradient(135deg,#0c1428,#130d28);border:1px solid #1d3461;border-radius:10px;padding:22px;margin-top:16px;}
+.v2flow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:14px;}
+.vstep{background:#111827;border:1px solid #1f2937;border-radius:6px;padding:7px 12px;font-size:11px;color:#9ca3af;text-align:center;}
+.vstep strong{display:block;color:#f9fafb;font-size:12px;margin-bottom:2px;}
+.varr{color:#374151;font-size:14px;}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar{width:5px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:#1f2937;border-radius:3px;}
+</style>
+</head>
+<body>
+
+<!-- Controls bar -->
+<div class="controls">
+  <div class="ctrl-group">
+    <button class="btn btn-ghost" id="prevBtn" onclick="go(-1)">← Back</button>
+    <span class="counter" id="ctr">1 / 8</span>
+    <button class="btn" id="nextBtn" onclick="go(1)">Next →</button>
+  </div>
+  <div class="nav-dots" id="dots"></div>
+  <span class="slide-label-top" id="stitle"></span>
+</div>
+
+<!-- Deck -->
+<div class="deck">
+
+<!-- ════════════════════ SLIDE 1 — Title ════════════════════ -->
+<div class="slide" data-t="Overview">
+  <div class="inner center">
+    <div class="kicker">CFI-1388 · DV-13856 · FY27Q1</div>
+    <h1>Clean Room Observability<br>&amp; Callback Registration</h1>
+    <p class="sub">MVP Design — Activity Feed UI + Webhook Callbacks<br>For TLM &amp; Product Review</p>
+    <p class="muted" style="margin-top:18px;">Aditya Bhardwaj · Staff L5 · LiveRamp · May 2026</p>
+
+    <div class="g3" style="margin-top:44px;text-align:left;max-width:860px;">
+      <div class="card accent-blue">
+        <div style="margin-bottom:10px;"><span class="badge bv1">V1 · 2 Sprints</span></div>
+        <h3>Activity Feed UI</h3>
+        <p style="margin-top:7px;">Every platform user can see what changed, who changed it, and when — directly in the clean room UI. No setup required.</p>
+      </div>
+      <div class="card accent-orange">
+        <div style="margin-bottom:10px;"><span class="badge bv2">V2 · 2–3 Sprints</span></div>
+        <h3>Webhook Callbacks</h3>
+        <p style="margin-top:7px;">XMI UI and customer integrations register a URL. Habu calls it automatically, with retry, when monitored objects change.</p>
+      </div>
+      <div class="card accent-green">
+        <div style="margin-bottom:10px;"><span class="badge bv3">V3 · 1–2 Sprints</span></div>
+        <h3>Production Hardening</h3>
+        <p style="margin-top:7px;">HMAC signatures, event replay API, DLQ visibility, and webhook test endpoints for enterprise customers.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════ SLIDE 2 — Problem ════════════════════ -->
+<div class="slide" data-t="The Problem">
+  <div class="inner">
+    <div class="sh">
+      <div class="kicker">The Problem</div>
+      <h2>No notification system exists for clean room object changes</h2>
+      <p style="margin-top:7px;">External systems poll <code>GET /cleanrooms/{id}/questions</code> every N seconds. Most calls return "nothing changed." When something does change, the reaction is delayed and the diff is imprecise.</p>
+    </div>
+
+    <div class="g3">
+      <div class="card">
+        <div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+          <span style="font-size:20px;">📋</span>
+          <span class="badge bq">Questions</span>
+        </div>
+        <h3>Question Changes Go Unnoticed</h3>
+        <p style="margin-top:8px;">When output columns are removed, a dataset is swapped, or a question is deleted, XMI UI has no way to know until its next poll cycle. Downstream dashboards and workflows break silently.</p>
+      </div>
+      <div class="card">
+        <div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+          <span style="font-size:20px;">🔌</span>
+          <span class="badge bdc">Data Connections</span>
+        </div>
+        <h3>Schema Changes Break Pipelines</h3>
+        <p style="margin-top:8px;">When a field type changes (Integer → String) or fields are added or removed, SQL queries and data pipelines fail at runtime with no prior warning to dependent teams.</p>
+      </div>
+      <div class="card">
+        <div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+          <span style="font-size:20px;">📤</span>
+          <span class="badge bex">Exports</span>
+        </div>
+        <h3>Export Status Is Invisible</h3>
+        <p style="margin-top:8px;">Export configuration changes and run completions are invisible to integrations. External systems must poll repeatedly to detect whether an export finished, failed, or was reconfigured.</p>
+      </div>
+    </div>
+
+    <div style="margin-top:20px;background:#111827;border:1px solid #1f2937;border-radius:8px;padding:15px 18px;display:flex;align-items:flex-start;gap:10px;">
+      <span style="font-size:18px;flex-shrink:0;">⚡</span>
+      <p style="margin:0;font-size:13px;"><strong style="color:#f9fafb;">Root cause:</strong> No event notification system exists for clean room objects. Every external consumer is forced to poll and run their own diff. The platform does not tell you when something changed — you have to go ask.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════ SLIDE 3 — Solution ════════════════════ -->
+<div class="slide" data-t="Solution Overview">
+  <div class="inner">
+    <div class="sh">
+      <div class="kicker">Solution</div>
+      <h2>One foundation. Two consumers.</h2>
+      <p style="margin-top:7px;">A single interceptor fires on every create/update/delete and writes to a persistent event store. V1 reads that store for the UI. V2 uses a queue for push delivery to external endpoints.</p>
+    </div>
+
+    <div style="background:#111827;border:1px solid #7c3aed;border-radius:9px;padding:18px 22px;margin-bottom:18px;">
+      <div class="kicker" style="color:#a78bfa;margin-bottom:10px;">Shared Foundation — Interceptor (unhygienix)</div>
+      <div style="font-family:'SF Mono',Menlo,monospace;font-size:12px;color:#9ca3af;line-height:2;">
+        On any create / update / delete in unhygienix:<br>
+        &nbsp;&nbsp;1. Snapshot <em>before</em> state of the object<br>
+        &nbsp;&nbsp;2. Execute the mutation<br>
+        &nbsp;&nbsp;3. Compute diff (before vs. after)<br>
+        &nbsp;&nbsp;4. Write event row to <span style="color:#60a5fa;">object_events</span> table &nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#93c5fd;background:#1e3a8a33;padding:1px 7px;border-radius:3px;font-size:10px;">V1</span><br>
+        &nbsp;&nbsp;5. If callback registered → publish to SNS <span style="color:#fdba74;background:#7c2d1233;padding:1px 7px;border-radius:3px;font-size:10px;">V2</span>
+      </div>
+    </div>
+
+    <div class="g2">
+      <div class="card accent-blue">
+        <span class="badge bv1" style="margin-bottom:10px;display:inline-block;">V1 · Activity Feed UI</span>
+        <h3>Human Users</h3>
+        <p style="margin-top:8px;margin-bottom:14px;">A chronological audit trail of all clean room changes, visible directly in the platform as an Activity tab. No setup. Every user benefits immediately.</p>
+        <div style="font-size:12px;color:#60a5fa;font-family:'SF Mono',Menlo,monospace;">object_events table → GET /events API → UI tab</div>
+      </div>
+      <div class="card accent-orange">
+        <span class="badge bv2" style="margin-bottom:10px;display:inline-block;">V2 · Webhook Callbacks</span>
+        <h3>Programmatic Systems (XMI UI)</h3>
+        <p style="margin-top:8px;margin-bottom:14px;">XMI registers a callback URL. Habu POSTs to it automatically (async, with retry) whenever a monitored object changes. No polling required.</p>
+        <div style="font-size:12px;color:#fb923c;font-family:'SF Mono',Menlo,monospace;">SNS → SQS → Delivery Worker → HTTP POST</div>
+      </div>
+    </div>
+
+    <div style="margin-top:16px;background:#111827;border-radius:7px;padding:12px 16px;font-size:12px;color:#4b5563;">
+      <strong style="color:#9ca3af;">XMI near-term path:</strong> V1's cursor API (<code>GET /cleanrooms/{'{id}'}/events?since=T</code>) is also a viable XMI integration — it's far better than object polling and requires no inbound webhook server on XMI's side. V2 webhooks are the long-term push model.
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════ SLIDE 4 — Activity Feed UI ════════════════════ -->
+<div class="slide" data-t="Activity Feed UI">
+  <div class="inner" style="padding:22px 32px;">
+    <div style="margin-bottom:14px;display:flex;align-items:baseline;gap:12px;">
+      <span class="kicker" style="margin-bottom:0;">V1 — UI Mockup</span>
+      <h2 style="font-size:20px;margin-bottom:0;">Activity Feed — what the customer sees inside the platform</h2>
+    </div>
+
+    <div class="browser">
+      <!-- Chrome bar -->
+      <div class="brow-chrome">
+        <div class="brow-dot" style="background:#ef4444;"></div>
+        <div class="brow-dot" style="background:#f59e0b;"></div>
+        <div class="brow-dot" style="background:#22c55e;"></div>
+        <div class="brow-url">app.habu.com / clean-rooms / acme-liveramp-q1 / activity</div>
+      </div>
+      <!-- App top nav -->
+      <div class="app-topbar">
+        <div class="app-logo">habu</div>
+        <a class="app-nav-link" href="#">Clean Rooms</a>
+        <a class="app-nav-link" href="#">Data Connections</a>
+        <a class="app-nav-link" href="#">Exports</a>
+      </div>
+      <!-- Clean room header -->
+      <div class="cr-hdr">
+        <div class="cr-name">Acme Corp × LiveRamp — Q1 2026</div>
+        <div class="cr-meta">2 Partners &nbsp;·&nbsp; 4 Active Questions &nbsp;·&nbsp; Last activity 2 hours ago</div>
+      </div>
+      <!-- Tab bar -->
+      <div class="tabs">
+        <div class="tab">Overview</div>
+        <div class="tab">Questions</div>
+        <div class="tab">Data Connections</div>
+        <div class="tab">Exports</div>
+        <div class="tab on">Activity</div>
+      </div>
+      <!-- Event feed -->
+      <div class="feed">
+        <div class="filter-row">
+          <span class="flabel">Filter:</span>
+          <select class="fsel"><option>All object types</option></select>
+          <select class="fsel"><option>All users</option></select>
+          <select class="fsel"><option>Last 30 days</option></select>
+        </div>
+        <div class="evt-list">
+
+          <div class="evt hi">
+            <div class="evt-ico ico-q">Q</div>
+            <div class="evt-body">
+              <div class="evt-name">Revenue Analysis</div>
+              <div class="evt-desc">Output columns were modified</div>
+              <div class="evt-meta">
+                <span class="tag tag-q">Question</span>
+                <span class="tag tag-upd">Updated</span>
+                <span class="evt-who">sarah@acme.com</span>
+                <span class="evt-time">· May 9, 2026, 2:32 PM</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="evt">
+            <div class="evt-ico ico-dc">DC</div>
+            <div class="evt-body">
+              <div class="evt-name">CRM_Import</div>
+              <div class="evt-desc">Field configuration changed</div>
+              <div class="evt-meta">
+                <span class="tag tag-dc">Data Connection</span>
+                <span class="tag tag-upd">Updated</span>
+                <span class="evt-who">john@acme.com</span>
+                <span class="evt-time">· May 9, 2026, 11:15 AM</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="evt">
+            <div class="evt-ico ico-q">Q</div>
+            <div class="evt-body">
+              <div class="evt-name">Attribution Model</div>
+              <div class="evt-desc">Dataset assignment was updated</div>
+              <div class="evt-meta">
+                <span class="tag tag-q">Question</span>
+                <span class="tag tag-upd">Updated</span>
+                <span class="evt-who">sarah@acme.com</span>
+                <span class="evt-time">· May 8, 2026, 9:00 AM</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="evt">
+            <div class="evt-ico ico-ex">EX</div>
+            <div class="evt-body">
+              <div class="evt-name">Weekly Report Export</div>
+              <div class="evt-desc">Export completed successfully</div>
+              <div class="evt-meta">
+                <span class="tag tag-ex">Export</span>
+                <span class="tag tag-upd">Status changed</span>
+                <span class="evt-who">system</span>
+                <span class="evt-time">· May 7, 2026, 6:00 PM</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="evt">
+            <div class="evt-ico ico-del">Q</div>
+            <div class="evt-body">
+              <div class="evt-name">Lookalike Segments</div>
+              <div class="evt-desc">Question was deleted</div>
+              <div class="evt-meta">
+                <span class="tag tag-q">Question</span>
+                <span class="tag tag-del">Deleted</span>
+                <span class="evt-who">admin@liveramp.com</span>
+                <span class="evt-time">· May 7, 2026, 4:45 PM</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="evt">
+            <div class="evt-ico ico-dc">DC</div>
+            <div class="evt-body">
+              <div class="evt-name">Pixel Data Feed</div>
+              <div class="evt-desc">New field added to schema</div>
+              <div class="evt-meta">
+                <span class="tag tag-dc">Data Connection</span>
+                <span class="tag tag-upd">Updated</span>
+                <span class="evt-who">john@acme.com</span>
+                <span class="evt-time">· May 6, 2026, 3:20 PM</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:10px;font-size:11px;color:#374151;display:flex;gap:18px;">
+      <span>🔵 MVP: object name · high-level change description · who · when</span>
+      <span>📌 Field-level diff (what exactly changed) shown on expand — V2/V3</span>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════ SLIDE 5 — Event Display Design ════════════════════ -->
+<div class="slide" data-t="Event Display Design">
+  <div class="inner">
+    <div class="sh">
+      <div class="kicker">MVP Event Display</div>
+      <h2>What to show — keep it simple for V1</h2>
+      <p style="margin-top:7px;">For MVP we show high-level summaries per event. The goal is quick auditability: <em>something changed, who did it, when.</em> Deep field-level diffs (e.g. "SQL changed at line 3") are V3 and risk information overload for most users.</p>
+    </div>
+
+    <div class="g2">
+      <div>
+        <h3 class="hl-blue" style="margin-bottom:14px;">MVP event card</h3>
+        <div style="background:#060d1b;border:1px solid #0f172a;border-radius:8px;padding:16px;">
+          <div style="font-size:13px;color:#9ca3af;line-height:2.1;">
+            <div><strong style="color:#f9fafb;display:inline-block;width:70px;">Object</strong> Revenue Analysis</div>
+            <div><strong style="color:#f9fafb;display:inline-block;width:70px;">Type</strong> Question</div>
+            <div><strong style="color:#f9fafb;display:inline-block;width:70px;">Action</strong> Output columns were modified</div>
+            <div><strong style="color:#f9fafb;display:inline-block;width:70px;">By</strong> sarah@acme.com</div>
+            <div><strong style="color:#f9fafb;display:inline-block;width:70px;">At</strong> May 9, 2026, 2:32 PM</div>
+          </div>
+        </div>
+        <p style="margin-top:10px;font-size:13px;">Simple. Auditable. No information overload.<br>Answers: what, what kind of change, who, when.</p>
+      </div>
+
+      <div>
+        <h3 class="hl-orange" style="margin-bottom:14px;">Change summary labels per type</h3>
+        <div style="display:flex;flex-direction:column;gap:9px;">
+          <div class="card" style="padding:12px 15px;">
+            <div style="font-size:10px;color:#4b5563;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:7px;">Question</div>
+            <div style="font-size:12px;color:#6b7280;line-height:1.9;">"Output columns were modified"<br>"Dataset assignment was updated"<br>"Question status changed"<br>"Question was renamed"<br>"Question was deleted"</div>
+          </div>
+          <div class="card" style="padding:12px 15px;">
+            <div style="font-size:10px;color:#4b5563;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:7px;">Data Connection</div>
+            <div style="font-size:12px;color:#6b7280;line-height:1.9;">"Field configuration changed"<br>"New field added to schema"<br>"Field removed from schema"<br>"Data connection was deleted"</div>
+          </div>
+          <div class="card" style="padding:12px 15px;">
+            <div style="font-size:10px;color:#4b5563;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:7px;">Export</div>
+            <div style="font-size:12px;color:#6b7280;line-height:1.9;">"Export completed successfully"<br>"Export failed"<br>"Export configuration was updated"</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <hr />
+    <div style="background:#111827;border-left:3px solid #f59e0b;border-radius:0 7px 7px 0;padding:12px 16px;">
+      <p style="font-size:13px;"><strong style="color:#fbbf24;">Open question for Product:</strong> Should V1 show old/new values inline (e.g. "columns removed: <span style="color:#fca5a5;text-decoration:line-through;">customer_segment, channel</span>") or summary-only? Recommendation: summary-only for MVP, expand on click in V2/V3.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════ SLIDE 6 — Design Q&A ════════════════════ -->
+<div class="slide" data-t="Design Q&amp;A">
+  <div class="inner">
+    <div class="sh">
+      <div class="kicker">Design Decisions</div>
+      <h2>Key questions answered</h2>
+    </div>
+
+    <div class="qa">
+      <div class="qa-q">Q: Why write to a database table — can't we show the UI using queue (SNS/SQS) data directly?</div>
+      <div class="qa-a">
+        A message queue is designed for <strong style="color:#f9fafb;">one-time delivery</strong> — a consumer reads a message, processes it, and the message is deleted. There's no persistent history to query.<br><br>
+        If you want a UI that shows "what happened over the last 30 days," the queue data is already gone. The <code>object_events</code> table is a <strong style="color:#f9fafb;">persistent, queryable ledger</strong> — always there, filterable by date/user/type. The queue (SNS → SQS) is used for <em>webhook delivery</em> in V2 only — fire-and-forget to external endpoints.<br><br>
+        Think of it this way: the table is the record book. The queue is the postal service.
+      </div>
+    </div>
+
+    <div class="qa">
+      <div class="qa-q">Q: For MVP event display — do we need to show deep data like "SQL changed at line 3"?</div>
+      <div class="qa-a">
+        No — not for MVP. The high-level summary ("Output columns were modified by sarah@acme.com on May 9") is sufficient for audit and answers the key question: <em>did something change, who did it, when?</em><br><br>
+        The detailed field-level diff (exact columns removed, exact type changes) is stored in the <code>changed_fields</code> JSONB column and can be exposed on-click in V2/V3. For MVP, the summary label gives users enough context without overloading the feed — this is a pragmatic tradeoff.
+      </div>
+    </div>
+
+    <div class="qa">
+      <div class="qa-q">Q: What is a "webhook server" on the XMI side?</div>
+      <div class="qa-a">
+        For V2 callbacks, XMI UI needs to expose an HTTPS endpoint that Habu can POST to when objects change. That endpoint is their "webhook server" — a small receiver that accepts Habu's JSON payload and reacts (refresh UI, update cache, trigger workflow).<br><br>
+        V1's cursor-based polling API (<code>GET /cleanrooms/{'{id}'}/events?since=T</code>) avoids this requirement entirely — XMI calls Habu's API on their own schedule instead of maintaining an inbound server. This is the recommended near-term path for XMI, with V2 webhooks as the long-term push model.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════ SLIDE 7 — Architecture ════════════════════ -->
+<div class="slide" data-t="Architecture">
+  <div class="inner">
+    <div class="sh">
+      <div class="kicker">Architecture</div>
+      <h2>End-to-end data flow — V1 and V2</h2>
+    </div>
+
+    <div style="margin-bottom:22px;">
+      <div style="font-size:10px;font-weight:700;color:#60a5fa;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;">V1 — Activity Feed</div>
+      <div class="flow">
+        <div class="fbox fsh">User Action<small>delete / update</small></div>
+        <div class="farr">→</div>
+        <div class="fbox fsh">unhygienix<small>Interceptor + Differ</small></div>
+        <div class="farr">→</div>
+        <div class="fbox fv1">object_events<small>PostgreSQL</small></div>
+        <div class="farr">→</div>
+        <div class="fbox fv1">GET /events API<small>external-api-server</small></div>
+        <div class="farr">→</div>
+        <div class="fbox fv1">Activity Feed UI<small>Clean Room tab</small></div>
+      </div>
+    </div>
+
+    <div>
+      <div style="font-size:10px;font-weight:700;color:#fb923c;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;">V2 — Webhook Callbacks (adds onto V1 interceptor)</div>
+      <div class="flow">
+        <div class="fbox fsh">unhygienix<small>same interceptor</small></div>
+        <div class="farr">→</div>
+        <div class="fbox fv2">SNS Topic<small>~1ms, non-blocking</small></div>
+        <div class="farr">→</div>
+        <div class="fbox fv2">SQS Queue<small>buffer + at-least-once</small></div>
+        <div class="farr">→</div>
+        <div class="fbox fv2">Delivery Worker<small>retry + DLQ</small></div>
+        <div class="farr">→</div>
+        <div class="fbox fv2">HTTP POST<small>XMI webhook URL</small></div>
+      </div>
+    </div>
+
+    <hr />
+
+    <div style="font-size:12px;font-weight:700;color:#9ca3af;margin-bottom:12px;">Key repositories</div>
+    <div class="g4">
+      <div class="card" style="padding:13px;">
+        <div style="font-size:11px;font-weight:800;color:#60a5fa;margin-bottom:6px;">unhygienix</div>
+        <div style="font-size:11px;color:#4b5563;line-height:1.6;">object_events table · CRUD interceptors · field differ · callback_registrations · SNS publish</div>
+      </div>
+      <div class="card" style="padding:13px;">
+        <div style="font-size:11px;font-weight:800;color:#60a5fa;margin-bottom:6px;">external-api-server</div>
+        <div style="font-size:11px;color:#4b5563;line-height:1.6;">GET /events read endpoint<br>Callback CRUD endpoints</div>
+      </div>
+      <div class="card" style="padding:13px;">
+        <div style="font-size:11px;font-weight:800;color:#60a5fa;margin-bottom:6px;">postaldistrix</div>
+        <div style="font-size:11px;color:#4b5563;line-height:1.6;">Extend for webhook HTTP delivery · retry logic · DLQ handling</div>
+      </div>
+      <div class="card" style="padding:13px;">
+        <div style="font-size:11px;font-weight:800;color:#60a5fa;margin-bottom:6px;">ignoramus</div>
+        <div style="font-size:11px;color:#4b5563;line-height:1.6;">Proto: CallbackRegistration · CallbackEvent · CallbackAuthConfig</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════ SLIDE 8 — Roadmap + V2 Summary ════════════════════ -->
+<div class="slide" data-t="Roadmap &amp; V2 Summary">
+  <div class="inner">
+    <div class="sh">
+      <div class="kicker">Delivery Plan</div>
+      <h2>Sprint Roadmap</h2>
+    </div>
+
+    <div class="roadmap">
+      <div class="rphase rv1">
+        <div class="rsprint">Sprint 1–2</div>
+        <div class="rtitle hl-blue">V1 — Activity Feed UI</div>
+        <div class="ritem">object_events table + migrations</div>
+        <div class="ritem">Interceptors for Questions + Data Connections</div>
+        <div class="ritem">Field differ (before/after JSONB diff)</div>
+        <div class="ritem">GET /cleanrooms/{id}/events API</div>
+        <div class="ritem">Activity tab UI with filters</div>
+        <div class="rnote">Ships value to every user immediately. No infra risk. Cursor API available to XMI as near-term integration.</div>
+      </div>
+      <div class="rphase rv2">
+        <div class="rsprint">Sprint 3–5</div>
+        <div class="rtitle hl-orange">V2 — Webhook Callbacks</div>
+        <div class="ritem">callback_registrations table + proto defs</div>
+        <div class="ritem">Callback CRUD endpoints (external-api-server)</div>
+        <div class="ritem">SNS publish step in V1 interceptors</div>
+        <div class="ritem">SQS consumer / delivery worker</div>
+        <div class="ritem">Retry (1s → 5s → 30s) + DLQ</div>
+        <div class="ritem">Delivery status visible in UI</div>
+        <div class="rnote">Enables XMI UI to stop polling entirely.</div>
+      </div>
+      <div class="rphase rv3">
+        <div class="rsprint">Sprint 6–7</div>
+        <div class="rtitle hl-green">V3 — Production Hardening</div>
+        <div class="ritem">HMAC signature on payloads</div>
+        <div class="ritem">DLQ admin visibility + replay</div>
+        <div class="ritem">Event replay API</div>
+        <div class="ritem">Webhook test endpoint</div>
+        <div class="ritem">Precise per-field subscriptions</div>
+        <div class="rnote">For enterprise and external customers.</div>
+      </div>
+    </div>
+
+    <hr />
+
+    <div style="font-size:12px;font-weight:800;color:#fb923c;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;">V2 Summary — Webhook Callback Delivery</div>
+    <div class="v2box">
+      <p style="font-size:13px;line-height:1.7;">
+        V2 adds <strong style="color:#fb923c;">push-based notification</strong> for programmatic consumers. Once a callback URL is registered via <code>POST /cleanrooms/{'{id}'}/callbacks</code>, Habu automatically calls that URL when a monitored object changes — sending the object name, change type, who changed it, and when. Delivery is fully async (SNS → SQS → worker), so the user's mutation never waits for the external endpoint. Failed deliveries retry up to 3× with exponential backoff; undeliverable events go to a Dead Letter Queue.
+      </p>
+      <div class="v2flow">
+        <div class="vstep"><strong>Register</strong>POST /callbacks</div>
+        <div class="varr">→</div>
+        <div class="vstep"><strong>Object changes</strong>in Habu</div>
+        <div class="varr">→</div>
+        <div class="vstep"><strong>SNS → SQS</strong>async, ~1ms</div>
+        <div class="varr">→</div>
+        <div class="vstep"><strong>Worker</strong>HTTP POST + retry</div>
+        <div class="varr">→</div>
+        <div class="vstep"><strong>XMI reacts</strong>refresh / update</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<script>
+  let cur = 0;
+  const slides = [...document.querySelectorAll('.slide')];
+  const titles = slides.map(s => s.dataset.t);
+
+  const dotsEl = document.getElementById('dots');
+  titles.forEach((_,i) => {
+    const d = document.createElement('div');
+    d.className = 'dot' + (i===0?' active':'');
+    d.onclick = () => goTo(i);
+    dotsEl.appendChild(d);
+  });
+
+  function goTo(n) {
+    slides[cur].classList.remove('active');
+    dotsEl.children[cur].classList.remove('active');
+    cur = Math.max(0, Math.min(n, slides.length-1));
+    slides[cur].classList.add('active');
+    dotsEl.children[cur].classList.add('active');
+    document.getElementById('ctr').textContent = `${cur+1} / ${slides.length}`;
+    document.getElementById('stitle').textContent = titles[cur];
+    document.getElementById('prevBtn').disabled = cur===0;
+    document.getElementById('nextBtn').disabled = cur===slides.length-1;
+  }
+
+  function go(d){ goTo(cur+d); }
+
+  document.addEventListener('keydown', e=>{
+    if(e.key==='ArrowRight'||e.key==='ArrowDown') go(1);
+    if(e.key==='ArrowLeft'||e.key==='ArrowUp') go(-1);
+  });
+
+  goTo(0);
+</script>
+</body>
+</html>

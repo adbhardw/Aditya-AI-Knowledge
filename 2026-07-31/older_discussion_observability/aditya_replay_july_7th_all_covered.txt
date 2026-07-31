@@ -1,0 +1,123 @@
+Replay — full reasoning, industry framing, and what got built
+Date: 2026-07-08 (filed as requested — replay discussion happened 7/7 into 7/8)
+
+------------------------------------------------------------------------
+
+CONFIRMED, DIRECTLY: object_events supports "replay ALL events," not just one
+
+The original engineering question was about replaying ALL events, not a
+single failed message — confirming: yes, object_events handles this,
+and it's not a stretch to make it work, it's what the table was already
+shaped for. Proof, not assertion: ReplayService.replayAllSince() reuses
+the EXACT SAME repository method GetCleanroomEvents already uses —
+findByCleanroomIdAndCursorPositionGreaterThanOrderByCursorPositionAsc().
+No new query was written for bulk replay. The cursor-based pull API and
+bulk replay are the same underlying capability, used two different ways.
+That's the whole point of building on a real log instead of a queue.
+
+------------------------------------------------------------------------
+
+WHAT "REPLAY" MEANS IN GENERAL — three genuinely different use cases
+
+Industry systems use "replay" to mean three different things, and conflating
+them is where designs get weak:
+
+  1. FAILURE-RECOVERY REPLAY — "this one delivery attempt failed, retry it."
+     Narrow, automatic, short time horizon. This is what an SQS DLQ redrive
+     is, and only what it is.
+
+  2. REPROCESSING REPLAY — "we had a bug in consumer logic for two weeks,
+     re-run everything from that window through the fixed code." Needs to
+     go back further than any queue would ever retain.
+
+  3. BOOTSTRAP/BACKFILL REPLAY — "a new consumer just joined, they need full
+     history, not just events from now on." Needs to replay from the
+     beginning, not from a recent failure point.
+
+Case 1 is a safety net. Cases 2 and 3 are a capability. Most systems only
+build the safety net and wish, later, they'd built the capability from the
+start.
+
+------------------------------------------------------------------------
+
+THE CORE INDUSTRY DISTINCTION: LOG vs QUEUE
+
+A QUEUE (SQS) is destructive by design — once a message is consumed and
+ACKed, it's gone. Anything "replayable" from a queue is bounded by whatever
+still happens to be sitting in it, within its retention window (SQS DLQ:
+max 14 days). This only ever covers case 1.
+
+A LOG (Kafka is the canonical example) is non-destructive — consumers track
+an OFFSET, not a deletion pointer. Replaying is just "reset the offset and
+re-read." This is why log-based architectures treat replay as a first-class,
+cheap, arbitrary-depth operation, not a break-glass recovery procedure.
+Stripe's Events API works the same way — you can page through and re-send
+ANY historical event, not just recently-failed ones, because they keep an
+append-only log, not a queue. GitHub's per-delivery "redeliver" button is
+case-1-only (queue-shaped); their Events API (paging through history) is
+case 2/3-shaped (log-shaped). Two different mechanisms, on purpose.
+
+------------------------------------------------------------------------
+
+WHERE OUR OWN ARCHITECTURE ALREADY LANDED ON THE RIGHT SIDE OF THIS
+
+object_events is append-only, never deleted, with cursor_position as a
+monotonic sequence — that IS a Kafka-style offset, structurally, whether or
+not that was the explicit goal when the schema was designed back in June.
+We were only using this table for two things (write once, serve the pull
+API) before this conversation. The gap wasn't architectural — the log was
+already durable and already cursor-indexed — the gap was that nothing yet
+read from it FOR THE PURPOSE OF REPLAY. That's now closed (see below).
+
+So there are properly TWO TIERS now, not one:
+
+  TIER 1 — DLQ redrive (SQS-native, already covered in the design)
+    Automatic, short-horizon, handles "endpoint was briefly down."
+    Bounded by SQS's own retention (~14 days).
+
+  TIER 2 — log-backed replay (object_events-native, NEW as of this session)
+    On-demand, unbounded horizon, handles reprocessing and backfill.
+    Bounded by nothing — object_events never deletes a row.
+
+------------------------------------------------------------------------
+
+WHAT GOT BUILT (orinix-backend, this session)
+
+  CallbackDeliveryWorker.java — refactored, not rewritten:
+    Extracted the actual delivery step (channel lookup + channel.deliver())
+    into a new public method, deliverToRegistration(registration, event).
+    The live SQS listener (onDispatchMessage) now calls this same method
+    instead of inlining the logic. One implementation, two callers.
+
+  ReplayService.java — new:
+    replayEvent(objectEventId, registrationId)
+      Single-event replay — the case-1-adjacent, "redeliver this one" case.
+    replayAllSince(cleanroomId, registrationId, sinceCursor)
+      Bulk replay — the case-2/3 bulk case the original engineering
+      question actually asked about. Reuses ObjectEventRepository's
+      existing cursor query verbatim (no new query written), then calls
+      CallbackDeliveryWorker.deliverToRegistration() once per event.
+
+Why reuse CallbackDeliveryWorker's method instead of writing a second
+delivery path in ReplayService: so replay can never quietly drift from how
+live delivery actually behaves. One implementation, not two to keep in sync.
+
+------------------------------------------------------------------------
+
+OUSTERHOUT TIE-IN, FOR THE PRESENTATION
+
+  DEFINE ERRORS OUT OF EXISTENCE (ch. 9) — "we lost an event and can't get
+  it back" isn't a risk that gets mitigated by careful ops procedure; it
+  structurally cannot happen, because the log never deletes anything.
+
+  DEEP MODULES / GENERAL-PURPOSE MODULES (ch. 3, 5) — one durable table now
+  quietly serves THREE jobs: live pull (GetCleanroomEvents), live push
+  (DeliveryDispatcher reads it once per event), and replay/backfill
+  (ReplayService reads it on demand). Not three separate mechanisms bolted
+  on independently — the same simple interface (a cursor-scoped query)
+  underneath all three.
+
+  BETTER TOGETHER OR APART (ch. 8) — ReplayService and CallbackDeliveryWorker
+  share the one delivery method rather than each having their own copy —
+  the delivery mechanics belong together regardless of what triggered them
+  (a live SQS message vs. an on-demand replay call).

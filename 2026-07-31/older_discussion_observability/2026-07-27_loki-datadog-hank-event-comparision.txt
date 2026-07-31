@@ -1,0 +1,464 @@
+================================================================================
+LOKI / DATADOG vs. A REAL EVENT STREAM — AND CAN HANK'S GORM HOOK CARRY {from,to}?
+================================================================================
+Date:    2026-07-27
+Author:  Aditya Bhardwaj
+Context: orinix (DV-13856 / DV-15090 / DV-15496) — deciding whether the existing
+         log infrastructure can back GetCleanroomEvents, and whether modifying
+         Hank's shared GORM audit hook is the shortcut it looks like.
+Status:  Q1 answered (no). Q2 answered (technically yes, but it solves the wrong
+         half of the problem — see the pivot in Q2.5).
+
+Everything below marked [VERIFIED] was read in the actual source/infra repos on
+2026-07-27. Everything marked [UNVERIFIED] must be confirmed before it goes in a
+Confluence page or in front of Josh/Jon.
+
+================================================================================
+PART 0 — WHAT THE LOG PIPELINE ACTUALLY IS
+================================================================================
+
+Corrections to the informal description we started from:
+
+[VERIFIED] The node agent is Grafana Alloy, not Promtail. It ships to Grafana
+Cloud Loki (habu.grafana.net — see janus/docs/metrics.md:7), not to an in-cluster
+Loki.
+
+[VERIFIED] The self-hosted Loki in dyogram/charts/monitoring/values.yaml:99-122
+is `enabled: false` and is never enabled in any override in fiddley/. Therefore
+the 168h retention and 512Gi PVC in that chart are DEAD CONFIG. Do not quote
+those numbers anywhere — they describe a Loki that does not run.
+
+[UNVERIFIED] Real retention is a Grafana Cloud plan setting, not visible from the
+repo. Must be pulled from the Grafana Cloud org before any design decision leans
+on it.
+
+[VERIFIED] Log collection is an explicit allowlist, not "everything on the node":
+
+  fiddley/control-plane/infrastructure/prod/aws/monitoring-k8s/prod-overrides.yaml:20-22
+    podLogs:
+      enabled: true
+      namespaces: [armorica, tragicomix, tenansix, forebitt, primage, pegleg,
+                   unhygienix, bucolix, moonraker, picanmix, topgallant,
+                   unimpedimenta, postaldistrix, api-gateway,
+                   external-api-server, cronos, habu-gai, janus,
+                   identity-bridge, kedge]
+
+  fiddley/control-plane/infrastructure/prod/aws/monitoring/prod-overrides.yaml:230
+    containerInclude: "image:(deklared|...ecr...)/(armorica|tragicomix|tenansix|
+                       forebitt|primage|pegleg|unhygienix|bucolix|moonraker|
+                       picanmix|topgallant|unimpedimenta|postaldistrix|
+                       api-gateway|external-api-server|cronos|habu-gai|janus|
+                       identity-bridge) ..."
+    containerExclude: "image:.*"
+
+Note the Datadog agent here is an allowlist regex with a catch-all exclude — it
+is NOT containerCollectAll (that is only the chart default, overridden in prod).
+
+Consequence for us: unhygienix, forebitt and picanmix — the three producers
+orinix cares about — are on BOTH allowlists. Producer-side log data is available
+today, nothing to provision.
+
+Minor ops note only: orinix itself is on neither list, so when it deploys its own
+service logs will land nowhere until both files are edited. This is a pre-deploy
+chore for debugging the delivery worker. It has nothing to do with the event
+stream and should not be presented as a design issue.
+
+================================================================================
+PART 1 — Q1: CAN LOKI OR DATADOG BACK GetCleanroomEvents?
+================================================================================
+Answer: No. Four independent disqualifiers; any one of them is fatal.
+
+--------------------------------------------------------------------------------
+1.1  A TIMESTAMP IS NOT A SEQUENCE
+--------------------------------------------------------------------------------
+orinix's contract:
+    WHERE cleanroom_id = ? AND cursor_position > ? ORDER BY cursor_position LIMIT ?
+cursor_position is a global Postgres sequence assigned at INSERT. Deterministic,
+resumable, and stable — XMI can bookmark it for a week and resume exactly.
+
+A log store's only ordering key is the timestamp, and it fails three ways:
+
+  (a) NOT UNIQUE. Many lines share a millisecond. Paginating on
+      since_timestamp either re-delivers or SKIPS events at every page
+      boundary. There is no tiebreak column to fall back on.
+
+  (b) NOT GLOBALLY ORDERED. Loki orders within a stream
+      ({namespace, pod, container}). Two unhygienix pods writing concurrently
+      are two streams. A merged query interleaves them by time, but there is no
+      single monotonic value a client can bookmark.
+
+  (c) OUT-OF-ORDER ARRIVAL. Alloy buffers during node pressure, eviction or
+      restart, and ships late. A cursor already advanced past that timestamp
+      will NEVER see those events, and the consumer has no way to detect the
+      gap. Silent, undetectable loss on a delivery API is not shippable.
+
+Datadog's Log Search API does expose a page.cursor, but it is opaque, scoped to
+one query + time window, and expires. That is scroll-pagination for a UI, not a
+durable client bookmark across days.
+
+--------------------------------------------------------------------------------
+1.2  org_id / cleanroom_id ARE IN THE LINE, NOT IN THE INDEX
+--------------------------------------------------------------------------------
+Loki indexes LABELS only. cleanroom_id lives inside the payload, so the query is:
+
+    {namespace="unhygienix"} | json | cleanroom_id="X"
+
+The label selector narrows to the stream; then Loki decompresses and scans every
+line in the window. Cost scales with TOTAL unhygienix log volume, not with the
+number of matching events. For an endpoint XMI polls on a loop, that is a full
+scan per request.
+
+The obvious fix is the trap: promoting org_id/cleanroom_id to labels makes stream
+count = orgs x cleanrooms x object types. Grafana Cloud enforces per-tenant
+stream limits and begins rejecting writes (429) past them — i.e. you would drop
+events at INGEST in order to make reads fast. Same shape in Datadog: these would
+need to be indexed facets, which is a billing decision on indexed volume, and
+still yields no stable cursor.
+
+--------------------------------------------------------------------------------
+1.3  THE COMBINE / DIFF PROBLEM  <-- the strongest argument
+--------------------------------------------------------------------------------
+orinix's schema is changedFields { from, to }. A log line records one moment. To
+build a diff from logs, orinix would have to SELF-JOIN log lines across time:
+find the previous line for the same object ID, diff the two, and handle the cases
+where that previous line aged out of retention or was dropped by the agent.
+
+Log stores do not do joins. Not self-joins, not window functions, not "previous
+row for this key." You would be building a stateful stream-processing job over a
+lossy log index to reconstruct information the producer HAD IN MEMORY at write
+time and threw away.
+
+[OUSTERHOUT] This is complexity pushed in exactly the wrong direction.
+Information that is free at the write site is discarded, then expensively and
+imperfectly rebuilt at the read site — and the rebuild is a new subsystem with
+its own failure modes. The "fat publish at the mutation path" approach costs a
+few lines per path PRECISELY BECAUSE that is where the information already sits.
+
+--------------------------------------------------------------------------------
+1.4  IDEMPOTENCY AND THE TENANCY BOUNDARY
+--------------------------------------------------------------------------------
+  - IDEMPOTENCY. UNIQUE(idempotency_key) + ON CONFLICT is permanent dedup.
+    Agents retry after network blips and duplicate lines; a log store enforces
+    nothing. Our at-least-once contract with XMI depends on that constraint
+    existing somewhere.
+
+  - TENANCY. M2 is external customers. In Postgres, "org A cannot see org B" is
+    a typed FK plus a WHERE clause on an indexed column. In LogQL it is a string
+    filter inside a `| json` pipeline that silently matches nothing — or the
+    wrong thing — if a producer renames a field. Log lines also carry everything
+    the service happened to print, so the leak surface is the entire log, not a
+    chosen schema.
+
+--------------------------------------------------------------------------------
+1.5  ONE-LINE VERSION FOR THE DESIGN REVIEW
+--------------------------------------------------------------------------------
+    A log store is a debugging surface, not a query surface. It has no sequence,
+    no index on our keys, and no joins — and orinix's contract needs all three.
+
+[OUSTERHOUT] Layering: Loki is a general-purpose mechanism at the infrastructure
+layer; orinix is a special-purpose API at the domain layer. An orinix backed by
+Loki would be a shallow module whose two-RPC interface leaks LogQL, label sets
+and retention windows to every caller.
+
+--------------------------------------------------------------------------------
+1.6  WHERE LOKI IS GENUINELY THE RIGHT TOOL FOR US
+--------------------------------------------------------------------------------
+Offline, human-driven, one-time analysis. Run by a person, in a browser, with no
+latency or correctness contract attached — the exact opposite access pattern from
+a customer-facing cursor API, which is why the same tool is right for one and
+wrong for the other. Two queries worth running to close open items:
+
+    {cluster="eks-admin-prod", namespace="unhygienix"} |= "Audit Log:"
+
+    sum(count_over_time(
+      {cluster="eks-admin-prod", namespace="unhygienix"} |= "Audit Log:" [24h]))
+
+These size the M3 expansion (events/day, ObjectType distribution across Josh's
+80+ entities) and settle the still-open question of whether blank OrgID/actor
+fields hold in PRODUCTION traffic or were an artifact of the stage row we looked
+at on 2026-07-18.
+
+There is also a defensible place for Loki in the M3 two-tier design — but only as
+the WARM slice of the cold tier:
+    warm forensic window (already exists, zero build) ......... Loki
+    compliance long tail (still to build, Habu-owned) ......... object storage
+That is a better M3 story than "we'll archive to S3," because it shows the
+near-term window is already covered and scopes the build down to the legal tail.
+
+================================================================================
+PART 2 — Q2: CAN WE CHANGE HANK'S GORM HOOK TO CAPTURE BEFORE *AND* AFTER?
+================================================================================
+
+--------------------------------------------------------------------------------
+2.0  FIRST, A CORRECTION THAT MAKES THE QUESTION BIGGER
+--------------------------------------------------------------------------------
+I previously said the audit line for a stage change "contains Stage: STAGE_X and
+nothing about what it was before." That was wrong, and wrong in the direction
+that matters.
+
+[VERIFIED] hank/db/audit.go — the AuditLog struct contains NO FIELD VALUES AT ALL:
+
+    type AuditLog struct {
+        ObjectID, ObjectName, ObjectType, Action string
+        ActionByID, ActionByEmail                string
+        ActionAt                                 time.Time
+        Method, OrgID, RequestID                 interface{}
+        ImpersonatedByID, ImpersonatedByEmail    string
+    }
+
+and getObjectDetails(scope.Value) marshals the model to JSON and pulls exactly
+two keys: "ID", and "Name" (falling back to "DisplayName").
+
+So the line says "user U updated a DataImportJob with ID X at time T via method
+M." It does not say WHICH COLUMN CHANGED, nor to what. The after-state is absent
+too, not just the before-state.
+
+This means Q2 is not "add the from side to an existing to side." It is "add both
+sides where today there are neither." Scope roughly doubles.
+
+--------------------------------------------------------------------------------
+2.1  IS IT MECHANICALLY POSSIBLE? YES
+--------------------------------------------------------------------------------
+The hooks are registered globally, once, for every Hank-consuming service:
+
+  [VERIFIED] hank/db/service.go:83-91
+    func applyEmbeddedHooks(db *gorm.DB) {
+        beforeCreateCallback := *db.Callback().Create()
+        beforeCreateCallback.After("gorm:before_create")
+        beforeCreateCallback.Register("gorm:audit_before_create", auditBeforeCreate)
+
+        beforeUpdateCallback := *db.Callback().Update()
+        beforeUpdateCallback.After("gorm:before_update")
+        beforeUpdateCallback.Register("gorm:audit_before_update", auditBeforeUpdate)
+    }
+
+The shape of the change would be:
+  - In BeforeUpdateHook: SELECT the current row by primary key, stash it via
+    scope.InstanceSet("audit:before_image", oldRow).
+  - In AfterUpdate: read it back, diff against the update attrs, emit {from,to}.
+
+That is a small, clean-looking diff. Which is exactly why it needs the six
+objections below before anyone estimates it.
+
+--------------------------------------------------------------------------------
+2.2  SIX REASONS IT IS NOT THE SHORTCUT IT LOOKS LIKE
+--------------------------------------------------------------------------------
+
+(a) BLAST RADIUS — one extra SELECT per UPDATE, fleet-wide, instantly.
+    applyEmbeddedHooks runs on the shared DB handle for EVERY Hank consumer
+    (~91 models embedding db.Audit in unhygienix alone, plus forebitt, primage,
+    picanmix...). Adding a read to BeforeUpdateHook doubles the query count on
+    every update path in the platform the moment services bump the hank version.
+    Nobody outside our project asked for this, and some of those paths are hot.
+
+(b) BULK / CONDITION-SCOPED WRITES BREAK IT — with a real example.
+    A before-image by primary key works for single-row updates. For
+    Model(&X{}).Where(...).Updates(...) or .Delete(...) across N rows there is
+    no single PK; the hook would need SELECT ... WHERE <same conditions>
+    returning N rows, and GORM v1 gives no reliable way to match them back up
+    afterwards. So the hook is correct for by-PK updates and either wrong or
+    silently skipped for condition-scoped ones — the worst kind of partial
+    correctness, because it looks complete.
+
+    THE WORKED EXAMPLE (found 2026-07-28, and it is worse than the general case):
+    editing a data connection's parameters is not an UPDATE at all. It is a
+    condition-scoped DELETE followed by N fresh INSERTs, with new identities.
+
+      [VERIFIED] forebitt/db/job_parameters.go:109-167
+                 SetOrganizationJobParametersInTransaction(...)
+          1. ClearOrganizationJobParameters(tx, ...)          // line 121
+          2. for each incoming param:
+                 inParamObj.ID = uuid.New().String()          // line 150  <--
+                 tx.Create(inParamObj)                        // line 154
+
+      [VERIFIED] forebitt/db/job_parameters.go:65-82
+                 ClearOrganizationJobParameters(...)
+          importDataSourceParameterIDS, err := FetchImportDataSourceParameterIDS(...)   // line 72
+          return db.Scopes(
+              DataImportJobIDScope(importJobID),
+              ImportDataSourceIDScope(importDataSourceID),
+              ImportDataSourceParameterIDsScope(importDataSourceParameterIDS),
+              OrganizationScope(organizationID)).
+              Delete(models.OrganizationJobParameter{}).Error                            // line 81
+
+      [VERIFIED] forebitt/models/organization_job_parameter.go:11-20 — the model
+      embeds hdb.Audit, so the audit hooks DO fire on all of this.
+
+    Three consequences, each independently fatal to the log-derived-diff idea:
+
+      (i)  THE DELETE AUDIT LINE IS BLANK. scope.Value here is the empty struct
+           literal models.OrganizationJobParameter{}, so getObjectDetails()
+           (hank/db/audit.go) marshals it and finds ID = "" and Name = "". The
+           emitted AfterDelete line carries ObjectID: "". One line, no identity,
+           for an unbounded number of deleted rows.
+
+      (ii) ROW IDENTITY IS DESTROYED ON EVERY EDIT. Line 150 mints a brand-new
+           uuid for every parameter on every save. So the "same" parameter has a
+           different primary key before and after. There is no key to join on —
+           not in logs, not anywhere. Reconstructing "parameter 'bucket' changed
+           from X to Y" from the audit stream is not hard, it is IMPOSSIBLE.
+
+      (iii) A ONE-FIELD EDIT LOOKS LIKE A FULL REPLACEMENT. A user changing one
+           value produces one blank DELETE line plus N CREATE lines with new
+           ids. Any consumer diffing this sees every parameter as new.
+
+    This single call path demolishes both halves of the argument at once: it is
+    the concrete proof of 1.3 (logs cannot be self-joined — here there is not
+    even a stable key to join ON), and it is the concrete proof that a
+    before-image hook in Hank cannot cover the paths XMI actually cares about.
+
+    It also widens the security objection (d) below: OrganizationJobParameter
+    has a free-text Value column (line 19) carrying connection configuration —
+    line 152 rewrites "S3://" to "s3://" in it — so a generic before/after diff
+    would push data-connection config into the log index too, not just
+    primage.Credential.
+
+(c) THE AFTER-IMAGE IS ALSO PARTIAL.
+    [VERIFIED] forebitt/db/job_v2.go:38-45
+        tx.Model(&models.DataImportJob{}).Updates(*job)
+    GORM v1 converts the struct to a map of NON-ZERO fields. Zero values are
+    dropped — so "Stage set to empty", "IsInternal set to false", "CurrentTries
+    set to 0" are invisible at this layer. Getting a truthful "to" side means a
+    SECOND extra SELECT after the update. Now it is two extra queries per update,
+    fleet-wide.
+
+(d) SECURITY — this is a hard blocker, not a caveat.
+    A generic before/after diff dumps every column of every audited model into
+    stdout, and from there into Loki and Datadog. Concretely:
+      [VERIFIED] primage/models/models.go:219-226
+        type Credential struct {
+            UUID
+            hdb.Audit          <-- audited by the shared hook
+            TimeAudit
+            OrganizationCredentialsID string
+            Name                      string
+            Value                     string   <-- the secret
+        }
+    A naive diff logs Credential.Value's before and after into a third-party log
+    index. Any version of this change needs a field-level allow/deny list before
+    it can even be prototyped, and it will not clear a security review without
+    one.
+
+(e) THE CLAIMS GATE MEANS COVERAGE STAYS INCOMPLETE.
+    [VERIFIED] every hook begins:
+        tokenClaims, ctx, parsed := claims(scope)
+        if !parsed { return nil }
+    and claims() requires scope.DB().Get("context"), which is only set by
+    BeginDB/BeginTxDB. So any mutation without parsed auth claims in context —
+    background pipeline work, service-to-service calls without a bound user —
+    produces NO audit line at all, diff or no diff. XMI's #1 use case is
+    DataConnection STAGE CHANGES, many of which are driven by the async import
+    pipeline rather than a user request. Fixing the content of the line does not
+    fix the fact that the line may never be written.
+    [UNVERIFIED] exactly which forebitt stage transitions run without claims —
+    worth tracing before relying on this argument in front of Josh.
+
+(f) IT IS STILL A LOG LINE — Part 1 applies unchanged.
+    The output still goes to hlog...Infof("Audit Log: %s", ...) -> stdout ->
+    Alloy -> Loki. No sequence, no index on our keys, no dedup, best-effort
+    shipping, retention we do not control. We would have fixed the CONTENT
+    problem and none of the TRANSPORT problems. GetCleanroomEvents is still not
+    servable. This is the whole ballgame, and (a)-(e) are just the price of
+    admission.
+
+--------------------------------------------------------------------------------
+2.3  THE INFORMATION IS ALREADY FREE AT THE CALL SITE — WITH RECEIPTS
+--------------------------------------------------------------------------------
+The premise behind Q2 is that the before-state is hard to get. In forebitt it is
+already in hand:
+
+  [VERIFIED] forebitt/api/server/job_service.go:1552 (UpdateImportJob)
+      dbJob, notFound := db.FetchJobByID(s.DB, in.Job.Id)
+      ...
+  [VERIFIED] job_service.go:~1583 — it ALREADY does an old-vs-new comparison:
+      if dbJob.Name != in.Job.Name || dbJob.ImportDataTypeID != in.Job.ImportDataType.Id {
+          // and already publishes a thin hevent.EventStruct here
+      }
+
+  [VERIFIED] forebitt/api/server/job_service.go:1828 (UpdateImportJobStage)
+      _, notFound := db.FetchJobByID(s.DB, in.Id)
+      ^-- the before-row is fetched and THROWN AWAY. It is used only as an
+          existence check. The before-image is literally one character away
+          (`_` -> `dbJob`).
+
+So the fat publish with {from, to} is a genuinely small, local change on these
+paths — not because we are optimistic, but because the SELECT is already there
+and in one case already being diffed.
+
+  [UNVERIFIED / worth a second look] UpdateImportJobStage sets
+  models.DataImportJob{Status: in.Status} — Status, not Stage — despite the
+  function name and despite Stage being a separate column
+  (forebitt/models/data_import_job.go:27). Might be intentional (it takes an
+  UpdateImportJobStatus_Request), might be a latent bug. Check before building a
+  stage-change event on top of this path.
+
+--------------------------------------------------------------------------------
+2.4  VERDICT ON Q2
+--------------------------------------------------------------------------------
+Modifying Hank's shared hook to capture before/after is technically feasible and
+would genuinely improve the AUDIT LOG PRODUCT (Josh's M3 ask). It does NOT solve
+orinix's problem, because orinix's problem was never "the diff is missing from
+the log line." It is "a log line is not an event." Objection (f) survives every
+version of this change.
+
+Recommendation: do NOT change the hook for orinix M1. Keep the per-path fat
+publish. Revisit the hook for M3 — and when we do, see 2.5.
+
+--------------------------------------------------------------------------------
+2.5  THE PIVOT — IF WE TOUCH THE HOOK, MAKE IT PUBLISH, NOT LOG
+--------------------------------------------------------------------------------
+This is the useful idea hiding inside Q2.
+
+The two M3 paths already on the table are (i) instrument ~91 mutation points
+individually, or (ii) modify Hank's shared hooks. What Q2 adds is: if we take
+path (ii), the before/after capture work is THE SAME WORK whether the result is
+logged or published. So the choice is free — and publishing solves the transport
+problem that logging cannot:
+
+    hook builds {from,to}  ->  hlog.Infof(...)        ->  Loki   [dead end]
+    hook builds {from,to}  ->  event publisher        ->  object_events
+                                                          + idempotency_key
+                                                          + cursor_position
+                                                          + real query API
+
+[VERIFIED, from 2026-07-18] the GORM audit hooks and the SNS event publisher
+(hank/events.EventClient) are structurally independent systems inside the same
+shared library — the hooks never call the publisher today. So this is a real
+wiring decision with real blast radius, not a free ride. But it is the RIGHT
+version of the question to bring to Josh, and it reframes his "should Hank's
+hooks feed the audit store" question productively.
+
+Objections (a)-(e) still apply to path (ii) in either form and must be answered
+first — especially (d), the credential-value leak, which is disqualifying until
+a field-level allow/deny list exists.
+
+================================================================================
+PART 3 — ACTION ITEMS
+================================================================================
+1. Run the two LogQL queries in 1.6 against prod. Settle the blank-OrgID/actor
+   question with production data before presenting it to Jon or Josh.
+2. Get the real Grafana Cloud Loki retention number from whoever owns the org.
+   It is the only input that decides where the warm/cold boundary sits in M3.
+3. Trace which forebitt stage transitions run without parsed auth claims (2.2e).
+   This bounds how much of XMI's #1 use case the Hank hook could ever cover.
+4. Check whether UpdateImportJobStage writing Status instead of Stage is
+   intentional (2.3) before building a stage-change event on that path.
+5. Open a low-priority ticket to add orinix to both log allowlists before first
+   deploy (Part 0) — ops hygiene only, not a design item.
+6. Take 2.5 to Josh as the reframed version of the Hank-hooks question, with
+   (a)-(e) attached as the cost side. Lead with the worked example in 2.2(b) —
+   it is the most concrete thing in this document.
+7. NEW, and a genuine design question for orinix M1, not just for M3:
+   what does a DATA_CONNECTION changed-fields event look like when the
+   parameters are delete-and-reinsert with fresh uuids (2.2b)? Options:
+     - diff by (ImportDataSourceParameterID, Name) — the STABLE business key —
+       rather than by the row's primary key, and build {from,to} at the service
+       layer where both lists are in hand;
+     - or treat parameters as an opaque set and emit a single
+       "parameters replaced" event with the full before/after collection.
+   The first is more useful to XMI and is still cheap, because
+   SetOrganizationJobParametersInTransaction already fetches the job
+   (job_parameters.go:111) and ClearOrganizationJobParameters already computes
+   the affected parameter-id set (job_parameters.go:72). Decide this before
+   writing the forebitt publisher — it is the one place where our uniform
+   changedFields {from,to} model does not map cleanly onto the storage.

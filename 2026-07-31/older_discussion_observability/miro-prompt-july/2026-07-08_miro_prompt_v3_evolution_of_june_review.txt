@@ -1,0 +1,208 @@
+Miro Prompt V3 — Evolution of the diagram presented to Josh (June review)
+Date: 2026-07-08
+Base: this preserves the shape, colors, and structure of
+2026-06-02/miro_prompt_full_diagram_2026-06-02.md (the source of the PDF you
+presented) so the room recognizes continuity from the last review — same
+producer boxes, same SNS band, same rejoin-at-external-api-server pattern,
+same bottom-scorecard convention. What changed since June, reflected here:
+  - Option A (Pegleg consumer) is GONE. orinix won. No more split/rejoin —
+    one path, not two columns.
+  - Delivery now has THREE branches, not two: Pull, Webhook, AND Pub/Sub
+    (Pub/Sub didn't exist in the June version at all).
+  - DLQ + Replay gets its own explicit section (June version only had a
+    small failure-path box).
+  - Idempotency-at-XMI is now its own band, not buried in a side sticky.
+  - Every box shortened to 3-6 lines — June's boxes had full inline
+    proto/JSON, which is exactly what collapses in Miro.
+  - Bottom scorecard replaced: comparing Option A vs B no longer makes
+    sense (decided), so it's now "why orinix is built this way," anchored
+    in Ousterhout principles instead.
+
+---
+
+```
+Create an enterprise architecture flowchart titled:
+"DV-13856 — orinix: Cleanroom Observability, Since the June Review"
+Subtitle: "Same mutation layer you've seen · orinix now decided · Pub/Sub added · DLQ + Replay detailed"
+
+LAYOUT: Strictly TOP-TO-BOTTOM vertical flowchart, single center spine (no
+Option A/B split anymore — that decision is closed). Keep every box body to
+3-6 short lines — no embedded JSON/proto/step-lists. Rounded corners, drop
+shadows, same color family as the June diagram for continuity.
+
+======================================================================
+SECTION A — MUTATION LAYER (full width) — UNCHANGED FROM JUNE
+======================================================================
+
+  Box A1 (blue): "unhygienix"
+    QUESTION, FLOW, FLOW_RUN
+    Publishes post-commit
+
+  Box A2 (teal): "forebitt"
+    DATA_CONNECTION
+    Publishes post-commit
+
+  Box A3 (orange): "picanmix"
+    EXPORT_JOB
+    Publishes post-commit
+
+  Side sticky (gray): "No service calls another. SNS only. Same as June."
+
+All three → down arrow: "POST COMMIT, non-blocking, ~1ms"
+
+======================================================================
+SECTION B — SNS (full width) — UNCHANGED FROM JUNE
+======================================================================
+
+  Box B1 (orange, wide): "AWS SNS — habu-observability-events"
+    Internal event bus, stays in Habu AWS
+
+Arrow down: "SNS → SQS"
+
+────────────────────────────────────────────────────────────────────
+NOTE WHERE THE JUNE SPLIT USED TO BE:
+Label (strikethrough style if Miro supports it, else plain):
+  "Option A (Pegleg) — REMOVED. orinix is the only consumer now."
+────────────────────────────────────────────────────────────────────
+
+======================================================================
+SECTION C — orinix (full width, purple — was the "Option B" column in June,
+now the only column)
+======================================================================
+
+  Box C1 (purple, large): "orinix — SQS Consumer"
+    Reads sqs-habu-observability-internal
+    Idempotent insert, plain method call
+    Own DB, own gRPC port — gangway precedent
+
+  Side sticky (teal): "DEEP MODULE — one insert, hides all queue wiring"
+
+  Arrow down: "INSERT"
+
+  Box C2 (purple): "object_events — orinix Postgres"
+    Append-only, no update/delete
+    cursor_position — global sequence
+    changed_fields { from, to } — uniform shape
+
+  Arrow down:
+
+  Box C3 (purple): "DeliveryDispatcher"
+    One event → N registrations
+    Fan-out, one message per registration
+
+  Side sticky (teal): "Fan-out kept separate from dispatch — two concerns,
+    not one conflated interface"
+
+======================================================================
+SECTION D — external-api-server (full width) — SAME ROLE AS JUNE
+======================================================================
+
+  Box D1 (green, full width): "external-api-server"
+    @GrpcClient("orinix") — one entry, same pattern as
+    every other backend call
+    Same REST contract XMI already saw in June
+
+======================================================================
+SECTION E — CloudEvents payload (full width, yellow) — UNCHANGED SHAPE
+======================================================================
+
+  Box E1 (yellow): "CloudEvents v1.0 envelope"
+    specversion, id, source, type, time, data
+    changedFields { from, to } — same for all object types
+    Same schema regardless of delivery path below
+
+  Side callout (teal, prominent): "Vendor-neutral — GCP Eventarc, Azure
+    Event Grid, AWS EventBridge all consume this natively"
+
+────────────────────────────────────────────────────────────────────
+SPLIT — three delivery branches now, not two like June
+Label: "Pull (cursor)  |  Webhook (push)  |  Pub/Sub (push) — NEW SINCE JUNE"
+────────────────────────────────────────────────────────────────────
+
+======================================================================
+SECTION F-LEFT — PULL (green) — SAME AS JUNE
+======================================================================
+
+  Box F-L1 (green): "XMI polls on schedule"
+    GET .../events?since_cursor=X&limit=N
+    30-60s latency, no inbound endpoint
+
+======================================================================
+SECTION F-MID — WEBHOOK (orange) — SAME AS JUNE, SHORTENED
+======================================================================
+
+  Box F-M1 (orange): "Registration"
+    POST .../callbacks, delivery_type=WEBHOOK
+    Returns signing_secret once
+
+  Box F-M2 (orange): "Delivery"
+    HMAC-SHA256 signed (symmetric secret)
+    X-Habu-Signature, X-Habu-Event-Id
+
+======================================================================
+SECTION F-RIGHT — PUB/SUB (purple) — NEW, DID NOT EXIST IN JUNE
+======================================================================
+
+  Box F-R1 (purple): "Registration"
+    delivery_type=PUBSUB
+    gcp_project_id + gcp_topic_id
+
+  Box F-R2 (purple): "Delivery"
+    Publish via Google Pub/Sub SDK
+    Auth: WIF or static key — open decision
+    Same SDK pattern as pegleg's billing publisher
+
+  Side sticky (teal): "STRATEGY PATTERN — Webhook and Pub/Sub are two
+    DeliveryChannel implementations, one interface, zero branching
+    in the worker"
+
+======================================================================
+SECTION G — IDEMPOTENCY AT XMI (full width) — ITS OWN BAND NOW,
+was a small side-note in June, promoted to a full section
+======================================================================
+
+  Box G1 (yellow, full width): "Idempotency — required on ALL 3 paths"
+    Same event id: producer → SNS → SQS → object_events → XMI
+    orinix dedupes on insert (unique constraint)
+    XMI MUST dedupe too — at-least-once, not exactly-once
+
+======================================================================
+SECTION H — DLQ + REPLAY (full width, red) — EXPANDED FROM JUNE'S
+single small failure box into its own explicit section
+======================================================================
+
+  Box H1 (red): "Retry"
+    5 attempts, exponential backoff + jitter
+    SQS-native — no Postgres attempt counter
+
+  Box H2 (red): "DLQ"
+    Exhausted → dead letter queue
+    CloudWatch alarm → Habu on-call (not XMI)
+
+  Box H3 (red): "Replay"
+    On-call confirms root cause fixed
+    Native AWS redrive-to-source action
+    Manual for M1 — no custom tooling yet
+
+======================================================================
+SECTION I — BOTTOM: replaces June's Option A/B scorecard
+(that decision is closed — this is "why orinix is built this way")
+======================================================================
+
+  Box I1 (dark blue, full width): "Design principles behind this build"
+    Deep Modules — orinix's insert hides all queue/DB complexity
+    Information Hiding — delivery_type hides "how," ingest never branches
+    Strategy Pattern — one interface, two delivery channels
+    Design It Twice — Java vs Go vs Hybrid, 5 delivery patterns compared
+    Chesterton's Fence — reused pegleg's proven SQS + Pub/Sub code, not rebuilt
+    Define Errors Out of Existence — cursor + idempotency key designed in
+      from day one, not retrofitted
+
+COLOR SPEC (kept from June for continuity):
+  Blue = unhygienix, Teal = forebitt, Orange = picanmix / webhook branch,
+  Purple = orinix / pubsub branch, Green = pull branch / external-api-server,
+  Yellow = CloudEvents / idempotency, Red = DLQ/replay, Dark blue = closing
+  principles box.
+Every box 3-6 short lines max. No inline JSON/proto — name the artifact,
+point to the Confluence doc (or the terminology glossary) for full schema.
+```

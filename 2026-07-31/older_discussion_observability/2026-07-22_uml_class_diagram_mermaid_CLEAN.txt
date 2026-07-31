@@ -1,0 +1,236 @@
+2026-07-22 — CLEAN UML class diagram (Mermaid) for the delivery
+Strategy pattern
+
+Why this replaces the Miro-AI attempt: the Miro version (uml-class-
+diagram.pdf) came out messy for three fixable reasons —
+  1. The implements arrows didn't render — WebhookDeliveryChannel and
+     PubSubDeliveryChannel floated disconnected from DeliveryChannel,
+     killing the entire point of the diagram.
+  2. Too many classes — 6 data/value objects (ObjectEvent, CloudEvent,
+     ObjectEventEntity, DeliveryResult, SqsDispatchMessage,
+     CallbackRegistration) cluttered the behavior story. Those belong
+     in the ER diagram, not here.
+  3. Miro AI auto-layout is non-deterministic for UML — won't reliably
+     group an inheritance hierarchy or use correct arrowheads.
+
+Fix: use Mermaid (deterministic, correct UML arrows) and include ONLY
+behavior classes. Paste into mermaid.live or any Mermaid-enabled tool.
+
+================================================================================
+MERMAID SPEC — paste as-is
+================================================================================
+
+classDiagram
+    class DeliveryChannel {
+        <<interface>>
+        +deliver(registration, event) DeliveryResult
+    }
+    class WebhookDeliveryChannel {
+        -signPayload with HMAC-SHA256
+        +deliver(registration, event)
+    }
+    class PubSubDeliveryChannel {
+        -auth via WIF / static key
+        +deliver(registration, event)
+    }
+    class DeliveryDispatcher {
+        -channels : Map~String, DeliveryChannel~
+        +dispatch(event) void
+    }
+    class CallbackDeliveryWorker {
+        -sqsQueueName : string
+        +deliverToRegistration(reg, event) void
+    }
+    class ReplayService {
+        +replayEvent(eventId, registrationId)
+        +replayAllSince(cleanroomId, registrationId, sinceCursor)
+    }
+    class ObjectEventMapper {
+        +toCloudEvent(entity) CloudEvent
+    }
+
+    DeliveryChannel <|.. WebhookDeliveryChannel : implements
+    DeliveryChannel <|.. PubSubDeliveryChannel : implements
+    CallbackDeliveryWorker o--> "by type" DeliveryChannel : holds & selects
+    CallbackDeliveryWorker ..> CallbackRegistrationEntity : reads delivery_type
+    DeliveryDispatcher ..> CallbackRegistrationEntity : queries ACTIVE regs
+    DeliveryDispatcher ..> CallbackDeliveryWorker : via SQS queue (decoupled, no direct ref)
+    ReplayService ..> CallbackDeliveryWorker : reuses deliverToRegistration
+
+CORRECTION 2026-07-22 (verified against the real scaffold, orinix repo):
+  - The Map<String, DeliveryChannel> aggregation is on CallbackDeliveryWorker
+    (CallbackDeliveryWorker.java:34), NOT DeliveryDispatcher. The earlier
+    version of this file wrongly put it on DeliveryDispatcher — corrected above.
+  - DeliveryDispatcher holds only CallbackRegistrationRepository +
+    QueueMessagingTemplate + ObjectMapper(Jackson). It does NOT reference
+    DeliveryChannel and does NOT reference CallbackDeliveryWorker directly —
+    the two are decoupled through the SQS queue sqs-habu-delivery-xmi
+    (Dispatcher convertAndSend -> queue; Worker @SqsListener <- queue).
+  - CallbackRegistrationEntity added: it's the DB row that stores WHICH
+    delivery mechanism a consumer (e.g. XMI) registered — delivery_type
+    (WEBHOOK|PUBSUB) + delivery_config (url/topic). The worker reads
+    registration.getDeliveryType() to pick the channel from the Map.
+  - ObjectEventMapper REMOVED from this diagram: not present in this
+    checkout of the orinix repo (the Q8 schema-drift work referenced one,
+    which may live in a different checkout — re-verify before drawing it).
+
+To add the two classes referenced above, include in the class list:
+
+    class DeliveryDispatcher {
+        +dispatch(event) void
+    }
+    class CallbackRegistrationEntity {
+        +deliveryType : WEBHOOK | PUBSUB
+        +deliveryConfig : url or topic
+    }
+
+================================================================================
+HOW THE ARROWS READ (so you can explain it live)
+================================================================================
+
+  <|..  hollow triangle, dashed  = "implements/realizes an interface"
+        WebhookDeliveryChannel and PubSubDeliveryChannel each realize
+        DeliveryChannel. THIS is the Strategy pattern — the one line
+        the Miro version dropped.
+
+  o-->  open diamond  = "aggregates" — DeliveryDispatcher holds a Map
+        of many DeliveryChannel (Spring auto-collects each @Component
+        by name; no factory class).
+
+  ..>   dashed arrow  = "uses/depends on" — the worker uses a channel
+        to deliver and the mapper to build the payload; ReplayService
+        reuses the worker's deliverToRegistration method.
+
+Caption for the slide:
+  "Adding a new delivery mechanism (e.g. Azure Event Grid) = one new
+  class implementing DeliveryChannel. No change to the dispatcher, the
+  worker, or any existing channel. Open/closed principle in practice."
+
+================================================================================
+IF YOU MUST STAY IN MIRO (tightened prompt — behavior classes only)
+================================================================================
+
+Create a UML class diagram of a Strategy pattern, clean flat style.
+Place the interface at the TOP CENTER, its two implementations
+directly BELOW it connected by hollow-triangle "implements" arrows
+(this connection is the most important element — it must be drawn).
+Palette: purple interface, blue implementations, green orchestration.
+Only these 7 classes, no data/value-object classes:
+
+  <<interface>> DeliveryChannel        [purple, top center]
+    + deliver(registration, event): DeliveryResult
+
+  WebhookDeliveryChannel   [blue]  --implements-->  DeliveryChannel
+  PubSubDeliveryChannel    [blue]  --implements-->  DeliveryChannel
+
+  DeliveryDispatcher       [green]
+    + dispatch(event): void
+    --queries ACTIVE regs-->  CallbackRegistrationEntity
+    --via SQS queue (decoupled, no direct ref)-->  CallbackDeliveryWorker
+
+  CallbackDeliveryWorker   [green]
+    - channelsByType: Map<String, DeliveryChannel>   (the aggregation is HERE)
+    + deliverToRegistration(reg, event): void
+    --aggregates (open diamond), "by type"-->  DeliveryChannel
+    --reads delivery_type-->  CallbackRegistrationEntity
+
+  CallbackRegistrationEntity  [yellow — data]
+    + deliveryType: WEBHOOK | PUBSUB
+    + deliveryConfig: url or topic
+
+  ReplayService            [green]
+    + replayEvent(eventId, registrationId)
+    + replayAllSince(cleanroomId, registrationId, sinceCursor)
+    --reuses-->  CallbackDeliveryWorker
+
+Draw every "implements/aggregates/uses/reuses" connector explicitly
+with the correct UML arrowhead. CORRECTED: the DeliveryChannel
+aggregation is on CallbackDeliveryWorker, NOT DeliveryDispatcher (the
+dispatcher does fan-out to a queue and never holds a channel). Do NOT
+add ObjectEvent, CloudEvent, DeliveryResult, SqsDispatchMessage, or
+ObjectEventMapper (not in this checkout) — data classes belong in the
+ER diagram.
+
+Note: even with this tightened prompt, Miro AI may still drop
+connectors or scatter boxes — Mermaid above is the reliable option for
+a presentation. Prefer it unless you specifically need the diagram
+inside a Miro board.
+
+================================================================================
+BEST MIRO PROMPT — layout-explicit, paste as-is (fixes dropped arrows)
+================================================================================
+
+Tuned to fix the three failures from the first Miro attempt: dropped
+implements arrows, too many boxes, scattered layout. The wording is
+deliberately explicit about POSITIONING and DRAWING EVERY CONNECTOR.
+
+----------------------------- PROMPT START -----------------------------
+
+Create a UML class diagram of the Strategy design pattern, clean
+modern flat style, rounded rectangles, one colored header bar per
+class.
+
+LAYOUT (follow exactly):
+- TOP ROW, centered: the interface DeliveryChannel.
+- SECOND ROW, directly below the interface: WebhookDeliveryChannel and
+  PubSubDeliveryChannel, side by side. Draw a hollow-triangle
+  "implements" arrow from EACH of these two classes UP to
+  DeliveryChannel. These two arrows are the most important part of the
+  diagram — they must be drawn.
+- THIRD ROW: DeliveryDispatcher and CallbackDeliveryWorker, side by side.
+- FOURTH ROW: ObjectEventMapper and ReplayService.
+
+COLORS: purple header for the interface; blue headers for the two
+implementations; green headers for the four orchestration classes.
+
+CLASSES (only these 7 — do not add any data classes):
+
+DeliveryChannel  «interface»
+  + deliver(registration, event): DeliveryResult
+
+WebhookDeliveryChannel
+  - signs payload with HMAC-SHA256
+  + deliver(registration, event)
+
+PubSubDeliveryChannel
+  - auth via WIF / static key
+  + deliver(registration, event)
+
+DeliveryDispatcher
+  + dispatch(event): void
+
+CallbackDeliveryWorker
+  - channelsByType: Map<String, DeliveryChannel>   (aggregation lives HERE)
+  + deliverToRegistration(reg, event): void
+
+CallbackRegistrationEntity  [yellow — data row that stores the registration]
+  + deliveryType: WEBHOOK | PUBSUB
+  + deliveryConfig: url or topic
+
+ReplayService
+  + replayEvent(eventId, registrationId)
+  + replayAllSince(cleanroomId, registrationId, sinceCursor)
+
+CONNECTORS (draw every one, with the correct UML arrowhead):
+- WebhookDeliveryChannel --implements (hollow triangle)--> DeliveryChannel
+- PubSubDeliveryChannel  --implements (hollow triangle)--> DeliveryChannel
+- CallbackDeliveryWorker --aggregates (open diamond), label "by type"--> DeliveryChannel
+- CallbackDeliveryWorker --reads delivery_type (dashed)--> CallbackRegistrationEntity
+- DeliveryDispatcher --queries ACTIVE regs (dashed)--> CallbackRegistrationEntity
+- DeliveryDispatcher --via SQS queue, decoupled (dashed)--> CallbackDeliveryWorker
+- ReplayService --reuses (dashed arrow)--> CallbackDeliveryWorker
+
+Caption below the diagram: "Adding a new delivery mechanism (e.g.
+Azure Event Grid) = one new class implementing DeliveryChannel. No
+change to the dispatcher, worker, or existing channels — open/closed
+principle in practice."
+
+------------------------------ PROMPT END ------------------------------
+
+Two caveats for the presentation:
+- Miro AI is non-deterministic — it may STILL drop the implements
+  arrows or reflow the layout. If it does, drag the 2 arrows in by hand
+  (~30 seconds) rather than re-prompting.
+- Whichever tool you use (Miro or Mermaid), EXPORT TO AN IMAGE and drop
+  it into the slide ahead of time — don't depend on a tool loading live
+  in the room.

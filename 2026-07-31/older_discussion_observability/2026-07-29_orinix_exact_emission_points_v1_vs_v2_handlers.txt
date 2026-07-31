@@ -1,0 +1,497 @@
+================================================================================
+orinix — EXACT EMISSION POINTS, LINE BY LINE
+CreateDataConnectionV2 / UpdateDataConnectionV2, and how the V1 handlers differ
+================================================================================
+Prepared by: Aditya Bhardwaj
+Date:        2026-07-29
+For:         Anil (Architect)
+Purpose:     Not "roughly where" — the actual line numbers, the actual variables
+             in scope, and the actual patch. Plus the V1-vs-V2 difference, which
+             turns out to change the hook-count argument substantially.
+
+Companion:  2026-07-29_orinix_event_emission_implementation_analysis_qa.txt
+            2026-07-30_aditya-josh-anil-q-and-a-30-july.txt
+
+All line numbers [VERIFIED] against source on 2026-07-29.
+
+================================================================================
+PART 1 — CreateDataConnectionV2   (forebitt/api/server/dataConnections_v2.go:309)
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1 THE HANDLER AS IT STANDS, WITH WHAT IS IN SCOPE AT EACH POINT
+--------------------------------------------------------------------------------
+  :313   authUser := getAuthUser(ctx)          -> *hauth.UserDetails
+                                                  {ID, Name, Email, Type}
+  :318   validateDataConnection(...)            -> request is valid past here
+  :323   dataType, notFound := db.FetchImportDataTypeByID(...)
+  :328   dataSource, notFound := db.FetchImportDataSourceByID(...)
+  :333   jobModel := models.NewImportJobFromProtoV2(in.DataConnection)
+  :334   jobModel.CreatedByUserID = authUser.ID
+  :335   jobModel.Status = ACTIVE
+  :341   jobModel.Stage = stage.Stage
+  :343   dbParameters := make([]*models.OrganizationJobParameter, ...)
+  :345-354  loop fills dbParameters from in.DataConnection.JobParameters
+  :356   err = db.InsertJobV2(ctx, s.DB, &jobModel, dbParameters)
+             ^-- ONE transaction: job INSERT + params DELETE + params INSERT.
+                 jobModel.ID is populated when this returns.
+  :362-371  Snowflake setup — CAN RETURN AN ERROR AFTER THE COMMIT
+  :372   protoDataConnection := convertDataConnectionToProto(ctx, s.DB, &jobModel, dataSource, dataType)
+  :373-376  jobParameters := [...] built from dbParameters via ToProtoV2()
+  :378   protoDataConnection.JobParameters = jobParameters
+  :379   return &dataconnections.CreateDataConnectionV2_Response{...}
+
+--------------------------------------------------------------------------------
+1.2 WHERE THE EVENT GOES: BETWEEN LINE 378 AND LINE 379
+--------------------------------------------------------------------------------
+Why exactly there, and not earlier:
+  - NOT after :356 (InsertJobV2). The Snowflake block at :362-371 can still
+    return an error, and the caller would be told the create failed while XMI
+    was told it succeeded. Emitting after :371 makes the event always true.
+  - NOT before :372. protoDataConnection does not exist yet.
+  - AT :378/:379 everything is assembled and every failure path has already
+    returned. This is the last line before success.
+
+--------------------------------------------------------------------------------
+1.3 THE PATCH
+--------------------------------------------------------------------------------
+    	protoDataConnection.JobParameters = jobParameters                      // :378  existing
++
++   	// ---- orinix observability event -------------------------------------
++   	s.emitDataConnectionEvent(ctx, observability.DataConnectionChange{
++   		ChangeType:  observability.Created,
++   		Actor:       authUser,                 // performedBy = authUser.Email
++   		Before:      nil,                      // nothing existed
++   		BeforeParams: nil,
++   		After:       &jobModel,                // ID populated by InsertJobV2 (:356)
++   		AfterParams: dbParameters,
++   		DataSource:  dataSource,
++   		DataType:    dataType,
++   	})
++   	// ----------------------------------------------------------------------
++
+    	return &dataconnections.CreateDataConnectionV2_Response{                // :379  existing
+    		DataConnection: protoDataConnection,
+    	}, nil
+
+emitDataConnectionEvent is deliberately fire-and-forget with an internal log on
+failure (matching the existing publish convention, and per the recorded decision
+to stay at-most-once for M1). It must NEVER return an error that changes the
+handler's result.
+
+--------------------------------------------------------------------------------
+1.4 WHAT emitDataConnectionEvent BUILDS FOR A CREATE
+--------------------------------------------------------------------------------
+Before = nil, so every field is {from: null, to: <value>}:
+
+    {
+      "specversion": "1.0",
+      "id":   "9f3c1e0a-...",                       // minted here; = idempotency_key
+      "source": "urn:habu:org:<jobModel.OrganizationID>",   // see OPEN-1
+      "type": "com.habu.cleanroom.data_connection.created",
+      "time": "2026-07-29T09:31:07Z",
+      "data": {
+        "objectType": "DATA_CONNECTION",
+        "objectId":   "<jobModel.ID>",
+        "objectName": "<jobModel.Name>",
+        "changeType": "CREATED",
+        "changedFields": {
+          "name":         { "from": null, "to": "Adidas EMEA Customer File" },
+          "category":     { "from": null, "to": "CLEANROOM" },
+          "status":       { "from": null, "to": "ACTIVE" },          // set at :335
+          "stage":        { "from": null, "to": "MAPPING_REQUIRED" },// set at :341
+          "dataSource":   { "from": null, "to": "S3" },              // dataSource.Name
+          "datasetType":  { "from": null, "to": "GENERIC" },         // dataType.Name
+          "credentialId": { "from": null, "to": "c81f...-..." },
+          "parameters":   { "from": null,
+                            "to": { "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers/",
+                                    "SampleFilePath": "s3://adidas-emea-cleanroom/crm/schema/sample_2026_06.csv",
+                                    "FileFormat":     "CSV",
+                                    "FieldDelimiter": ",",
+                                    "FileHeader":     "true" } }
+        },
+        "performedBy":   "aditya.bhardwaj@liveramp.com",   // authUser.Email (:313)
+        "schemaVersion": 1
+      }
+    }
+
+NEW DB READS REQUIRED FOR CREATE: ZERO. Every value above is already a live
+variable at :378.
+
+================================================================================
+PART 2 — UpdateDataConnectionV2   (dataConnections_v2.go:384)
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1 THE HANDLER AS IT STANDS
+--------------------------------------------------------------------------------
+  :388   authUser := getAuthUser(ctx)
+  :393   dbJob, notFound := db.FetchJobByID(s.DB, in.DataConnection.ID)
+             ^-- THE JOB'S BEFORE-IMAGE. It is a VALUE (models.DataImportJob),
+                 so it stays an untouched snapshot for the rest of the handler.
+  :397   validateDataConnection(...)
+  :403   org mismatch check
+  :407   dataType, notFound := ...
+  :412   dataSource, notFound := ...
+  :417   jobModel := models.NewImportJobFromProtoV2(in.DataConnection)
+  :418   jobModel.ID = in.DataConnection.ID
+  :419   jobModel.UpdatedByUserID = authUser.ID
+  :420-431  dbParameters built ENTIRELY FROM THE REQUEST — these are the NEW values
+  :432   err = db.UpdateJobV2(ctx, s.DB, &jobModel, dbParameters)
+  :438-447  Snowflake setup — can return an error after the commit
+  :448   protoDataConnection := convertDataConnectionToProto(...)
+  :453   protoDataConnection.JobParameters = jobParameters
+  :454   return ...
+
+THE GAP: the OLD parameter rows are never read anywhere in this handler, and
+UpdateJobV2 -> SetOrganizationJobParametersInTransaction ->
+ClearOrganizationJobParameters only fetches parameter IDs
+(job_parameters.go:72), never their values. So `from` for parameters does not
+exist unless we fetch it.
+
+--------------------------------------------------------------------------------
+2.2 CHANGE 1 OF 2 — ADD THE PARAMETER BEFORE-IMAGE, AFTER LINE 405
+--------------------------------------------------------------------------------
+Placed after the org-mismatch check so we do not spend a query on a request that
+is about to be rejected, and before :432 which destroys the old rows.
+
+    	if dbJob.OrganizationID != in.DataConnection.OrganizationID {        // :403 existing
+    		return nil, status.Error(codes.InvalidArgument, "organization id mismatch")
+    	}                                                                    // :405 existing
++
++   	// ---- orinix: capture the parameter before-image while it still exists ----
++   	beforeParams, paramErr := db.FetchOrganizationJobParameters(s.DB,
++   		&db.OrganizationJobParameterKey{
++   			OrganizationID:  in.DataConnection.OrganizationID,
++   			DataImportJobID: in.DataConnection.ID,
++   		})
++   	if paramErr != nil {
++   		// non-fatal: we would rather emit an event with an incomplete `from`
++   		// than fail a user's update because observability had a bad day
++   		hlog.LogEntryCtx(ctx).Errorf("orinix: could not read parameter before-image for %s: %v",
++   			in.DataConnection.ID, paramErr)
++   		beforeParams = nil
++   	}
++   	// -------------------------------------------------------------------------
+
+  [VERIFIED] the function already exists — forebitt/db/job_parameters.go:20
+      func FetchOrganizationJobParameters(db *gorm.DB, queryKey *OrganizationJobParameterKey)
+                ([]*models.OrganizationJobParameter, error)
+  and the key type at job_parameters.go:15.
+
+THIS IS THE ONLY NEW QUERY IN THE ENTIRE ORINIX DESIGN.
+
+--------------------------------------------------------------------------------
+2.3 CHANGE 2 OF 2 — EMIT, BETWEEN LINE 453 AND LINE 454
+--------------------------------------------------------------------------------
+    	protoDataConnection.JobParameters = jobParameters                     // :453 existing
++
++   	// ---- orinix observability event -------------------------------------
++   	s.emitDataConnectionEvent(ctx, observability.DataConnectionChange{
++   		ChangeType:   observability.Updated,
++   		Actor:        authUser,
++   		Before:       &dbJob,          // the snapshot from :393
++   		BeforeParams: beforeParams,    // from 2.2
++   		After:        nil,             // <-- NOT jobModel. see 2.4
++   		AfterParams:  dbParameters,
++   		DataSource:   dataSource,
++   		DataType:     dataType,
++   		Patch:        &jobModel,       // the six-field patch, see 2.4
++   	})
++   	// ----------------------------------------------------------------------
++
+    	return &dataconnections.UpdateDataConnectionV2_Response{               // :454 existing
+    		DataConnection: protoDataConnection}, nil
+
+--------------------------------------------------------------------------------
+2.4 WHY `After` IS NOT jobModel — THE TRAP
+--------------------------------------------------------------------------------
+[VERIFIED] forebitt/models/data_import_job.go:76-85 —
+    func NewImportJobFromProtoV2(p *dataconnections.DataConnection) DataImportJob {
+        return DataImportJob{
+            Name:               p.Name,
+            Category:           p.Category,
+            OrganizationID:     p.OrganizationID,
+            ImportDataTypeID:   p.DatasetTypeID,
+            ImportDataSourceID: p.DataSourceID,
+            CredentialID:       p.CredentialID,
+        }
+    }
+
+SIX FIELDS. No Status. No Stage. No CurrentTries, ErrorMessage, IsInternal, etc.
+
+[VERIFIED] forebitt/db/job_v2.go:45 —
+    tx.Model(&models.DataImportJob{}).Updates(*job)
+GORM v1 converts the struct to a map of NON-ZERO fields; blanks are dropped.
+
+So jobModel is a PATCH, not the after-state. If we diffed dbJob against jobModel
+directly, every single update would emit garbage like:
+
+    "status": { "from": "ACTIVE",           "to": "" }
+    "stage":  { "from": "MAPPING_REQUIRED", "to": "" }
+
+which is not just noise — it is WRONG, and XMI's stage-change consumer would act
+on it.
+
+THE FIX — build the after-state by overlaying the patch onto the before-image:
+
+    after := *before                       // start from the true current row
+    if patch.Name != ""               { after.Name = patch.Name }
+    if patch.Category != ""           { after.Category = patch.Category }
+    if patch.ImportDataTypeID != ""   { after.ImportDataTypeID = patch.ImportDataTypeID }
+    if patch.ImportDataSourceID != "" { after.ImportDataSourceID = patch.ImportDataSourceID }
+    if patch.CredentialID != ""       { after.CredentialID = patch.CredentialID }
+    // OrganizationID deliberately not overlaid — :403 already proved it unchanged
+    changed := diffJob(before, &after)     // emits only real differences
+
+This mirrors GORM's own zero-value semantics deliberately and explicitly, in six
+lines, rather than leaving it implicit. The alternative is a re-fetch after :432
+(one more read, zero reasoning) — recorded as OPEN-2. My recommendation is the
+overlay for M1 because the patch surface is exactly these six fields and they are
+right here in the file; switch to re-fetch if that surface ever widens.
+
+--------------------------------------------------------------------------------
+2.5 PARAMETER DIFF — BY BUSINESS KEY, NEVER BY ROW ID
+--------------------------------------------------------------------------------
+[VERIFIED] job_parameters.go:150 — inParamObj.ID = uuid.New().String() on every
+save, after a condition-scoped DELETE of all existing rows (:81). Row identity
+does not survive an edit.
+
+    func diffParams(before, after []*models.OrganizationJobParameter)
+                   map[string]FromTo {
+        key := func(p *models.OrganizationJobParameter) string {
+            return p.ImportDataSourceParameterID + "|" + p.Name   // STABLE
+        }
+        // build maps by key, then emit only entries whose Value differs,
+        // plus added (from=null) and removed (to=null)
+    }
+
+Emit the diff keyed by parameter NAME so it reads naturally to a consumer, and
+do NOT put the parameter row id in the payload at all — it is unstable by
+construction and would mislead anyone who tried to use it as an identifier.
+
+--------------------------------------------------------------------------------
+2.6 RESULTING UPDATE EVENT
+--------------------------------------------------------------------------------
+User repoints the connection at a new S3 location and switches the field delimiter
+from comma to pipe:
+
+    {
+      "id": "1a77bd52-...",
+      "source": "urn:habu:org:<orgId>",
+      "type": "com.habu.cleanroom.data_connection.updated",
+      "time": "2026-07-29T11:02:44Z",
+      "data": {
+        "objectType": "DATA_CONNECTION",
+        "objectId":   "d56ada74-...",
+        "objectName": "Adidas EMEA CRM Data",
+        "changeType": "UPDATED",
+        "changedFields": {
+          "parameters": {
+            "from": { "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers/",
+                      "FieldDelimiter": "," },
+            "to":   { "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers_v2/",
+                      "FieldDelimiter": "|" }
+          }
+        },
+        "performedBy":   "aditya.bhardwaj@liveramp.com",
+        "schemaVersion": 1
+      }
+    }
+
+Note what is NOT in there: status, stage, dataSource, credentialId, and the two
+parameters that did not change. That is the whole point — the diff is the
+payload.
+
+================================================================================
+PART 3 — HOW UpdateDataConnectionV2 DIFFERS FROM UpdateDataConnection
+================================================================================
+These are two different generations of API sitting side by side, and they behave
+completely differently. This matters for us because it decides WHERE we emit and
+how we avoid emitting twice.
+
+--------------------------------------------------------------------------------
+3.1 SIDE BY SIDE
+--------------------------------------------------------------------------------
+                        UpdateDataConnectionV2        UpdateDataConnection
+                        dataConnections_v2.go:384     job_service.go:1675
+  --------------------  ----------------------------  --------------------------
+  Request type          dataconnections.              proto.
+                        UpdateDataConnectionV2_Request  CreateUpdateDataConnection_Request
+  Request shape         one DataConnection message    Job + Parameters + Schedule
+                                                      + Stats + AssetID
+  Length                ~72 lines                     ~24 lines
+  Does the DB work?     YES — calls db.UpdateJobV2    NO — delegates entirely
+                        directly (:432)
+  Transaction           ONE (job_v2.go:44-56)         several, one per callee
+  Auth                  getAuthUser(ctx) at :388      delegated to the callees
+                        (user-identity metadata)      (isUserAuthorizedWrite)
+  Before-state in scope YES — dbJob at :393           NO — never fetched here
+  Nested RPC calls      none                          UpdateImportJobV2 (:1693)
+  Side effects          Snowflake field mapping       whatever the chain does,
+                        only                          including a RETRY (:1664)
+
+--------------------------------------------------------------------------------
+3.2 WHAT UpdateDataConnection ACTUALLY DOES
+--------------------------------------------------------------------------------
+It is a TRANSLATOR, not a writer:
+
+  [VERIFIED] job_service.go:1675-1699
+    :1680  orgJobParams, err := buildOrganizationJobParameters(ctx, in, s, "UpdateDataConnection")
+             ^-- :1701-1746. Calls s.FetchImportDataSourceParameters (:1707) and
+                 reshapes in.Parameters into []*proto.OrganizationJobParameter,
+                 dropping any parameter the data source does not declare (:1731).
+    :1687  in.Job.UseCases = []proto.JobUseCase{proto.CLEANROOM_QUESTIONS}
+    :1688  builds a proto.UpdateImportJobV2_Request
+    :1693  dataConnection, err := s.UpdateImportJobV2(ctx, &importJobV2)
+    :1698  return
+
+  and UpdateImportJobV2 [VERIFIED job_service.go:1624-1673] fans out to THREE
+  more RPCs:
+    :1640  s.UpdateImportJob(...)              -> UPDATE data_import_jobs
+                                                  (+ the conditional thin hevent
+                                                   publish at :1602)
+    :1650  s.SetOrganizationJobParameters(...) -> DELETE all params + N INSERTs
+                                                  (its OWN transaction)
+    :1664  s.RetryImportJob(...)               -> re-runs the import
+
+So "update a data connection" via the V1 API is one RPC that becomes four, across
+at least two transactions, and it also RETRIES THE JOB — a side effect the V2
+handler does not have at all.
+
+--------------------------------------------------------------------------------
+3.3 THE V1 CREATE IS WORSE — IT WRITES THE WHOLE THING TWICE
+--------------------------------------------------------------------------------
+[VERIFIED] job_service.go:1396-1506, CreateDataConnection:
+
+    :1401  orgJobParams := buildOrganizationJobParameters(...)
+    :1409  importJobV2 := proto.CreateImportJobV2_Request{ ..., IsDraft: true }
+    :1418  dataConnection, err := s.CreateImportJobV2(ctx, &importJobV2)   <== PASS 1
+    :1423  importJobV2.IsDraft = false
+    :1424  in.Job.Id = dataConnection.Job.Id
+    :1425  dataConnection, err = s.CreateImportJobV2(ctx, &importJobV2)    <== PASS 2
+    :1430+ data source lookup, RampID Universe scheduler, job stats, asset mapping
+    :1505  return dataConnection
+
+CreateImportJobV2 [VERIFIED :1293-1392] branches on IsDraft:
+    pass 1 (IsDraft=true, no Job.Id)  -> s.CreateImportJob(...)  -> INSERT job
+    pass 2 (IsDraft=false, Job.Id set)-> s.UpdateImportJob(...)  -> UPDATE job
+  and BOTH passes then call s.SetOrganizationJobParameters (:1375), which is
+  DELETE-all + N INSERTs each time.
+
+--------------------------------------------------------------------------------
+3.4 THE NUMBER TO PUT IN FRONT OF ANIL
+--------------------------------------------------------------------------------
+Hank hook firings for ONE user action, "create a data connection with 3
+parameters":
+
+  VIA THE V2 API (CreateDataConnectionV2):
+      1  AfterCreate  DataImportJob
+      1  AfterDelete  OrganizationJobParameter   (phantom — matches 0 rows)
+      3  AfterCreate  OrganizationJobParameter
+      = 5 hook firings
+
+  VIA THE V1 API (CreateDataConnection):
+      pass 1:  1 AfterCreate job + 1 AfterDelete param (0 rows) + 3 AfterCreate param
+      pass 2:  1 AfterUpdate job + 1 AfterDelete param (3 rows) + 3 AfterCreate param
+      = 10 hook firings
+
+  In the V1 case the same three logical parameters are created, deleted and
+  created again — SIX parameter-create records carrying SIX DIFFERENT uuids
+  (job_parameters.go:150) for THREE parameters, plus two delete records both
+  carrying ObjectID "" (empty struct passed to Delete, job_parameters.go:81).
+  And the job appears once as CREATE and once as UPDATE.
+
+  A hook-based assembler receiving those ten records would have to conclude, from
+  no field values, no parent references, no transaction id and no completeness
+  marker, that this was ONE data connection created ONCE with THREE parameters.
+
+  By contrast the service-layer approach emits exactly ONE event, from ONE line,
+  in ONE place, in BOTH cases — because the handler knows what the user asked
+  for, and the hook only knows what the tables did.
+
+--------------------------------------------------------------------------------
+3.5 CONSEQUENCE FOR US: THE DOUBLE-EMISSION RULE
+--------------------------------------------------------------------------------
+Because V1 delegates into the same inner RPCs, we must NOT put the emit inside
+CreateImportJobV2 / UpdateImportJobV2 / UpdateImportJob — the V1 create would
+then emit twice (once per pass at :1418 and :1425).
+
+RULE: emit at the OUTERMOST handler the caller actually invoked, and suppress
+nested emission.
+
+  EMIT HERE:
+    dataConnections_v2.go:378   CreateDataConnectionV2
+    dataConnections_v2.go:453   UpdateDataConnectionV2
+    job_service.go:1505         CreateDataConnection      (V1 wrapper)
+    job_service.go:1698         UpdateDataConnection      (V1 wrapper)
+    job_service.go:1932         DeleteImportJob           (beside the thin publish)
+
+  DO NOT EMIT HERE (internal, called by the above):
+    job_service.go:1293         CreateImportJobV2
+    job_service.go:1624         UpdateImportJobV2
+    job_service.go:1538         UpdateImportJob
+
+  MECHANISM: a context flag set by the outer handler.
+
+      ctx = observability.WithSuppressed(ctx)     // set before nested calls
+      ...
+      func (s *Server) emitDataConnectionEvent(ctx, change) {
+          if observability.IsSuppressed(ctx) { return }
+          ...
+      }
+
+  This is needed because CreateImportJobV2 and UpdateImportJobV2 are themselves
+  public RPCs — [UNVERIFIED] whether external-api-server or the UI call them
+  directly today. If they do, they need their own emit, guarded by the flag so
+  the V1 wrapper path still produces exactly one event. CONFIRM THE CALLERS
+  BEFORE IMPLEMENTING — this determines whether we instrument 5 sites or 8.
+
+--------------------------------------------------------------------------------
+3.6 WHICH API IS ACTUALLY LIVE?
+--------------------------------------------------------------------------------
+[UNVERIFIED] and it matters a great deal:
+  - If the UI is fully on V2, we instrument 2 handlers plus delete and we are
+    done, and the 10-hook V1 example is a historical argument rather than a live
+    one.
+  - If V1 is still serving traffic, we instrument both families, and the V1 path
+    is where the double-emission rule earns its keep.
+  - If V1 is dead, it is worth saying so out loud — it is ~130 lines of
+    orchestration whose only remaining purpose would be backwards compatibility.
+
+Action: check external-api-server's call sites for CreateDataConnection /
+UpdateDataConnection vs CreateDataConnectionV2 / UpdateDataConnectionV2 before
+the meeting if there is time; otherwise raise it as the first question.
+
+================================================================================
+PART 4 — THE COMPLETE CHANGE LIST FOR THESE TWO HANDLERS
+================================================================================
+  CREATE  (dataConnections_v2.go)
+    [ ] insert emit block between :378 and :379            — 1 block, 0 new reads
+
+  UPDATE  (dataConnections_v2.go)
+    [ ] insert FetchOrganizationJobParameters after :405   — 1 new read
+    [ ] insert emit block between :453 and :454            — 1 block
+    [ ] applyPatch overlay helper (2.4)                    — ~6 lines
+    [ ] diffParams by (ImportDataSourceParameterID, Name)  — ~20 lines
+
+  SHARED  (new package forebitt/services/observability/)
+    [ ] event structs + NewDataConnectionEvent
+    [ ] diffJob / diffParams / applyPatch
+    [ ] emitDataConnectionEvent (fire-and-forget, suppression-aware)
+    [ ] WithSuppressed / IsSuppressed (3.5)
+
+  WIRING
+    [ ] server.go:72  add ObservabilityEvents *hevent.Config beside Events
+    [ ] cmd/forebitt/commands/server.go:86  add events.AddEvents(flags, "observability-events")
+    [ ] publish via hank/aws/sns directly — Publish(ctx, message any, ...) at
+        hank/aws/sns/service.go:34 already takes `any`, so no hank change needed
+    [ ] empty-ARN guard so this can merge and deploy before the topic exists
+
+  OPEN BEFORE CODING
+    OPEN-1  cleanroom vs org scoping for `source` (DataImportJob has
+            OrganizationID and no CleanroomID — models/data_import_job.go:20)
+    OPEN-2  overlay (2.4) vs re-fetch after :432
+    OPEN-3  no-op update: emit nothing, or emit with an empty diff?
+    OPEN-4  are the V1 handlers live, and are CreateImportJobV2 /
+            UpdateImportJobV2 called directly by anyone? (3.5, 3.6)

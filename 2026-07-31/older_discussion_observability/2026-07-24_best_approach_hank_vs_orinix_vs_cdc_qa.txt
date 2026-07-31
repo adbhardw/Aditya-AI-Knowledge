@@ -1,0 +1,193 @@
+BEST APPROACH GIVEN WHAT'S IN HAND — HANK vs ORINIX vs CDC OPTIONS
+Decision doc, plain Q&A. Follow-up to
+2026-07-24_hank_host_and_cdc_simple_qa.txt.
+Date: 2026-07-24
+
+WHAT'S ALREADY IN HAND (the constraints that decide this):
+  - Hank already has audit GORM hooks firing on create/update/delete,
+    IN-PROCESS, inside all ~15 services. (but: only log today, no from->to,
+    fire mid-transaction)
+  - Hank already has an SNS publisher (events.Publish). (but: not wired to
+    the hook)
+  - Event plumbing already exists: SNS habu-observability-events -> SQS ->
+    orinix consumes it today.
+  - orinix is already scaffolded: registration table, dispatcher, webhook +
+    pubsub channels, worker, replay.
+  - Consumers only care about SOME fields (registration has monitored_fields)
+    — you do NOT need a full-row diff, only the watched fields.
+  - Stack: Postgres per service, AWS SNS/SQS, Go (hank) + Java (orinix).
+
+
+===========================================================
+Q1: Isn't this ONE choice — "Hank vs orinix vs CDC"? Why do you keep
+    splitting it?
+===========================================================
+
+Because it's really TWO separate decisions, and the best answer uses a
+DIFFERENT tool for each. Trying to pick one winner for both is what makes it
+feel confusing.
+
+  Decision 1 — CAPTURE: how do we detect a change (and its from->to) and get
+    an event onto the topic? Candidates: Hank hook / DB trigger / CDC-Debezium
+    / event-sourcing / consumer-reconstruct.
+  Decision 2 — DELIVER: who calls XMI, retries, holds registrations, serves
+    pull, does replay? Candidates: orinix (owned service) / Hank / an
+    existing service.
+
+These are independent. You can mix any capture option with any delivery
+option. So answer them separately.
+
+
+===========================================================
+Q2: Decision 2 first (it's the easy one) — who DELIVERS? orinix, Hank, or
+    something else?
+===========================================================
+
+VERDICT: an owned service — and since orinix is already scaffolded, orinix.
+
+  - Hank: NO. Already settled — a library can't be an always-on, addressable,
+    independently-deployed program, and delivery fundamentally needs one.
+  - orinix (owned service): YES. Everything delivery needs (registration
+    store, 24/7 dispatch loop, retries/DLQ, pull endpoint + cursor, replay)
+    is exactly what an owned service is for, and it already exists in scaffold.
+  - Fallback IF the hard constraint is "absolutely no net-new service":
+    host the delivery code inside an EXISTING owned service that already has
+    a durable deployment (not Hank). Still one owner, still a real service —
+    just not a brand-new deployment. Only reach for this if "no new service"
+    is a non-negotiable political constraint; technically orinix is cleaner.
+
+So Decision 2 is basically closed: delivery = orinix. The real thinking is
+all in Decision 1.
+
+
+===========================================================
+Q3: Decision 1 — how do we CAPTURE the change + from->to? Rank the options
+    against what's in hand.
+===========================================================
+
+Reminder of the two hard requirements: (a) from->to for the watched fields,
+(b) no phantom events (don't emit for a write that rolls back).
+
+OPTION A — Hank hook, wired to publish (+ pre-image read + after-commit)
+  What: extend the existing audit hook to read the old row, diff the watched
+  fields, and publish {from,to} to SNS after the transaction commits.
+  WHY it's attractive here: reuses the TWO things you already have (the hook
+  in every service + the SNS publisher). No new infra. Smallest conceptual
+  leap for the team.
+  WHY NOT / cost: you must fix BOTH known problems yourself —
+    * phantom events -> add after-commit or an outbox table (real work),
+    * from->to -> add a pre-image SELECT (extra read per update; must be
+      same-transaction to be correct).
+  And you're now maintaining this logic across a shared library used by 15
+  services — a bug ships to everyone. Medium effort, medium risk, lowest
+  new-infra.
+
+OPTION B — Database trigger writing to an outbox table
+  What: a Postgres trigger on the watched tables fires ON UPDATE, gets OLD
+  and NEW handed to it by the database for free, writes {from,to} into an
+  outbox table in the SAME transaction. A small relay ships committed outbox
+  rows to SNS.
+  WHY it's strong here: this ELEGANTLY solves BOTH hard requirements at once
+  — the DB gives you from->to for free (no pre-image read, no race), and
+  because the outbox row is in the same transaction, a rollback deletes it
+  too (no phantoms, for free). It also doesn't smear pre-image-read logic
+  across 15 app services.
+  WHY NOT / cost: logic lives in SQL/triggers (some teams dislike that);
+  you still need the little relay process that reads the outbox and publishes
+  (though that can be tiny, or even part of orinix). Another artifact to
+  version/deploy per table.
+
+OPTION C — CDC / Debezium (read the DB's WAL change log)
+  What: Debezium tails Postgres' write-ahead log and emits before+after for
+  every change automatically, after commit, with zero app code.
+  WHY it's the "correct" answer: solves from->to AND phantoms AND
+  works-for-all-tables, cleanly, no app changes.
+  WHY NOT here: biggest infra lift (run Debezium + Kafka/connectors,
+  operate it). Overkill for a first cut and a single consumer (XMI). Right
+  answer only if change-capture becomes a platform-wide standard you'll
+  reuse widely.
+
+OPTION D — Event sourcing (append every version)
+  WHY NOT here: requires redesigning existing tables to never overwrite.
+  Not retrofittable onto the current schema. Off the table for this.
+
+OPTION E — Consumer reconstructs from->to (publish only new value)
+  WHY NOT here: NOT deterministic (established last doc) — the "from" is
+  already overwritten by query time, the "to" may have changed again,
+  ordering races corrupt the diff. Only half-works if the consumer keeps a
+  full shadow copy. Reject as the primary mechanism.
+
+
+===========================================================
+Q4: So what's the single best combination, given what you have?
+===========================================================
+
+RECOMMENDED: orinix delivers + (phase it) Hank-hook now, DB-trigger if you
+need clean from->to.
+
+Concretely, phased so you ship value fast without painting into a corner:
+
+  PHASE 1 (fastest, reuses everything you have):
+    - CAPTURE: wire the existing Hank audit hook -> existing events.Publish,
+      publishing CREATE and the NEW value on UPDATE (no from->to yet), and
+      make it AFTER-COMMIT so there are no phantom events (this one fix is
+      non-negotiable even in phase 1).
+    - DELIVER: orinix consumes, fans out, calls XMI. (Already built.)
+    - This lights up the whole pipeline end-to-end with minimal new work and
+      proves the delivery half.
+
+  PHASE 2 (add from->to, where it actually matters):
+    - Because consumers only watch SOME fields (monitored_fields), you don't
+      need full-row history. Add from->to for JUST those fields.
+    - PREFER a DB trigger + outbox on the specific watched tables (Option B):
+      it gives from->to and phantom-safety together, without adding a
+      pre-image SELECT into the shared Hank hook that every one of 15
+      services would pay for. This keeps the messy part (before/after
+      capture) in ONE place per table instead of smeared across the library.
+    - If only one or two tables ever need from->to, the app-diff in Hank
+      (Option A) is also fine — pick based on how many tables end up needing
+      it. Few tables -> app-diff is simpler; many tables or you want it
+      uniform -> trigger/outbox wins.
+
+  RESERVE (don't build yet): CDC/Debezium (Option C). Adopt only if/when
+  before->after capture becomes a platform-wide need beyond this one XMI
+  integration. Note it in the design as the "if this grows" path so the
+  architects see you've considered it.
+
+WHY THIS IS THE BEST FIT (the one-paragraph pitch for the council):
+  Delivery is unavoidably a service, so it stays in orinix — that half isn't
+  really up for debate. Capture is where Hank genuinely helps: you already
+  have the hook and the publisher in-hand, so Phase 1 reuses them for near-
+  zero cost, provided you emit after-commit to avoid phantom events. The
+  only real gap — before/after state — is added surgically in Phase 2, and
+  the cleanest place for it is a DB trigger+outbox on the handful of watched
+  tables (DB hands you old+new for free and makes rollback-safety automatic),
+  rather than pushing a pre-image read into a library shared by 15 services.
+  Debezium is the textbook answer and is noted as the scale-out path, but is
+  deliberately deferred as overkill for a single consumer today.
+
+
+===========================================================
+Q5: Quick decision table
+===========================================================
+
+  Concern                     | Best tool            | Why
+  ----------------------------|----------------------|----------------------
+  Deliver to XMI (call/retry/ | orinix (owned svc)   | needs always-on owned
+  register/pull/replay)       |                      | runtime; not a library
+  ----------------------------|----------------------|----------------------
+  Emit event on CUD, fast,    | Hank hook +          | reuses hook + publisher
+  reuse what exists           | events.Publish       | you already have
+  ----------------------------|----------------------|----------------------
+  No phantom events           | after-commit OR      | hook fires mid-txn;
+                              | outbox               | must wait for commit
+  ----------------------------|----------------------|----------------------
+  from->to for watched fields | DB trigger + outbox  | DB gives old+new free,
+  (clean, few/many tables)    | (or app-diff if 1-2  | rollback-safe, not
+                              | tables)              | smeared across 15 svcs
+  ----------------------------|----------------------|----------------------
+  Platform-wide before/after  | CDC / Debezium       | cleanest at scale;
+  (future, many consumers)    | (DEFER)              | too heavy for one now
+  ----------------------------|----------------------|----------------------
+  Consumer figures out diff   | REJECT               | not deterministic;
+                              |                      | "from" already gone

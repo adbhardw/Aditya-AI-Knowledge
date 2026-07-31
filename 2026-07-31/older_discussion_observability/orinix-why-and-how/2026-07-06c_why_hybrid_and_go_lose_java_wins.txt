@@ -1,0 +1,109 @@
+Why hybrid loses, why Go alone loses, and yes — Java exposes the API too
+Date: 2026-07-06
+Status: Q1 (language) — reasoning deepened, still needs your explicit sign-off
+
+------------------------------------------------------------------------
+
+WHY HYBRID (Go ingest + Java delivery, or the reverse) LOSES
+
+  BETTER TOGETHER OR APART (ch. 8) — the test is: do these two things share
+  information and get used together? Ingest (SQS consume -> write
+  object_events) and Delivery (read object_events -> dispatch webhook/pubsub)
+  operate on the exact same row, in the same lifecycle, for the same event.
+  Splitting them by language puts a network hop and a serialization boundary
+  between two halves of one operation, for no reason the domain actually
+  demands — that's "apart" applied to something that wants to be "together."
+
+  DEEP MODULE vs SHALLOW MODULE (ch. 3) — ask what the interface between the
+  Go half and the Java half would even be. Either they share the DB directly
+  (then it isn't two services, it's one deep module wearing two deploy
+  pipelines as a costume — no real separation, just doubled operational
+  weight), or they talk over gRPC (then we've built "publish an event, wait
+  for an ack, mark it delivered" TWICE — once for talking to XMI, once for
+  talking to our own other half). A complex boundary that doesn't hide
+  anything new is the textbook shallow module: it costs interface complexity
+  and pays back nothing.
+
+  CHANGE AMPLIFICATION (ch. 1's definition of complexity) — the
+  delivery_type / delivery_config schema decision has to be understood by
+  BOTH ingest (does this event need dispatching) and delivery (how do I
+  dispatch it). Two languages means two codebases, two CI pipelines, two
+  deploys, two on-call rotations, all needing to move together every time
+  that schema changes. One small change, many places touched — the exact
+  shape of the problem the book is about.
+
+  CONSISTENCY (ch. 16) — every other service in this fleet is internally
+  one language (Go services generate a Java stub for Java callers; Java
+  services generate a Go stub for Go callers — the split is at the CLIENT
+  boundary, never inside the service itself). A hybrid orinix would be the
+  only internally-split service in the org. Anyone opening it for the first
+  time has to relearn the shape of this one service instead of recognizing
+  a pattern they already know.
+
+  Verdict: sketched per "Design It Twice," rejected for real reasons, not
+  just because it's unfamiliar.
+
+------------------------------------------------------------------------
+
+WHY GO ALONE LOSES (weaker, not impossible — being fair to it)
+
+  Being even-handed: Go is NOT a bad choice in general. gangway and
+  unhygienix prove it's a perfectly good fit for "own DB, own gRPC port"
+  services. It loses THIS specific comparison for a narrower reason:
+
+  DEEP MODULES NEED SOMETHING BEHIND THE DOOR (ch. 3) — a deep module is
+  valuable because a simple interface hides real, already-solved complexity.
+  In Go, the complexity behind orinix's interface — SQS consumption,
+  GCP Pub/Sub publish with WIF — hasn't been solved by anyone in this
+  codebase yet. hank doesn't even have an SQS package. Choosing Go means the
+  "depth" behind orinix's door has to be built from scratch, in exactly the
+  domain (queue semantics, at-least-once delivery, cross-cloud token
+  exchange) where subtle mistakes are easiest to make and hardest to notice
+  until they cause a dropped XMI event.
+
+  TACTICAL vs STRATEGIC (ch. 2) — XMI wants push now. Under that pressure,
+  picking the language where the hard parts don't exist yet is exactly the
+  setup for a tactical shortcut: hand-roll a quick poller and a quick WIF
+  flow to hit the date, plan to harden it later. "Later" is the part
+  Ousterhout says never actually arrives. Strategic here means: don't pay
+  the from-scratch tax when hardened, already-in-production code exists in
+  the other language.
+
+  CHESTERTON'S FENCE, applied forward — gangway's fence (why it's "own DB,
+  own gRPC port") is an ownership-boundary decision, not a language mandate.
+  Understanding WHY gangway is shaped that way means we keep the part of the
+  precedent that was actually the point (separate ownership) without
+  cargo-culting the part that wasn't (the specific language).
+
+  Fair counterpoint I'm not hiding: WIF is proven in Go too
+  (unhygienix/services/google/workload_identity_federation.go). Go isn't
+  behind on all three capabilities, just two of three — SQS consumption and
+  the Pub/Sub reference pattern you named. That's still enough to lose the
+  comparison, but it's not a rout.
+
+------------------------------------------------------------------------
+
+ARE WE EXPOSING THE API IN JAVA? YES.
+
+If orinix is Java, the gRPC server (RecordObjectEvent, GetCleanroomEvents)
+and the REST callback-registration endpoint (POST /v1/cleanrooms/{id}/callbacks)
+live in the same Java service, same deploy — exactly the shape pegleg,
+cronos, and ignoramus already have (consume + expose, one service). For
+external-api-server, nothing changes about HOW it calls orinix versus how
+it calls unhygienix today — it's still a generated client stub via zabra,
+just a Java-generated one instead of a Go-generated one. This is also
+DIFFERENT LAYER, DIFFERENT ABSTRACTION (ch. 6) in miniature: the gRPC layer
+is doing real translation work either way — raw object_events rows in,
+CloudEvents-shaped API responses out — that's not language-dependent, it's
+just work that has to happen somewhere in the stack regardless of which
+language does it.
+
+------------------------------------------------------------------------
+
+ONE MORE DATA POINT IN JAVA'S FAVOR
+
+You said you're already comfortable with SQS subscription in Java from
+Pegleg work. That's cognitive load (ch. 1) already paid down on the person
+actually building this — not just "the codebase has a Java example," but
+"the person writing orinix has already internalized how that example works."
+That's real, not incidental.

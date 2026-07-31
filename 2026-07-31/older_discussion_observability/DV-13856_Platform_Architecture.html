@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Habu Platform Observability Infrastructure — DV-13856</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#050a14;color:#e2e8f0;height:100vh;overflow:hidden;display:flex;flex-direction:column;}
+
+/* ── Controls ── */
+.ctrl{background:#0a1628;padding:9px 24px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #0f2040;flex-shrink:0;}
+.cg{display:flex;align-items:center;gap:9px;}
+.ctr{font-size:11px;color:#334155;min-width:44px;text-align:center;}
+.stitle{font-size:11px;color:#334155;}
+.btn{border:none;padding:7px 16px;border-radius:5px;cursor:pointer;font-size:12px;font-weight:600;transition:all .12s;}
+.btn-pri{background:#1d4ed8;color:#fff;} .btn-pri:hover{background:#1e40af;}
+.btn-sec{background:transparent;border:1px solid #1e3a5f;color:#475569;} .btn-sec:hover{background:#0f2040;}
+.btn:disabled{opacity:.3;cursor:not-allowed;}
+.dots{display:flex;gap:5px;}
+.dot{width:6px;height:6px;border-radius:50%;background:#0f2040;cursor:pointer;transition:background .12s;}
+.dot.on{background:#2563eb;} .dot:hover:not(.on){background:#1e3a5f;}
+
+/* ── Deck ── */
+.deck{flex:1;overflow:hidden;position:relative;}
+.slide{position:absolute;inset:0;display:none;flex-direction:column;overflow-y:auto;}
+.slide.on{display:flex;}
+.inn{flex:1;padding:36px 56px;display:flex;flex-direction:column;}
+.inn.cx{align-items:center;justify-content:center;text-align:center;}
+.inn.sm{padding:24px 40px;}
+
+/* ── Type ── */
+.kk{font-size:10px;font-weight:800;letter-spacing:.12em;color:#2563eb;text-transform:uppercase;margin-bottom:8px;}
+h1{font-size:36px;font-weight:800;line-height:1.15;color:#f8fafc;}
+h2{font-size:24px;font-weight:800;color:#f8fafc;margin-bottom:5px;}
+h3{font-size:14px;font-weight:700;color:#f8fafc;margin-bottom:5px;}
+.sub{font-size:15px;color:#64748b;margin-top:12px;line-height:1.55;}
+p{color:#64748b;line-height:1.65;font-size:13px;}
+code{font-family:'SF Mono',Menlo,monospace;font-size:11px;color:#38bdf8;background:#0a1628;padding:1px 5px;border-radius:3px;}
+.muted{font-size:11px;color:#1e3a5f;}
+
+/* ── Badges ── */
+.bd{display:inline-flex;align-items:center;padding:2px 9px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.04em;}
+.bv1{background:#1e3a8a;color:#93c5fd;} .bv2{background:#7c2d12;color:#fdba74;} .bv3{background:#14532d;color:#86efac;}
+.baw{background:#1e3a8a22;color:#60a5fa;border:1px solid #1e3a8a55;}
+.bgcp{background:#14532d22;color:#4ade80;border:1px solid #14532d55;}
+
+/* ── Grids ── */
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:18px;}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:18px;}
+.g5{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;}
+hr{border:none;border-top:1px solid #0f2040;margin:18px 0;}
+
+/* ── Cards ── */
+.card{background:#0a1628;border:1px solid #0f2040;border-radius:9px;padding:18px;}
+.card.ab{border-top:2px solid #2563eb;} .card.ao{border-top:2px solid #f97316;} .card.ag{border-top:2px solid #22c55e;}
+.card p{font-size:12px;}
+.hl-b{color:#60a5fa;} .hl-o{color:#fb923c;} .hl-g{color:#4ade80;} .hl-p{color:#a78bfa;}
+
+/* ═══════════════════════════════════════════════
+   ARCHITECTURE DIAGRAM STYLES
+═══════════════════════════════════════════════ */
+.arch-wrap{flex:1;display:flex;flex-direction:column;gap:0;overflow:auto;padding:4px 0;}
+
+/* top-level label strip */
+.arch-section-label{
+  font-size:9px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
+  color:#1e3a5f;padding:0 6px 4px;
+}
+
+/* service source chips */
+.svc-row{display:flex;gap:8px;align-items:stretch;margin-bottom:6px;}
+.svc-chip{
+  flex:1;background:#0a1628;border:1px solid #0f2040;border-radius:7px;
+  padding:10px 12px;text-align:center;
+}
+.svc-chip .sname{font-size:12px;font-weight:800;color:#f8fafc;margin-bottom:3px;}
+.svc-chip .sobjs{font-size:10px;color:#334155;line-height:1.5;}
+.svc-chip.u{border-color:#1d4ed855;} .svc-chip.p{border-color:#c2410c55;}
+.svc-chip.o{border-color:#06402855;} .svc-chip.f{border-color:#7c3aed55;}
+.svc-chip.future{border-style:dashed;border-color:#1e3a5f;opacity:.6;}
+
+/* connector arrows */
+.conn{display:flex;justify-content:center;align-items:center;height:22px;color:#1e3a5f;font-size:13px;flex-shrink:0;}
+.conn-split{display:flex;justify-content:center;align-items:center;height:28px;color:#1e3a5f;font-size:11px;letter-spacing:.05em;}
+
+/* interceptor layer */
+.interceptor{
+  background:linear-gradient(135deg,#0c1a3a,#0f0a2e);
+  border:1px solid #7c3aed44;border-radius:8px;
+  padding:12px 16px;display:flex;align-items:center;gap:14px;
+  flex-shrink:0;
+}
+.int-label{font-size:10px;font-weight:800;color:#a78bfa;text-transform:uppercase;letter-spacing:.08em;white-space:nowrap;}
+.int-steps{display:flex;align-items:center;gap:6px;flex:1;flex-wrap:wrap;}
+.int-step{
+  background:#0a1628;border:1px solid #7c3aed33;border-radius:5px;
+  padding:5px 10px;font-size:11px;color:#9ca3af;white-space:nowrap;
+}
+.int-arrow{color:#4c1d95;font-size:13px;}
+
+/* two-path split */
+.path-split{display:grid;grid-template-columns:1fr 2fr;gap:14px;flex:1;min-height:0;}
+
+/* V1 path (left) */
+.path-v1{display:flex;flex-direction:column;gap:6px;}
+.path-v2{display:flex;flex-direction:column;gap:6px;}
+
+.path-node{
+  background:#0a1628;border:1px solid #0f2040;border-radius:7px;
+  padding:10px 12px;flex-shrink:0;
+}
+.pn-label{font-size:9px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;}
+.pn-title{font-size:12px;font-weight:700;color:#f8fafc;margin-bottom:2px;}
+.pn-desc{font-size:10px;color:#334155;line-height:1.4;}
+.pn-tag{display:inline-flex;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700;margin-right:4px;margin-top:3px;}
+.t-aws{background:#1e3a8a22;color:#60a5fa;border:1px solid #1e3a8a44;}
+.t-gcp{background:#14532d22;color:#4ade80;border:1px solid #14532d44;}
+
+/* path node V1 vs V2 coloring */
+.path-node.v1-node{border-left:2px solid #1d4ed8;}
+.path-node.v2-node{border-left:2px solid #c2410c;}
+.path-node.shared-node{border-left:2px solid #7c3aed;}
+
+/* end consumer row */
+.consumer-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+.consumer{
+  background:#0a1628;border:1px solid #0f2040;border-radius:7px;
+  padding:9px 12px;text-align:center;
+}
+.consumer.xmi{border-color:#c2410c44;}
+.consumer .cname{font-size:12px;font-weight:700;color:#f8fafc;margin-bottom:2px;}
+.consumer .cdesc{font-size:10px;color:#334155;}
+
+/* ── Browser mockup ── */
+.browser{background:#0a1628;border:1px solid #0f2040;border-radius:9px;overflow:hidden;display:flex;flex-direction:column;flex:1;min-height:0;}
+.brow-chrome{background:#020b18;padding:8px 12px;display:flex;align-items:center;gap:5px;border-bottom:1px solid #0f2040;flex-shrink:0;}
+.brow-dot{width:9px;height:9px;border-radius:50%;}
+.brow-url{background:#0a1628;border-radius:4px;padding:3px 9px;font-size:10px;color:#1e3a5f;flex:1;margin-left:5px;}
+.app-top{background:#020b18;padding:0 18px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #050e1c;flex-shrink:0;}
+.app-logo{font-size:13px;font-weight:800;color:#2563eb;padding:11px 0;margin-right:5px;}
+.app-link{font-size:11px;color:#1e3a5f;padding:11px 0;margin-right:14px;}
+.cr-hdr{padding:11px 18px;border-bottom:1px solid #050e1c;flex-shrink:0;}
+.cr-name{font-size:13px;font-weight:700;color:#f8fafc;}
+.cr-meta{font-size:10px;color:#1e3a5f;margin-top:2px;}
+.tabs{background:#020b18;padding:0 18px;display:flex;border-bottom:1px solid #050e1c;flex-shrink:0;}
+.tab{padding:9px 12px;font-size:11px;color:#1e3a5f;border-bottom:2px solid transparent;margin-right:1px;}
+.tab.on{color:#2563eb;border-bottom-color:#2563eb;}
+.feed{padding:12px 18px;overflow-y:auto;flex:1;}
+.frow{display:flex;gap:7px;align-items:center;margin-bottom:10px;}
+.fsel{background:#020b18;border:1px solid #0f2040;color:#334155;padding:4px 8px;border-radius:4px;font-size:10px;}
+.evts{display:flex;flex-direction:column;gap:6px;}
+.evt{background:#020b18;border:1px solid #050e1c;border-radius:6px;padding:9px 11px;display:flex;align-items:flex-start;gap:9px;}
+.evt.hi{border-color:#1d4ed8;background:#030d1f;}
+.eico{width:28px;height:28px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:800;flex-shrink:0;}
+.iq{background:#1e3a8a22;color:#60a5fa;} .idc{background:#06402822;color:#4ade80;} .iex{background:#4c1d9522;color:#c4b5fd;} .idel{background:#7f1d1d22;color:#fca5a5;}
+.ebody{flex:1;min-width:0;}
+.ename{font-size:12px;font-weight:700;color:#f8fafc;}
+.edesc{font-size:11px;color:#1e3a5f;margin-top:1px;}
+.emeta{display:flex;align-items:center;gap:5px;margin-top:4px;flex-wrap:wrap;}
+.etag{font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;}
+.tq{background:#1e3a8a22;color:#60a5fa;border:1px solid #1e3a8a44;}
+.tdc{background:#06402822;color:#4ade80;border:1px solid #06402844;}
+.tex{background:#4c1d9522;color:#c4b5fd;border:1px solid #4c1d9544;}
+.tupd{background:#0f2040;color:#334155;border:1px solid #0f2040;}
+.tdel{background:#7f1d1d22;color:#fca5a5;border:1px solid #7f1d1d44;}
+.ewho{font-size:9px;color:#1e3a5f;}
+.etime{font-size:9px;color:#0f2040;}
+
+/* ── Q&A ── */
+.qa{background:#0a1628;border-left:3px solid #2563eb;border-radius:0 7px 7px 0;padding:13px 16px;margin-bottom:12px;}
+.qa-q{font-size:13px;font-weight:700;color:#60a5fa;margin-bottom:6px;}
+.qa-a{font-size:12px;color:#64748b;line-height:1.65;}
+
+/* ── Roadmap ── */
+.rmap{display:flex;gap:12px;margin-top:18px;}
+.rph{flex:1;background:#0a1628;border:1px solid #0f2040;border-radius:9px;padding:16px;}
+.rph.rv1{border-top:3px solid #2563eb;} .rph.rv2{border-top:3px solid #f97316;} .rph.rv3{border-top:3px solid #22c55e;}
+.rspr{font-size:9px;color:#334155;font-weight:800;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;}
+.rti{font-size:14px;font-weight:800;margin-bottom:10px;}
+.ri{font-size:11px;color:#334155;padding:3px 0 3px 11px;position:relative;}
+.ri::before{content:'→';position:absolute;left:0;color:#0f2040;}
+.rnote{margin-top:10px;font-size:10px;color:#1e3a5f;background:#020b18;border-radius:4px;padding:6px 9px;}
+
+/* ── Infra comparison table ── */
+.cmp-tbl{width:100%;border-collapse:collapse;margin-top:18px;font-size:12px;}
+.cmp-tbl th{background:#0a1628;color:#64748b;font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:.06em;padding:10px 14px;border-bottom:1px solid #0f2040;text-align:left;}
+.cmp-tbl td{padding:10px 14px;border-bottom:1px solid #050e1c;color:#64748b;vertical-align:top;}
+.cmp-tbl tr:hover td{background:#050e1c;}
+.cmp-tbl td:first-child{color:#94a3b8;font-weight:600;}
+.yes{color:#4ade80;font-weight:700;}
+.no{color:#fca5a5;}
+.part{color:#fbbf24;}
+
+/* ── V2 summary ── */
+.v2box{background:linear-gradient(135deg,#0a1628,#0d0a28);border:1px solid #1d3461;border-radius:9px;padding:20px;margin-top:14px;}
+.v2flow{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:12px;}
+.vstep{background:#0a1628;border:1px solid #0f2040;border-radius:5px;padding:6px 10px;font-size:10px;color:#64748b;text-align:center;}
+.vstep strong{display:block;color:#f8fafc;font-size:11px;margin-bottom:1px;}
+.varr{color:#1e3a5f;font-size:13px;}
+
+/* scrollbar */
+::-webkit-scrollbar{width:4px;} ::-webkit-scrollbar-track{background:transparent;} ::-webkit-scrollbar-thumb{background:#0f2040;border-radius:2px;}
+</style>
+</head>
+<body>
+
+<!-- Controls -->
+<div class="ctrl">
+  <div class="cg">
+    <button class="btn btn-sec" id="pB" onclick="go(-1)">← Back</button>
+    <span class="ctr" id="ctr">1 / 10</span>
+    <button class="btn btn-pri" id="nB" onclick="go(1)">Next →</button>
+  </div>
+  <div class="dots" id="dots"></div>
+  <span class="stitle" id="st"></span>
+</div>
+
+<div class="deck">
+
+<!-- ══════════ SLIDE 1 — Title ══════════ -->
+<div class="slide" data-t="Overview">
+<div class="inn cx">
+  <div class="kk">CFI-1388 · DV-13856 · FY27Q1</div>
+  <h1>Habu Platform<br>Observability Infrastructure</h1>
+  <p class="sub">Event-Driven Change Notification — Activity Feed UI + Webhook Callbacks<br>For TLM &amp; Product Review · Aditya Bhardwaj · May 2026</p>
+
+  <div class="g3" style="margin-top:44px;text-align:left;max-width:820px;">
+    <div class="card ab">
+      <div style="margin-bottom:8px;"><span class="bd bv1">Phase 1 · 2 Sprints</span></div>
+      <h3>Activity Feed UI</h3>
+      <p style="margin-top:6px;">Interceptor layer across unhygienix, picanmix, orbit + persistent event store + read API + UI tab. Every platform user gets an audit trail.</p>
+    </div>
+    <div class="card ao">
+      <div style="margin-bottom:8px;"><span class="bd bv2">Phase 2 · 2–3 Sprints</span></div>
+      <h3>Event Bus + Callback Delivery</h3>
+      <p style="margin-top:6px;">SNS/Pub/Sub event bus + event listener job + callback registration system + delivery worker with retry. XMI and customers stop polling.</p>
+    </div>
+    <div class="card ag">
+      <div style="margin-bottom:8px;"><span class="bd bv3">Phase 3 · 1–2 Sprints</span></div>
+      <h3>Platform Hardening</h3>
+      <p style="margin-top:6px;">HMAC verification, DLQ visibility, event replay, delivery audit, per-field subscriptions. Enterprise-grade for external customers.</p>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ══════════ SLIDE 2 — Problem ══════════ -->
+<div class="slide" data-t="The Problem">
+<div class="inn">
+  <div style="margin-bottom:20px;">
+    <div class="kk">The Problem</div>
+    <h2>Clean room objects change — nobody outside Habu knows</h2>
+    <p style="margin-top:6px;">External systems (XMI UI, customer integrations) poll API endpoints every N seconds. There is no notification mechanism. Three object domains are affected today, with more as Habu grows.</p>
+  </div>
+
+  <div class="g3">
+    <div class="card">
+      <div style="margin-bottom:9px;display:flex;align-items:center;gap:8px;">
+        <span style="font-size:18px;">📋</span>
+        <span style="font-size:10px;font-weight:800;color:#60a5fa;text-transform:uppercase;letter-spacing:.06em;">Questions · unhygienix</span>
+      </div>
+      <h3>Question Changes Go Unnoticed</h3>
+      <p style="margin-top:7px;">When output columns are removed, a dataset is swapped, or a question is deleted, XMI UI has no way to know until its next poll cycle. Downstream dashboards and workflows break silently.</p>
+    </div>
+    <div class="card">
+      <div style="margin-bottom:9px;display:flex;align-items:center;gap:8px;">
+        <span style="font-size:18px;">🔌</span>
+        <span style="font-size:10px;font-weight:800;color:#4ade80;text-transform:uppercase;letter-spacing:.06em;">Data Connections · orbit</span>
+      </div>
+      <h3>Schema Changes Break Pipelines</h3>
+      <p style="margin-top:7px;">When a field type changes or fields are added/removed, downstream SQL queries and pipelines fail at runtime — no notification reaches dependent teams before the failure.</p>
+    </div>
+    <div class="card">
+      <div style="margin-bottom:9px;display:flex;align-items:center;gap:8px;">
+        <span style="font-size:18px;">📤</span>
+        <span style="font-size:10px;font-weight:800;color:#c4b5fd;text-transform:uppercase;letter-spacing:.06em;">Exports · picanmix</span>
+      </div>
+      <h3>Export Status Is Invisible</h3>
+      <p style="margin-top:7px;">Export configuration changes and run completions are invisible to integrations. External systems must poll repeatedly to detect whether an export finished, failed, or was reconfigured.</p>
+    </div>
+  </div>
+
+  <div style="margin-top:18px;background:#0a1628;border:1px solid #0f2040;border-radius:7px;padding:13px 16px;display:flex;align-items:flex-start;gap:9px;">
+    <span style="font-size:16px;flex-shrink:0;">⚡</span>
+    <p style="font-size:12px;"><strong style="color:#f8fafc;">Scope beyond DV-13856:</strong> This is not a one-off XMI notification feature. The same gap exists for every programmatic consumer of the Habu API. Building it right means a reusable event infrastructure that plugs into any Habu service going forward.</p>
+  </div>
+</div>
+</div>
+
+<!-- ══════════ SLIDE 3 — Platform Scope ══════════ -->
+<div class="slide" data-t="Platform Scope">
+<div class="inn">
+  <div style="margin-bottom:20px;">
+    <div class="kk">Why This Is Platform Work</div>
+    <h2>Five services. One event infrastructure.</h2>
+    <p style="margin-top:6px;">The interceptor + event bus + delivery pattern is built once and plugs into every Habu service. Each service emits standardised events — any consumer can subscribe without changing the source service.</p>
+  </div>
+
+  <div class="g5" style="margin-bottom:16px;">
+    <div class="svc-chip u">
+      <div class="sname">unhygienix</div>
+      <div class="sobjs">Questions (CRUD)<br>Data Connections<br>Flows<br>Clean Room lifecycle</div>
+    </div>
+    <div class="svc-chip p">
+      <div class="sname">picanmix</div>
+      <div class="sobjs">Export Jobs<br>Job Runs<br>Export completions<br>Pipeline events</div>
+    </div>
+    <div class="svc-chip o">
+      <div class="sname">orbit</div>
+      <div class="sobjs">Data Connection<br>config changes<br>Schema updates<br>Connection health</div>
+    </div>
+    <div class="svc-chip f">
+      <div class="sname">forebitt</div>
+      <div class="sobjs">Scheduled triggers<br>Flow run events<br>Schedule changes</div>
+    </div>
+    <div class="svc-chip future">
+      <div class="sname">+ future</div>
+      <div class="sobjs">Any new Habu<br>service plugs in<br>with interceptor</div>
+    </div>
+  </div>
+
+  <div class="g2" style="margin-top:0;">
+    <div class="card" style="border-left:2px solid #7c3aed;">
+      <div style="font-size:10px;font-weight:800;color:#a78bfa;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;">Shared Interceptor Contract</div>
+      <div style="font-family:'SF Mono',Menlo,monospace;font-size:11px;color:#475569;line-height:2;">
+        interface MutationInterceptor {<br>
+        &nbsp;&nbsp;snapshot(id) → ObjectState<br>
+        &nbsp;&nbsp;diff(before, after) → ChangedFields<br>
+        &nbsp;&nbsp;emit(event: HabuEvent) → void<br>
+        }
+      </div>
+      <p style="margin-top:10px;font-size:11px;">Each service implements this once. The event bus, delivery, and registration system are shared — no duplication per service.</p>
+    </div>
+    <div class="card" style="border-left:2px solid #2563eb;">
+      <div style="font-size:10px;font-weight:800;color:#60a5fa;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;">Standardised Event Schema (CloudEvents-aligned)</div>
+      <div style="font-family:'SF Mono',Menlo,monospace;font-size:11px;color:#475569;line-height:1.8;">
+        {<br>
+        &nbsp;"source": "unhygienix",<br>
+        &nbsp;"objectType": "QUESTION",<br>
+        &nbsp;"objectId": "q-123",<br>
+        &nbsp;"eventType": "UPDATED",<br>
+        &nbsp;"changedFields": { ... },<br>
+        &nbsp;"performedBy": "sarah@acme.com",<br>
+        &nbsp;"timestamp": "2026-05-09T14:32Z"<br>
+        }
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:14px;background:#0a1628;border-radius:7px;padding:11px 14px;font-size:11px;color:#334155;">
+    <strong style="color:#64748b;">Related tickets already in backlog that benefit from this infrastructure:</strong>
+    &nbsp;DV-13789 (Better Ingestion Observability) · DV-12958 (Enable Exports Config from External API) · DV-13856 (Callback Registration)
+  </div>
+</div>
+</div>
+
+<!-- ══════════ SLIDE 4 — Full Architecture ══════════ -->
+<div class="slide" data-t="Full Architecture">
+<div class="inn sm">
+  <div style="margin-bottom:12px;">
+    <div class="kk">End-to-End Architecture</div>
+    <h2>6 layers — from source service to external consumer</h2>
+  </div>
+
+  <div class="arch-wrap">
+
+    <!-- Layer 0: Sources -->
+    <div class="arch-section-label">Layer 0 — Event Sources</div>
+    <div class="svc-row">
+      <div class="svc-chip u"><div class="sname">unhygienix</div><div class="sobjs">Questions · DCs · Flows</div></div>
+      <div class="svc-chip p"><div class="sname">picanmix</div><div class="sobjs">Exports · Job Runs</div></div>
+      <div class="svc-chip o"><div class="sname">orbit</div><div class="sobjs">Data Connections</div></div>
+      <div class="svc-chip f"><div class="sname">forebitt</div><div class="sobjs">Scheduled Triggers</div></div>
+      <div class="svc-chip future"><div class="sname">+future</div><div class="sobjs">any service</div></div>
+    </div>
+
+    <div class="conn">↓</div>
+
+    <!-- Layer 1: Interceptors -->
+    <div class="arch-section-label">Layer 1 — Interceptor (one pattern, all services)</div>
+    <div class="interceptor">
+      <div class="int-label">Mutation<br>Interceptor</div>
+      <div class="int-steps">
+        <div class="int-step">① Snapshot before-state</div>
+        <div class="int-arrow">→</div>
+        <div class="int-step">② Execute mutation</div>
+        <div class="int-arrow">→</div>
+        <div class="int-step">③ Compute field diff</div>
+        <div class="int-arrow">→</div>
+        <div class="int-step">④ Build HabuEvent</div>
+        <div class="int-arrow">→</div>
+        <div class="int-step">⑤ Write + Publish</div>
+      </div>
+    </div>
+
+    <div class="conn-split">
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+      ↙ Phase 1 (DB write) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Phase 2 (event bus) ↘
+    </div>
+
+    <!-- Two-path split -->
+    <div class="path-split" style="flex:1;">
+
+      <!-- LEFT: Phase 1 path (V1) -->
+      <div class="path-v1">
+        <div class="arch-section-label" style="color:#1d4ed8;">Phase 1 Path — Persistent Store</div>
+
+        <div class="path-node v1-node">
+          <div class="pn-label" style="color:#1d4ed8;">Layer 2a — Event Store</div>
+          <div class="pn-title">object_events table</div>
+          <div class="pn-desc">Append-only PostgreSQL table. Every mutation writes a row before returning. Never deleted — retention policy (90 days default).</div>
+          <div><span class="pn-tag" style="background:#1e3a8a22;color:#60a5fa;border:1px solid #1e3a8a44;">persistent</span><span class="pn-tag" style="background:#1e3a8a22;color:#60a5fa;border:1px solid #1e3a8a44;">queryable</span></div>
+        </div>
+
+        <div class="conn" style="height:14px;">↓</div>
+
+        <div class="path-node v1-node">
+          <div class="pn-label" style="color:#1d4ed8;">Layer 3a — Read API</div>
+          <div class="pn-title">GET /cleanrooms/{id}/events</div>
+          <div class="pn-desc">Cursor-based. Filter by object type, user, date range. XMI can use this as a near-term polling upgrade — no webhook server needed.</div>
+        </div>
+
+        <div class="conn" style="height:14px;">↓</div>
+
+        <div class="path-node v1-node">
+          <div class="pn-label" style="color:#1d4ed8;">Layer 4a — Activity Feed UI</div>
+          <div class="pn-title">Activity tab in Clean Room</div>
+          <div class="pn-desc">Chronological feed. Object name · what changed · who · when. Every platform user benefits, no setup required.</div>
+        </div>
+      </div>
+
+      <!-- RIGHT: Phase 2 path (V2) -->
+      <div class="path-v2">
+        <div class="arch-section-label" style="color:#c2410c;">Phase 2 Path — Event Bus + Callback Delivery</div>
+
+        <div class="path-node v2-node">
+          <div class="pn-label" style="color:#c2410c;">Layer 2b — Event Bus (infrastructure choice)</div>
+          <div class="pn-title">AWS SNS Topics &nbsp;<span style="font-size:9px;color:#334155;">OR</span>&nbsp; GCP Pub/Sub Topics</div>
+          <div class="pn-desc">One topic per service (unhygienix-events, picanmix-events …). Fan-out to multiple subscribers. Decouples event emission from delivery.</div>
+          <div style="margin-top:5px;display:flex;gap:5px;">
+            <span class="pn-tag t-aws">AWS SNS — already in platform</span>
+            <span class="pn-tag t-gcp">GCP Pub/Sub — native push delivery</span>
+          </div>
+        </div>
+
+        <div class="conn" style="height:14px;">↓</div>
+
+        <div class="path-node v2-node">
+          <div class="pn-label" style="color:#c2410c;">Layer 3b — Queue + Event Listener Job</div>
+          <div class="pn-title">SQS Queue / GCP Subscription + Listener</div>
+          <div class="pn-desc">Consumer job reads from queue. Enriches event with registration metadata. Routes to callback delivery engine. Decouples receipt from delivery.</div>
+        </div>
+
+        <div class="conn" style="height:14px;">↓</div>
+
+        <div class="g2" style="margin-top:0;gap:8px;">
+          <div class="path-node" style="border-left:2px solid #7c3aed;">
+            <div class="pn-label" style="color:#a78bfa;">Layer 4b — Registration Store</div>
+            <div class="pn-title">callback_registrations</div>
+            <div class="pn-desc">Maps objectId + objectType → callback URL + monitoredFields + authConfig. Managed via CRUD API.</div>
+          </div>
+          <div class="path-node v2-node">
+            <div class="pn-label" style="color:#c2410c;">Layer 5 — Delivery Worker</div>
+            <div class="pn-title">HTTP POST + Retry + DLQ</div>
+            <div class="pn-desc">Retry 1s→5s→30s. Auth: Bearer / API Key / Basic. Dead Letter Queue after 3 failures.</div>
+          </div>
+        </div>
+
+        <div class="conn" style="height:14px;">↓</div>
+
+        <div class="consumer-row">
+          <div class="consumer xmi">
+            <div class="cname">XMI UI</div>
+            <div class="cdesc">webhook endpoint<br>registered callback</div>
+          </div>
+          <div class="consumer">
+            <div class="cname">Customer A</div>
+            <div class="cdesc">enterprise endpoint<br>Bearer auth</div>
+          </div>
+          <div class="consumer" style="border-style:dashed;">
+            <div class="cname" style="color:#334155;">+ future</div>
+            <div class="cdesc">any HTTPS endpoint<br>any consumer</div>
+          </div>
+        </div>
+      </div>
+    </div><!-- /path-split -->
+  </div><!-- /arch-wrap -->
+</div>
+</div>
+
+<!-- ══════════ SLIDE 5 — Infrastructure Options ══════════ -->
+<div class="slide" data-t="Infrastructure Options">
+<div class="inn">
+  <div style="margin-bottom:20px;">
+    <div class="kk">Phase 2 Decision</div>
+    <h2>Event bus infrastructure: AWS SNS vs GCP Pub/Sub</h2>
+    <p style="margin-top:6px;">Both are viable. The choice affects Phase 2 operational complexity and delivery model. Phase 1 (DB table + UI) is infrastructure-agnostic and ships first regardless.</p>
+  </div>
+
+  <table class="cmp-tbl">
+    <thead>
+      <tr>
+        <th>Criterion</th>
+        <th><span class="bd baw">AWS SNS + SQS</span></th>
+        <th><span class="bd bgcp">GCP Pub/Sub</span></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Already in platform?</td>
+        <td><span class="yes">YES</span> — picanmix already uses SNS + hank library</td>
+        <td><span class="no">NO</span> — new GCP dependency to add</td>
+      </tr>
+      <tr>
+        <td>HTTP delivery (no extra worker)</td>
+        <td><span class="no">NO</span> — must build SQS consumer worker to POST to URLs</td>
+        <td><span class="yes">YES</span> — Pub/Sub Push Subscriptions deliver HTTP natively</td>
+      </tr>
+      <tr>
+        <td>Custom auth on outbound POST</td>
+        <td><span class="yes">YES</span> — worker controls auth header (Bearer/API Key/Basic)</td>
+        <td><span class="part">PARTIAL</span> — OIDC token only; custom auth needs proxy</td>
+      </tr>
+      <tr>
+        <td>Built-in retry + DLQ</td>
+        <td><span class="yes">YES</span> — SQS visibility timeout + SQS DLQ</td>
+        <td><span class="yes">YES</span> — configurable retry policy + dead-letter topic</td>
+      </tr>
+      <tr>
+        <td>Message ordering</td>
+        <td><span class="yes">YES</span> — FIFO SNS/SQS (picanmix uses .fifo already)</td>
+        <td><span class="yes">YES</span> — ordering keys per subscription</td>
+      </tr>
+      <tr>
+        <td>Operational overhead</td>
+        <td>Medium — SQS consumer worker service to manage</td>
+        <td>Low (push mode) — Pub/Sub manages delivery itself</td>
+      </tr>
+      <tr>
+        <td>Platform fit</td>
+        <td><span class="yes">HIGH</span> — consistent with existing unhygienix/picanmix pattern</td>
+        <td>Low — introduces multi-cloud complexity</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="g2" style="margin-top:14px;">
+    <div class="card ab" style="padding:14px;">
+      <div style="font-size:10px;font-weight:800;color:#60a5fa;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">Recommendation — AWS SNS + SQS</div>
+      <p style="font-size:12px;">SNS is already wired in picanmix via the hank library. SQS gives us retry + DLQ with no new infrastructure. The consumer worker gives us full control over auth and payload shaping. Consistent with how the rest of Habu handles async events.</p>
+    </div>
+    <div class="card" style="padding:14px;border-color:#1e3a5f;">
+      <div style="font-size:10px;font-weight:800;color:#4ade80;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">When GCP Pub/Sub Makes Sense</div>
+      <p style="font-size:12px;">If Habu becomes multi-cloud and GCP services need to subscribe to events, Pub/Sub's native push subscriptions simplify delivery. Defer this unless the platform explicitly moves multi-cloud — the SNS/SQS approach can be swapped behind the event bus interface without changing the interceptors or delivery worker logic.</p>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ══════════ SLIDE 6 — Activity Feed UI ══════════ -->
+<div class="slide" data-t="Activity Feed UI">
+<div class="inn" style="padding:22px 32px;">
+  <div style="margin-bottom:12px;display:flex;align-items:baseline;gap:12px;">
+    <span class="kk" style="margin-bottom:0;">Phase 1 — UI Mockup</span>
+    <h2 style="font-size:19px;margin-bottom:0;">Activity Feed — what the customer sees inside the platform</h2>
+  </div>
+
+  <div class="browser">
+    <div class="brow-chrome">
+      <div class="brow-dot" style="background:#ef4444;"></div>
+      <div class="brow-dot" style="background:#f59e0b;"></div>
+      <div class="brow-dot" style="background:#22c55e;"></div>
+      <div class="brow-url">app.habu.com / clean-rooms / acme-liveramp-q1 / activity</div>
+    </div>
+    <div class="app-top">
+      <div class="app-logo">habu</div>
+      <span class="app-link">Clean Rooms</span>
+      <span class="app-link">Data Connections</span>
+      <span class="app-link">Exports</span>
+    </div>
+    <div class="cr-hdr">
+      <div class="cr-name">Acme Corp × LiveRamp — Q1 2026</div>
+      <div class="cr-meta">2 Partners &nbsp;·&nbsp; 4 Active Questions &nbsp;·&nbsp; Last activity 2 hours ago</div>
+    </div>
+    <div class="tabs">
+      <div class="tab">Overview</div>
+      <div class="tab">Questions</div>
+      <div class="tab">Data Connections</div>
+      <div class="tab">Exports</div>
+      <div class="tab on">Activity</div>
+    </div>
+    <div class="feed">
+      <div class="frow">
+        <span style="font-size:10px;color:#1e3a5f;">Filter:</span>
+        <select class="fsel"><option>All object types</option></select>
+        <select class="fsel"><option>All users</option></select>
+        <select class="fsel"><option>Last 30 days</option></select>
+      </div>
+      <div class="evts">
+        <div class="evt hi">
+          <div class="eico iq">Q</div>
+          <div class="ebody">
+            <div class="ename">Revenue Analysis</div>
+            <div class="edesc">Output columns were modified</div>
+            <div class="emeta"><span class="etag tq">Question</span><span class="etag tupd">Updated</span><span class="ewho">sarah@acme.com</span><span class="etime">· May 9, 2026, 2:32 PM</span></div>
+          </div>
+        </div>
+        <div class="evt">
+          <div class="eico idc">DC</div>
+          <div class="ebody">
+            <div class="ename">CRM_Import</div>
+            <div class="edesc">Field configuration changed</div>
+            <div class="emeta"><span class="etag tdc">Data Connection</span><span class="etag tupd">Updated</span><span class="ewho">john@acme.com</span><span class="etime">· May 9, 2026, 11:15 AM</span></div>
+          </div>
+        </div>
+        <div class="evt">
+          <div class="eico iq">Q</div>
+          <div class="ebody">
+            <div class="ename">Attribution Model</div>
+            <div class="edesc">Dataset assignment was updated</div>
+            <div class="emeta"><span class="etag tq">Question</span><span class="etag tupd">Updated</span><span class="ewho">sarah@acme.com</span><span class="etime">· May 8, 2026, 9:00 AM</span></div>
+          </div>
+        </div>
+        <div class="evt">
+          <div class="eico iex">EX</div>
+          <div class="ebody">
+            <div class="ename">Weekly Report Export</div>
+            <div class="edesc">Export completed successfully</div>
+            <div class="emeta"><span class="etag tex">Export</span><span class="etag tupd">Status changed</span><span class="ewho">system</span><span class="etime">· May 7, 2026, 6:00 PM</span></div>
+          </div>
+        </div>
+        <div class="evt">
+          <div class="eico idel">Q</div>
+          <div class="ebody">
+            <div class="ename">Lookalike Segments</div>
+            <div class="edesc">Question was deleted</div>
+            <div class="emeta"><span class="etag tq">Question</span><span class="etag tdel">Deleted</span><span class="ewho">admin@liveramp.com</span><span class="etime">· May 7, 2026, 4:45 PM</span></div>
+          </div>
+        </div>
+        <div class="evt">
+          <div class="eico idc">DC</div>
+          <div class="ebody">
+            <div class="ename">Pixel Data Feed</div>
+            <div class="edesc">New field added to schema</div>
+            <div class="emeta"><span class="etag tdc">Data Connection</span><span class="etag tupd">Updated</span><span class="ewho">john@acme.com</span><span class="etime">· May 6, 2026, 3:20 PM</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div style="margin-top:8px;font-size:10px;color:#1e3a5f;display:flex;gap:16px;">
+    <span>🔵 Phase 1: object name · high-level summary · who · when (no SQL-level diff)</span>
+    <span>📌 Field-level diff expandable on click in Phase 3</span>
+  </div>
+</div>
+</div>
+
+<!-- ══════════ SLIDE 7 — Event Display Design ══════════ -->
+<div class="slide" data-t="Event Display Design">
+<div class="inn">
+  <div style="margin-bottom:18px;">
+    <div class="kk">Phase 1 Event Display</div>
+    <h2>Keep it simple — high-level summaries for MVP</h2>
+    <p style="margin-top:6px;">For Phase 1, each event shows: what object, what kind of change, who, when. Deep field-level diffs (exact columns removed, SQL changes) are Phase 3 — stored in JSONB but surfaced on expand, not inline.</p>
+  </div>
+
+  <div class="g2">
+    <div>
+      <h3 class="hl-b" style="margin-bottom:12px;">Phase 1 event card</h3>
+      <div style="background:#020b18;border:1px solid #050e1c;border-radius:7px;padding:14px;">
+        <div style="font-size:12px;color:#64748b;line-height:2.1;">
+          <div><strong style="color:#f8fafc;display:inline-block;width:68px;">Object</strong> Revenue Analysis</div>
+          <div><strong style="color:#f8fafc;display:inline-block;width:68px;">Service</strong> unhygienix · Question</div>
+          <div><strong style="color:#f8fafc;display:inline-block;width:68px;">Action</strong> Output columns were modified</div>
+          <div><strong style="color:#f8fafc;display:inline-block;width:68px;">By</strong> sarah@acme.com</div>
+          <div><strong style="color:#f8fafc;display:inline-block;width:68px;">At</strong> May 9, 2026, 2:32 PM</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h3 class="hl-o" style="margin-bottom:12px;">Summary labels per change type</h3>
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <div class="card" style="padding:11px 14px;">
+          <div style="font-size:9px;color:#334155;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;">Question (unhygienix)</div>
+          <div style="font-size:11px;color:#334155;line-height:1.9;">"Output columns were modified" · "Dataset assignment was updated"<br>"Question status changed" · "Question was renamed" · "Question was deleted"</div>
+        </div>
+        <div class="card" style="padding:11px 14px;">
+          <div style="font-size:9px;color:#334155;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;">Data Connection (orbit)</div>
+          <div style="font-size:11px;color:#334155;line-height:1.9;">"Field configuration changed" · "New field added to schema"<br>"Field removed from schema" · "Data connection was deleted"</div>
+        </div>
+        <div class="card" style="padding:11px 14px;">
+          <div style="font-size:9px;color:#334155;font-weight:800;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;">Export (picanmix)</div>
+          <div style="font-size:11px;color:#334155;line-height:1.9;">"Export completed successfully" · "Export failed"<br>"Export configuration was updated"</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <hr/>
+  <div style="background:#0a1628;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0;padding:11px 14px;">
+    <p style="font-size:12px;"><strong style="color:#fbbf24;">Open question for Product:</strong> Should Phase 1 show inline old/new values ("columns removed: <span style="color:#fca5a5;text-decoration:line-through;">customer_segment</span>") or summary-only? Recommendation: summary-only for Phase 1, expand on click in Phase 3. Keeps the feed scannable.</p>
+  </div>
+</div>
+</div>
+
+<!-- ══════════ SLIDE 8 — Design Q&A ══════════ -->
+<div class="slide" data-t="Design Q&amp;A">
+<div class="inn">
+  <div style="margin-bottom:18px;">
+    <div class="kk">Design Decisions</div>
+    <h2>Key questions answered</h2>
+  </div>
+
+  <div class="qa">
+    <div class="qa-q">Q: Why write to a DB table — can't the UI read queue (SNS/SQS) data directly?</div>
+    <div class="qa-a">A message queue is designed for <strong style="color:#f8fafc;">one-time delivery</strong> — a consumer reads a message, processes it, the message is deleted. There's no persistent history. If you want a UI showing "what happened in the last 30 days," queue data is already gone by then.<br><br>The <code>object_events</code> table is a <strong style="color:#f8fafc;">persistent, queryable ledger</strong> — always there, filterable by date/user/type, never expires until the retention policy fires. The queue (SNS → SQS) is used for <em>webhook delivery in Phase 2 only</em> — fire-and-forget to external endpoints. Think of it: the table is the record book; the queue is the postal service.</div>
+  </div>
+
+  <div class="qa">
+    <div class="qa-q">Q: Why not use GCP Pub/Sub push subscriptions — wouldn't that eliminate the delivery worker?</div>
+    <div class="qa-a">Pub/Sub push does eliminate the worker <em>for basic delivery</em>, but it limits authentication to OIDC tokens only — you can't attach a custom Bearer token or API key without adding a proxy in front. Enterprise customers often require specific auth headers. Additionally, SNS is already wired into picanmix via the hank library, so Phase 2 reuses existing platform plumbing. The event bus interface in the design is abstracted — we can swap SNS → Pub/Sub later without touching interceptors or the delivery worker logic.</div>
+  </div>
+
+  <div class="qa">
+    <div class="qa-q">Q: Can the interceptor / event infrastructure scale to other Habu services beyond the three in scope?</div>
+    <div class="qa-a">Yes — that is the point of building it as platform infrastructure, not a one-off feature. The <code>MutationInterceptor</code> interface is a contract any service implements. The event bus, <code>object_events</code> table, <code>callback_registrations</code>, and delivery worker are shared. Adding a new service (e.g., a future "catalogmix" or a new scheduler) means implementing the interceptor in that service and pointing it at the same SNS topic. No changes to the delivery layer.</div>
+  </div>
+
+  <div class="qa">
+    <div class="qa-q">Q: What is the "webhook server" on the XMI side that we need?</div>
+    <div class="qa-a">For Phase 2 callbacks, XMI UI needs to expose an HTTPS endpoint that Habu's delivery worker POSTs to. That is their "webhook server" — a small receiver that accepts Habu's JSON payload and reacts (refresh cache, update UI, trigger downstream workflow).<br>Phase 1's cursor API (<code>GET /cleanrooms/{'{id}'}/events?since=T</code>) avoids this requirement entirely — XMI calls Habu on their schedule instead of maintaining an inbound server. Recommended as XMI's near-term path, with Phase 2 push webhooks as the long-term model.</div>
+  </div>
+</div>
+</div>
+
+<!-- ══════════ SLIDE 9 — Roadmap ══════════ -->
+<div class="slide" data-t="Roadmap">
+<div class="inn">
+  <div style="margin-bottom:18px;">
+    <div class="kk">Delivery Plan</div>
+    <h2>Three phases — infrastructure first, then delivery</h2>
+  </div>
+
+  <div class="rmap">
+    <div class="rph rv1">
+      <div class="rspr">Phase 1 · Sprint 1–2</div>
+      <div class="rti hl-b">Activity Feed UI</div>
+      <div class="ri">object_events table schema + migrations</div>
+      <div class="ri">Interceptors: unhygienix (Questions + DCs)</div>
+      <div class="ri">Interceptors: picanmix (Exports)</div>
+      <div class="ri">Field differ — before/after JSONB</div>
+      <div class="ri">GET /cleanrooms/{id}/events API</div>
+      <div class="ri">Activity tab UI with filters</div>
+      <div class="rnote">Ships to all users immediately. Cursor API available to XMI as near-term upgrade from polling.</div>
+    </div>
+    <div class="rph rv2">
+      <div class="rspr">Phase 2 · Sprint 3–5</div>
+      <div class="rti hl-o">Event Bus + Webhook Callbacks</div>
+      <div class="ri">AWS SNS topic setup (per service)</div>
+      <div class="ri">SNS publish in Phase 1 interceptors</div>
+      <div class="ri">SQS queue + Event Listener Job</div>
+      <div class="ri">callback_registrations table + proto defs</div>
+      <div class="ri">Callback CRUD endpoints (external-api-server)</div>
+      <div class="ri">Delivery Worker — HTTP POST + retry + DLQ</div>
+      <div class="ri">Delivery status visible in UI</div>
+      <div class="rnote">XMI UI registers endpoint. Habu calls it on every change. No polling required.</div>
+    </div>
+    <div class="rph rv3">
+      <div class="rspr">Phase 3 · Sprint 6–7</div>
+      <div class="rti hl-g">Production Hardening</div>
+      <div class="ri">HMAC signature on every payload</div>
+      <div class="ri">DLQ admin visibility + replay UI</div>
+      <div class="ri">Event replay API (re-deliver from date X)</div>
+      <div class="ri">Webhook test endpoint POST /callbacks/{id}/test</div>
+      <div class="ri">Per-field subscription enforcement</div>
+      <div class="ri">Field-level diff visible in activity feed</div>
+      <div class="rnote">Enterprise and external customer readiness.</div>
+    </div>
+  </div>
+
+  <div style="margin-top:16px;background:#0a1628;border-radius:7px;padding:12px 16px;display:flex;gap:24px;font-size:11px;color:#334155;">
+    <div><strong style="color:#64748b;">Phase 1 ships independently</strong> — no dependency on Phase 2 infrastructure. Interceptors built in Phase 1 are reused and extended in Phase 2.</div>
+    <div><strong style="color:#64748b;">Phase 2 infrastructure choice</strong> — AWS SNS + SQS recommended (already in platform). Can evaluate GCP Pub/Sub as optional migration post-Phase 3.</div>
+  </div>
+</div>
+</div>
+
+<!-- ══════════ SLIDE 10 — V2 Summary ══════════ -->
+<div class="slide" data-t="Phase 2 Summary">
+<div class="inn">
+  <div style="margin-bottom:18px;">
+    <div class="kk">Phase 2 Summary</div>
+    <h2>Webhook Callback Delivery — how it works end-to-end</h2>
+  </div>
+
+  <div class="g2">
+    <div>
+      <h3 class="hl-o" style="margin-bottom:12px;">Registration</h3>
+      <div style="background:#020b18;border:1px solid #050e1c;border-radius:7px;padding:14px;font-family:'SF Mono',Menlo,monospace;font-size:11px;color:#475569;line-height:1.8;">
+        POST /cleanrooms/{crId}/callbacks<br>
+        {<br>
+        &nbsp;"objectType": "QUESTION",<br>
+        &nbsp;"objectId": "q-123-abc",<br>
+        &nbsp;"callbackUrl": "https://xmi-ui.lr.com/webhooks/habu",<br>
+        &nbsp;"monitoredFields": ["dimensions","datasets","status"],<br>
+        &nbsp;"authConfig": { "authType": "BEARER", "authValue": "..." }<br>
+        }
+      </div>
+    </div>
+    <div>
+      <h3 class="hl-o" style="margin-bottom:12px;">Delivered payload (XMI receives)</h3>
+      <div style="background:#020b18;border:1px solid #050e1c;border-radius:7px;padding:14px;font-family:'SF Mono',Menlo,monospace;font-size:11px;color:#475569;line-height:1.8;">
+        POST https://xmi-ui.lr.com/webhooks/habu<br>
+        Authorization: Bearer &lt;token&gt;<br>
+        {<br>
+        &nbsp;"eventType": "FIELD_CHANGED",<br>
+        &nbsp;"source": "unhygienix",<br>
+        &nbsp;"objectType": "QUESTION",<br>
+        &nbsp;"objectName": "Revenue Analysis",<br>
+        &nbsp;"changedBy": "sarah@acme.com",<br>
+        &nbsp;"eventTime": "2026-05-09T14:32:00Z"<br>
+        }
+      </div>
+    </div>
+  </div>
+
+  <div class="v2box" style="margin-top:14px;">
+    <p style="font-size:13px;line-height:1.7;">
+      Phase 2 adds <strong style="color:#fb923c;">push-based notification</strong> for programmatic consumers. Once a callback URL is registered, Habu automatically calls it when a monitored object changes. Delivery is fully async (SNS → SQS → Event Listener Job → Delivery Worker) — the user's mutation never waits for the external endpoint. Failed deliveries retry up to 3× with exponential backoff. Undeliverable events land in a Dead Letter Queue for review. The same infrastructure serves XMI today and any new consumer in the future.
+    </p>
+    <div class="v2flow" style="margin-top:14px;">
+      <div class="vstep"><strong>Register URL</strong>POST /callbacks</div>
+      <div class="varr">→</div>
+      <div class="vstep"><strong>Object changes</strong>in Habu</div>
+      <div class="varr">→</div>
+      <div class="vstep"><strong>Interceptor</strong>emits event</div>
+      <div class="varr">→</div>
+      <div class="vstep"><strong>SNS→SQS</strong>~1ms async</div>
+      <div class="varr">→</div>
+      <div class="vstep"><strong>Listener Job</strong>enriches + routes</div>
+      <div class="varr">→</div>
+      <div class="vstep"><strong>Delivery Worker</strong>POST + retry</div>
+      <div class="varr">→</div>
+      <div class="vstep"><strong>XMI reacts</strong>refresh / update</div>
+    </div>
+  </div>
+</div>
+</div>
+
+</div><!-- /deck -->
+
+<script>
+let cur=0;
+const slides=[...document.querySelectorAll('.slide')];
+const titles=slides.map(s=>s.dataset.t);
+const dotsEl=document.getElementById('dots');
+titles.forEach((_,i)=>{
+  const d=document.createElement('div');
+  d.className='dot'+(i===0?' on':'');
+  d.onclick=()=>goTo(i);
+  dotsEl.appendChild(d);
+});
+function goTo(n){
+  slides[cur].classList.remove('on');
+  dotsEl.children[cur].classList.remove('on');
+  cur=Math.max(0,Math.min(n,slides.length-1));
+  slides[cur].classList.add('on');
+  dotsEl.children[cur].classList.add('on');
+  document.getElementById('ctr').textContent=`${cur+1} / ${slides.length}`;
+  document.getElementById('st').textContent=titles[cur];
+  document.getElementById('pB').disabled=cur===0;
+  document.getElementById('nB').disabled=cur===slides.length-1;
+}
+function go(d){goTo(cur+d);}
+document.addEventListener('keydown',e=>{
+  if(e.key==='ArrowRight'||e.key==='ArrowDown')go(1);
+  if(e.key==='ArrowLeft'||e.key==='ArrowUp')go(-1);
+});
+goTo(0);
+</script>
+</body>
+</html>

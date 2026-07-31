@@ -1,0 +1,151 @@
+LIDAC (Live Insights Design Architecture Council) — prep Q&A
+Date: 2026-07-06
+Audience: Anil (Principal Architect), XMI team, cleanroom-wide forum
+Status: DRAFT — grounded in the actual pasted Confluence design doc
+        (Conflunece_Design_Doc_Pated_6_07.txt) + this week's orinix-why-and-how work
+
+------------------------------------------------------------------------
+
+QUESTION #1 — THE ONE TO RESOLVE FIRST, BEFORE ANYTHING ELSE AT LIDAC
+
+The approved written doc's own recommendation is:
+  V1 = Pull API (recommended initial implementation)
+  V2 = Webhooks (add for real-time use cases)
+  V3 = Cloud-Native Queue / Pub/Sub — "Special-case only. Not recommended
+       as the default integration model." Reason given, verbatim: "Service
+       Account changes on their end for Pub/Sub can break the flow without
+       any changes from our end."
+
+What's been decided since (Josh + XMI conversation, carried into this
+week's planning) is webhook AND Pub/Sub BOTH in M1 — which puts Pub/Sub
+(the doc's explicitly de-prioritized V3) into the first delivery-capable
+release, not held back as a special case.
+
+Ask Anil directly: does the Josh/XMI conversation supersede the written
+doc's V3 guidance, or does LIDAC need to formally re-scope this? Don't
+walk in assuming either answer — this is a real discrepancy between a
+written, previously-circulated doc and a verbal follow-up decision, and
+it should get resolved on the record in this forum, not quietly overridden.
+
+Talking point if asked why we'd accelerate V3 despite the doc's caution:
+the doc's risk callout is about a GENERAL multi-cloud, multi-consumer
+cloud-native-queue commitment ("For each customer: dedicated queue, bridge
+service, IAM setup... Cloud-Specific Complexity... Future Cloud: new
+implementation"). What XMI is asking for in M1 is narrower: one internal
+LiveRamp team, one GCP project, WIF instead of a static key, no AWS Lambda/
+ECS bridge at all (removed entirely — orinix publishes directly via
+Workload Identity Federation, not the SNS→Lambda→Pub/Sub bridge the doc
+describes). That's a materially smaller risk surface than what the doc's
+V3 caution was actually warning about — worth saying explicitly, not
+assuming Anil will infer it.
+
+------------------------------------------------------------------------
+
+FOR ANIL (PRINCIPAL ARCHITECT) — PLATFORM-LEVEL QUESTIONS
+
+Q: Why orinix (Option B) over Pegleg-consumer/unhygienix-owns-store
+   (Option A), given Option A is the doc's own MVP recommendation for
+   "lowest implementation cost, fastest path to production"?
+A: The doc's own cons list for Option A already makes the case against it
+   for anything beyond a pure MVP: "Pegleg becomes responsible for event
+   routing despite observability being outside its domain... unhygienix
+   grows observability responsibilities... event-store schema changes
+   require migrations inside the largest service in the platform." Given
+   webhook delivery, callback registrations, delivery logs, retry infra,
+   AND now Pub/Sub delivery are all real M1-or-adjacent scope (not
+   speculative future scope), Option B's "clear domain ownership... future
+   webhook functionality belongs naturally in the same service" is the
+   doc's own stated reasoning, just confirming it still holds now that
+   scope has grown.
+
+Q: Why Java for orinix, when unhygienix/forebitt/picanmix/gangway/
+   moonraker are all Go?
+A: SQS consumption and the GCP Pub/Sub publish pattern (the two things
+   orinix's own job requires) are both already proven, production Java
+   code in pegleg (AWSSQSConfiguration/SnowflakeSqsListener;
+   BillingMessagePublisherHelper using com.google.cloud.pubsub.v1). Neither
+   is proven in Go anywhere in this codebase — hank, the Go event library,
+   has no SQS support at all. WIF is proven in both languages, so that one
+   doesn't tip it. gangway's precedent (own DB, own gRPC port) is an
+   ownership lesson, not a language mandate — kept regardless of which
+   language wins. Ask Anil for explicit validation here since it's the one
+   place orinix breaks from the Go-service majority.
+
+Q: Migration tooling — Liquibase or plain versioned SQL?
+A: Genuinely open, flagging rather than guessing: unhygienix (Go) uses
+   Liquibase (changelog.yaml). pegleg and cronos (Java) both use plain
+   .sql files applied by hand. The original design doc's "Liquibase
+   migration" line may have been written with unhygienix's Go convention
+   in mind, before language was decided. Ask Anil for the platform
+   standard rather than picking one unilaterally.
+
+Q: Does the "no service-to-service calls, SNS-only" invariant apply to
+   orinix as well? (The doc states this for forebitt today: "Forebitt
+   publishes to SNS only... No circular dependency, Loose coupling,
+   Independent deployments.")
+A: Yes by design — orinix never calls unhygienix/forebitt/picanmix
+   directly, only consumes from SQS. Worth having this blessed explicitly
+   as a locked invariant for orinix too, not just assumed to carry over.
+
+------------------------------------------------------------------------
+
+FOR XMI TEAM — THINGS ONLY THEY CAN CONFIRM
+
+Q: Given the doc's own caution on Pub/Sub delivery risk (their service
+   account changes can silently break delivery with zero changes on Habu's
+   end) — is XMI still comfortable owning that operational risk for M1, or
+   would they rather stage it (webhook first, Pub/Sub once webhook is
+   proven in production)?
+
+Q: Who owns the GCP Pub/Sub topic? Does XMI create the topic and grant
+   Habu's service account (via Workload Identity Federation) a publisher
+   role, or does Habu create/own the topic and grant XMI a subscriber
+   role? This was raised as an open question in an earlier internal
+   discussion and never formally answered — force a decision here.
+
+Q: For webhook delivery, per the doc's own "XMI Responsibilities: Host
+   HTTPS endpoint, Verify HMAC signature, Deduplicate events" — can XMI
+   confirm their webhook handler will be idempotent? Delivery is
+   at-least-once (5 retry attempts, exponential backoff + jitter, DLQ on
+   exhaustion per the doc), so XMI WILL receive duplicate deliveries of
+   the same event id on retry.
+
+Q: If all 5 delivery attempts to XMI's callback URL fail (e.g. their
+   endpoint is down for an extended window), the event lands in Habu's
+   DLQ. Does XMI want to be notified when that happens (a "delivery
+   permanently failed" signal), or is Habu-side DLQ monitoring + manual
+   follow-up sufficient for M1?
+
+Q: The doc's registration payload already includes monitoredFields
+   (field-level filtering, e.g. only notify on "stage" changes, not every
+   DataConnection field). Does XMI need field-level filtering in M1, or is
+   object-type-level granularity (all DataConnection changes) sufficient
+   to start?
+
+Q: Is sub-5-second latency still the real number for Flow chaining, and
+   does XMI expect that number to hold equally for BOTH webhook and
+   Pub/Sub delivery, or is one path expected/allowed to be slower?
+
+Q: Confirm the M1 use case list is still accurate: DataConnection stage
+   changes, Flow Run state changes (STARTED/COMPLETED/FAILED), dataset
+   assignment changes, and the quick-start "all datasets assigned" trigger.
+   Anything added or dropped since this was last discussed?
+
+------------------------------------------------------------------------
+
+GENERAL / EITHER AUDIENCE
+
+Q: Event id stability — is the CloudEvents "id" field guaranteed to stay
+   the same UUID across a retried delivery of the same event (not re-
+   minted per attempt)? XMI's dedup logic depends on this being true.
+
+Q: Schema versioning policy — schemaVersion is 1 today. When a v2 is
+   needed, is the commitment strictly additive-only fields (safe for
+   existing consumers), or should XMI expect occasional breaking changes
+   with advance notice? Worth stating the policy explicitly rather than
+   leaving it implicit.
+
+Q: The doc states object_events is org-scoped and enforces append-only at
+   the DB level (REVOKE UPDATE, DELETE). Confirm this same DB-level
+   enforcement (not just application-level convention) applies to
+   whichever service ends up owning the table.

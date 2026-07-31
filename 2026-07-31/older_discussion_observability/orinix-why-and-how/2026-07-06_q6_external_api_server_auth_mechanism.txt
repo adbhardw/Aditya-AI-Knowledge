@@ -1,0 +1,99 @@
+Q6 — How does external-api-server authenticate/authorize its gRPC calls (e.g. dataSourceServiceBlockingStub -> forebitt)? What does orinix inherit for free?
+Date: 2026-07-06
+Status: ANSWERED — verified directly, relevant to orinix's future wiring
+
+------------------------------------------------------------------------
+
+dataSourceServiceBlockingStub HAS NO PER-FIELD AUTH CONFIG
+
+Declared exactly like the other five @GrpcClient("forebitt") stubs in
+DataConnectionService.java — plain injection, nothing else. Confirmed via
+grep: zero .withCallCredentials() calls in DataConnectionService.java or
+DataSourceService.java. Auth is not attached per-stub or per-call here —
+it's global.
+
+------------------------------------------------------------------------
+
+TWO GLOBAL INTERCEPTORS, APPLIED TO EVERY @GrpcClient STUB AUTOMATICALLY
+
+  grpc/client/interceptors/JwtBearerInterceptor.java
+    @GrpcGlobalClientInterceptor, @Order(ORDER_SECURITY_AUTHENTICATION)
+    On every outbound call, reads the current inbound user's JWT from
+    InternalJwtContext (a ThreadLocal set once per incoming HTTP request —
+    comment: "to avoid creating jwt token for every grpc call part of the
+    same request") and stamps it into the Authorization metadata header.
+    Skips a small allowlist of methods (login/backdoor/API-key-info) that
+    intentionally get no bearer token. Everything else, including every
+    forebitt call, gets it automatically.
+
+  grpc/client/interceptors/RequestIdInterceptor.java
+    @GrpcGlobalClientInterceptor, @Order(ORDER_TRACING_METRICS)
+    Same shape, different purpose: propagates/mints a request ID from MDC
+    into every outbound call for tracing. Not auth, but same pattern —
+    global interceptor, zero per-call code required anywhere.
+
+@GrpcGlobalClientInterceptor is the mechanism that makes this apply to
+EVERY @GrpcClient stub in the whole application without touching each
+service class — this is why DataConnectionService never manually attaches
+a JWT or trace id anywhere in its own code.
+
+------------------------------------------------------------------------
+
+AUTHORIZATION HAPPENS DOWNSTREAM, NOT IN external-api-server
+
+external-api-server's only job re: auth is faithful JWT propagation.
+forebitt (or whichever backend service) receives the token and enforces
+org-scoped filtering itself — matches the design doc's stated pattern
+elsewhere: JWT -> external-api-server -> org_id claim -> backend service,
+filtering WHERE org_id = <jwt_claim>.
+
+------------------------------------------------------------------------
+
+ONE CONTRAST WORTH NOTING — pegleg gets an EXTRA layer forebitt doesn't
+
+IntelligenceService.java (calling pegleg) also attaches an explicit
+service-level JWT via JwtServiceCallCredentials on top of the same global
+interceptor — a fresh RS256 token from JwtService.getServiceJwtToken()
+(issuer=subject="external-api-server", 5-minute expiry). This is a machine-
+identity assertion ("this call is genuinely from external-api-server
+itself"), separate from the propagated user JWT. Per the earlier-read
+javadoc: gRPC merges call-credentials metadata after interceptor headers,
+so pegleg's single Metadata.get reads the service JWT specifically (last
+value wins). forebitt doesn't do this — it's content with the propagated
+user JWT alone. Looks like a pegleg-specific requirement (validated
+against an "externalapiserver" public key in pegleg's own jwtPublicKeys),
+not something every downstream service needs by default.
+
+------------------------------------------------------------------------
+
+WHAT ORINIX INHERITS FOR FREE ONCE @GrpcClient("orinix") IS WIRED UP
+
+  Both interceptors apply automatically, zero orinix-specific code needed
+  in external-api-server:
+    - JwtBearerInterceptor propagates the inbound user's JWT to orinix,
+      same as it does for forebitt today
+    - RequestIdInterceptor propagates the trace/request id for observability
+
+  What orinix's OWN gRPC server then needs to do (not external-api-
+  server's job): parse the incoming JWT, extract org_id, filter
+  object_events rows by it — exactly the same pattern forebitt/unhygienix
+  already implement, per the design doc's "Organization Isolation" section.
+
+  Open question worth deciding during Q2/module-structure work, not
+  answered yet: does orinix need the EXTRA pegleg-style service-JWT layer
+  (JwtServiceCallCredentials), or is the standard propagated user JWT
+  sufficient, same as forebitt? No evidence yet that orinix needs the extra
+  layer — nothing in M1's scope suggests a reason pegleg-specific trust
+  requirements would apply here too, but flagging as unconfirmed rather
+  than assuming.
+
+------------------------------------------------------------------------
+
+OUSTERHOUT TIE-IN
+
+  PULL COMPLEXITY DOWNWARD (ch. 7) + INFORMATION HIDING (ch. 4) — both
+  principles in one mechanism: DataConnectionService (and future
+  orinix-calling code) has zero knowledge of HOW auth or tracing gets
+  attached. That complexity is fully absorbed by two interceptor classes
+  nobody has had to touch since they were written, and orinix gets the
+  same deal without anyone writing new code for it.

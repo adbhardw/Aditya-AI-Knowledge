@@ -1,0 +1,114 @@
+Q1 FINAL — Java vs Go vs Hybrid, consolidated, every Ousterhout pointer in one place
+Date: 2026-07-06
+Status: consolidates 2026-07-06_q1, 2026-07-06b, 2026-07-06c into one comparison
+
+------------------------------------------------------------------------
+
+THE THREE OPTIONS, SIDE BY SIDE
+
+                          JAVA                    GO                      HYBRID (split by concern)
+                          --------------------    --------------------    --------------------------
+SQS consumption           PROVEN — pegleg's       UNPROVEN — hank has     Whichever half does this
+                           AWSSQSConfiguration +    no SQS package, no      still only has one
+                           SnowflakeSqsListener,    existing Go SQS         language's proof behind it;
+                           Spring Cloud AWS          consumer anywhere       the other half gains nothing
+                           Messaging (@EnableSqs)    in this codebase
+
+GCP Pub/Sub publish       PROVEN — pegleg's       PARTIAL — Google's Go   Same SDK question as Go,
+ (the SDK you asked        BillingMessagePublish   pubsub client exists,   plus now a cross-language
+ to reuse)                 erHelper, com.google.    but zero existing        RPC hop between the ingest
+                           cloud.pubsub.v1.         usage in this repo       half and the delivery half
+                           Publisher, already a     set to model against
+                           direct pom.xml dep in
+                           pegleg-backend
+
+AWS<->GCP WIF              PROVEN — zabra-aws's    PROVEN — unhygienix's   Available either way,
+                           GoogleIdentityFederation services/google/         doesn't tip this comparison
+                           AwsToken, used live by   workload_identity_
+                           tragicomix/GCS.java      federation.go
+
+Precedent match            Breaks from gangway's   Matches gangway         Matches neither cleanly —
+ ("own DB, own gRPC        language (keeps its                             no other service in the
+ port" shape)               ownership lesson)                              fleet is internally split
+
+Called by external-api-   Already proven for      Already proven for     Whichever half is "the API"
+ server                    pegleg via the exact     picanmix via the same   gets called the normal way;
+                           same @GrpcClient +        mechanism                the other half is invisible
+                           grpc.client.<name>                                to external-api-server,
+                           block confirmed today                             which is itself a smell —
+                                                                              why does part of "orinix"
+                                                                              not have an address?
+
+Builder's own experience  You've already worked   No hank/SQS analog to   N/A — doesn't change either
+                           on Pegleg's SQS path     lean on for the          half's proof story
+                           (cognitive load          consumption side
+                           already paid down)
+
+------------------------------------------------------------------------
+
+OUSTERHOUT PRINCIPLES MAPPED TO THIS DECISION (every one used, named explicitly)
+
+  DESIGN IT TWICE (ch. 10)
+    This whole table. Three real sketches, not one obvious pick rubber-stamped.
+
+  DEEP MODULES vs SHALLOW MODULES (ch. 3)
+    A deep module needs real, hidden complexity behind a simple interface.
+    In Java, that hidden complexity (SQS handling, Pub/Sub+WIF publish) is
+    already built and hardened. In Go, choosing it means the "depth" is
+    hollow on day one — it has to be manufactured from scratch. In Hybrid,
+    the cross-language boundary is a complex interface hiding NOTHING new
+    (both sides are already inside Habu's trust boundary) — the textbook
+    shallow-module trap.
+
+  INFORMATION HIDING (ch. 4)
+    Whichever language wins, delivery_type + delivery_config hides "how do
+    we push to this consumer" from the ingest path and registration API.
+    Independent of the language call, but the SAME principle is what makes
+    "webhook AND Pub/Sub, both in M1" tractable at all.
+
+  BETTER TOGETHER OR APART (ch. 8)
+    Ingest and delivery share one event's lifecycle — that's what kills
+    Hybrid. They belong together; splitting them by language is "apart"
+    applied to something that wants to be "together."
+
+  CHANGE AMPLIFICATION / COMPLEXITY DEFINITION (ch. 1)
+    Hybrid means one schema change (delivery_type/delivery_config) requires
+    coordinating two codebases, two CI pipelines, two deploys. That's the
+    book's definition of complexity, concretely, in this decision.
+
+  TACTICAL vs STRATEGIC PROGRAMMING (ch. 2)
+    XMI wants push now. Picking Go means building unproven infrastructure
+    (SQS, Pub/Sub+WIF) under that deadline — a tactical setup, "I'll harden
+    it later." Picking Java means reusing infrastructure that already
+    survived production — the strategic choice costs less time here, not more.
+
+  CHESTERTON'S FENCE (ch. 15, applied both directions)
+    Applied correctly: read pegleg's actual SQS listener and billing
+    publisher code before proposing reuse, instead of assuming.
+    Applied in reverse (the miss, corrected in 2026-07-06b): initially
+    repeated the design doc's claim that cronos publishes FLOW_RUN without
+    checking cronos's actual source — it doesn't own that domain at all.
+    Applied forward for gangway: its fence is "own DB, own gRPC port"
+    (ownership), not "must be Go" (language) — we keep the real reason,
+    not the incidental detail.
+
+  CONSISTENCY (ch. 16)
+    Every service in this fleet is internally one language, with a
+    generated stub in the other language for cross-language callers.
+    Hybrid would be the only internally-split service — the one place a
+    new engineer couldn't apply the pattern they already know from every
+    other repo here.
+
+  DIFFERENT LAYER, DIFFERENT ABSTRACTION (ch. 6)
+    orinix's gRPC layer translates raw object_events rows into CloudEvents-
+    shaped responses — real translation work, independent of language, but
+    worth naming so this layer doesn't get built as a pass-through later.
+
+------------------------------------------------------------------------
+
+DECISION: JAVA. Go loses on 2 of 3 core capabilities (not all 3 — WIF is
+proven in both, credit where due). Hybrid is rejected outright, not close.
+
+This is still open for your explicit sign-off before Q2 work (module
+layout, pom.xml, design pattern) gets treated as final — see the companion
+doc for that: 2026-07-06_q2_dependencies_and_module_structure.txt

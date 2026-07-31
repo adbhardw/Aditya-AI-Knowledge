@@ -1,0 +1,225 @@
+orinix — PR #1 file manifest
+Date: 2026-07-06
+Status: DONE — scaffolded locally at Habu_Cloned_Repo/orinix and committed
+        (commit 04b4e50, "Scaffold orinix: cleanroom observability service (M1)").
+        Not pushed to https://github.com/deklareddotcom/orinix yet — that's a
+        separate, later step.
+Commit hygiene: no Claude co-author / mention anywhere, per standing rule — confirmed
+        clean in the actual commit.
+
+------------------------------------------------------------------------
+
+ONE REFINEMENT SURFACED WHILE BUILDING THIS LIST — flagging before the
+manifest, not burying it inside
+
+Re-reading the approved Confluence doc's Approach 2 "Operational Details"
+closely: it specifies PER-CONSUMER SQS delivery queues (sqs-habu-delivery-
+xmi, sqs-habu-delivery-microsoft, sqs-habu-delivery-safehaven) with "5
+attempts, exponential backoff, jitter, DLQ on exhaustion." That's AWS SQS's
+own native redrive-policy behavior (maxReceiveCount + a configured DLQ),
+not something to hand-roll as an attempts-counter column in Postgres.
+
+This changes the shape slightly from what I'd been describing loosely as
+"the worker polls object_events and tracks delivery status itself":
+  - Right after SqsEventConsumer inserts into object_events, a small
+    DeliveryDispatcher fans out one lightweight message per matching
+    registration onto THAT registration's own delivery queue
+    (sqs-habu-delivery-xmi for M1's one known consumer).
+  - CallbackDeliveryWorker becomes an SQS consumer itself, per queue —
+    reads a dispatch message, attempts delivery (webhook or Pub/Sub), and
+    either deletes the message (success) or lets it become visible again
+    (failure) so SQS's own retry/backoff/DLQ does the counting, not us.
+  - This means NO hand-rolled delivery-attempts tracking table is needed
+    for M1 correctness — SQS already owns that state. Simpler than my
+    earlier description, and more faithful to what the approved doc
+    actually specifies.
+  - M1 provisions ONE static per-consumer queue (XMI's), via Terraform,
+    not a dynamic "create a queue per new registration" system — that
+    generality isn't needed yet (GENERAL-PURPOSE MODULES, ch. 5: don't
+    build for consumers we don't have).
+
+Flagging this as a real design refinement, not a settled fact — confirm
+before I scaffold, since it changes two files below (removes one, adds one).
+
+------------------------------------------------------------------------
+
+WHERE THIS LIVES ON DISK (needs your answer before I create anything)
+
+Every real service repo (pegleg, cronos, unhygienix, gangway...) lives
+under Habu_Cloned_Repo/<name>. No orinix directory exists there yet, or
+anywhere else — confirmed by search. Proposing Habu_Cloned_Repo/orinix to
+match the convention, but this is a new-repo creation action, so naming it
+explicitly rather than assuming.
+
+------------------------------------------------------------------------
+
+FILE MANIFEST — orinix-proto/ (published stub jar, matches unhygienix-
+proto / gangway-proto / moonraker-proto convention)
+
+  pom.xml
+    artifactId orinix-proto, protobuf/grpc codegen plugins, published to
+    GitHub Packages same as every other -proto module.
+
+  src/main/proto/orinix.proto
+    ONE proto file for M1 — deliberately not split into multiple files yet
+    (DECIDE WHAT MATTERS, ch. 20: don't invent structure a small M1 surface
+    doesn't need). Defines exactly two RPCs:
+      GetCleanroomEvents(cleanroom_id, org_id, since_cursor, object_type,
+                          limit) -> (events[], next_cursor, has_more)
+      RegisterCallback(cleanroom_id, delivery_type, delivery_config)
+                       -> (registration_id, signing_secret)
+    Deliberately NOT included: a "RecordObjectEvent" RPC. The SQS consumer
+    and the DB write both live inside orinix-server, same process — a gRPC
+    call for a same-process write would be a network-shaped interface
+    hiding nothing (DEEP MODULES / DIFFERENT LAYER DIFFERENT ABSTRACTION,
+    ch. 3 & 6 — a layer that doesn't translate into new vocabulary should
+    be deleted, not built). It's a plain Java method call instead.
+    Also deliberately NOT included: StreamCleanroomEvents. Named in the
+    original design doc as a future option, not M1 scope — adding it now
+    would be speculative generality with no current caller.
+
+------------------------------------------------------------------------
+
+FILE MANIFEST — orinix-backend/ (domain logic, no Spring Boot app here —
+mirrors pegleg-backend's role as the library module)
+
+  pom.xml
+    depends on orinix-proto, spring-data-jpa, postgresql,
+    google-cloud-pubsub, com.habu.zabra:zabra-aws (WIF)
+
+  src/main/java/com/habu/orinix/ingest/SqsEventConsumer.java
+    Spring Cloud AWS listener on sqs-habu-observability-internal. Parses
+    the CloudEvents JSON, calls ObjectEventIngestService directly (plain
+    method call, not gRPC — see above).
+
+  src/main/java/com/habu/orinix/ingest/ObjectEventIngestService.java
+    Idempotent insert into object_events (unique constraint on
+    idempotency_key handles SQS at-least-once redelivery), then calls
+    DeliveryDispatcher for any matching registrations.
+
+  src/main/java/com/habu/orinix/ingest/DeliveryDispatcher.java
+    NEW, per the refinement above. Looks up active registrations matching
+    the event, sends one small dispatch message per registration onto that
+    consumer's delivery queue (sqs-habu-delivery-xmi for M1). This is the
+    OBSERVER/fan-out half of the design from the Q4 pattern discussion —
+    one event, notify N registrations — kept separate from dispatch
+    (Strategy), which happens downstream in the worker.
+
+  src/main/java/com/habu/orinix/db/ObjectEventEntity.java
+    JPA entity for object_events — schema unchanged from the June design
+    doc, carried forward as-is (append-only, cursor_position, changed_fields
+    JSONB).
+
+  src/main/java/com/habu/orinix/db/ObjectEventRepository.java
+    Spring Data JPA repository. One cursor-based query method backing
+    GetCleanroomEvents: findByCleanroomIdAndCursorPositionGreaterThan(...).
+
+  src/main/java/com/habu/orinix/db/CallbackRegistrationEntity.java
+    JPA entity for callback_registrations — delivery_type (WEBHOOK|PUBSUB),
+    delivery_config (JSONB), signing_secret, status, created_by.
+
+  src/main/java/com/habu/orinix/db/CallbackRegistrationRepository.java
+    Spring Data JPA repository — lookup by cleanroom_id + object_type for
+    DeliveryDispatcher's fan-out query.
+
+  src/main/java/com/habu/orinix/delivery/DeliveryChannel.java
+    The Strategy interface (Q4): deliver(registration, event) -> DeliveryResult.
+
+  src/main/java/com/habu/orinix/delivery/WebhookDeliveryChannel.java
+    @Component("WEBHOOK"). HTTP POST the CloudEvents payload to
+    delivery_config.callback_url, HMAC-SHA256 sign it (X-Habu-Signature,
+    confirmed into M1 this session), record the response. HMAC computation
+    is a private method here, not a separate class — a one-line wrapper
+    around Mac.getInstance() would be a SHALLOW MODULE (ch. 3), so it stays
+    folded into the one implementation that needs it.
+
+  src/main/java/com/habu/orinix/delivery/PubSubDeliveryChannel.java
+    @Component("PUBSUB"). Publishes via com.google.cloud.pubsub.v1.Publisher
+    to delivery_config's gcp_project_id/gcp_topic_id, using zabra-aws's
+    WIF credential exchange — modeled directly on pegleg's
+    BillingMessagePublisherHelper, per your original ask to reuse that SDK.
+
+  src/main/java/com/habu/orinix/delivery/CallbackDeliveryWorker.java
+    SQS listener PER delivery queue (sqs-habu-delivery-xmi for M1). Reads a
+    dispatch message, looks up the registration's delivery_type, invokes
+    the matching DeliveryChannel via Spring's auto-collected
+    Map<String, DeliveryChannel> (Q4). Deletes the SQS message on success;
+    on failure, lets SQS's own visibility timeout + redrive policy retry
+    and eventually DLQ it — no hand-rolled attempt counter.
+
+  src/main/java/com/habu/orinix/registration/CallbackRegistrationService.java
+    Validates a registration request (URL reachability for WEBHOOK, topic/
+    IAM existence for PUBSUB), mints the HMAC signing_secret, persists the
+    row.
+
+  src/main/resources/db/001_create_object_events.sql
+  src/main/resources/db/002_create_callback_registrations.sql
+    Plain versioned SQL, matching pegleg/cronos's convention (not
+    Liquibase, which is the unhygienix/Go convention) — CHESTERTON'S FENCE
+    applied forward: join the convention of the ecosystem we're actually
+    part of (Java), don't import a Go-world tool by default. Still flagged
+    to Anil at LIDAC as an open confirmation, not silently final.
+
+------------------------------------------------------------------------
+
+FILE MANIFEST — orinix-server/ (Spring Boot app — wiring only, mirrors
+pegleg-server's role)
+
+  pom.xml
+    spring-boot-starter-web, net.devh:grpc-spring-boot-starter,
+    spring-cloud-starter-aws-messaging, depends on orinix-backend + orinix-proto
+
+  src/main/java/com/habu/orinix/OrinixApplication.java
+    @SpringBootApplication entry point.
+
+  src/main/java/com/habu/orinix/grpc/OrinixServiceImpl.java
+    Implements OrinixServiceGrpc.OrinixServiceImplBase — GetCleanroomEvents
+    and RegisterCallback, delegating to the repository/service classes in
+    orinix-backend. This class is the gRPC layer's actual translation work
+    (DIFFERENT LAYER DIFFERENT ABSTRACTION, ch. 6) — raw entity rows in,
+    CloudEvents-shaped proto responses out.
+
+  src/main/java/com/habu/orinix/config/SqsConfig.java
+    @EnableSqs configuration — mirrors pegleg's AWSSQSConfiguration.java
+    almost exactly, same Spring Cloud AWS Messaging library.
+
+  src/main/resources/application.yml
+    gRPC server port, DB connection, SQS queue URLs (ingest queue +
+    XMI's delivery queue), GCP defaults.
+
+  src/main/resources/application-dev.yml
+
+  Dockerfile, Makefile, README.md
+    Same shape as every other repo here — nothing orinix-specific to
+    invent, CONSISTENCY (ch. 16) again.
+
+------------------------------------------------------------------------
+
+FILE MANIFEST — repo root
+
+  pom.xml (parent aggregator — mirrors pegleg's top-level pom.xml
+  aggregating its backend/commands/query/server modules)
+  settings.xml (GitHub Packages auth, same as every other repo)
+  .github/workflows/maven-package.yml (build + package + publish on push)
+  .gitignore
+
+------------------------------------------------------------------------
+
+TERRAFORM (separate infra repo/PR, not this one — noting for completeness)
+
+  SNS topic habu-observability-events, SQS sqs-habu-observability-internal,
+  SQS sqs-habu-delivery-xmi (+ its DLQ with redrive policy, maxReceiveCount
+  5). Additive only — existing operational hevent topic untouched.
+
+------------------------------------------------------------------------
+
+WHAT'S NOT IN THIS PR — same exclusions as the M1 scope doc, repeated here
+so the file list doesn't quietly grow past what was agreed
+
+  - delivery_log rich per-attempt audit table (V2 — SQS's own redrive
+    state is sufficient for M1's actual correctness needs)
+  - Self-service registration UI (M2 — product surface, not this PR)
+  - All object types except FLOW_RUN (DATA_CONNECTION/QUESTION/EXPORT_JOB
+    publishers come once this path is proven)
+  - Dynamic per-consumer queue provisioning (M1 has one static XMI queue)
+  - Activity Feed UI (V3, separate PM-owned consumer of GetCleanroomEvents)

@@ -1,0 +1,139 @@
+WHAT DOES "NEXUS APP" MEAN, WHAT DOES "NEXUS" MEAN, AND DOES THE SIDECAR
+MODEL SKIP CALLING NEXUS/CAC ENTIRELY?
+Follow-up to 2026-07-22_nexus_vs_cac_resolved.txt.
+Also closes a loop left open in that doc: exactly HOW does CAC validate a
+token when the caller (like MCS) has no local authn-proxy of its own?
+Date: 2026-07-22
+
+Source: LiveRamp/product-knowledge-graph,
+graph/graph-v2/domains/auth/application/repos/nexus/domain_repo_responsibilities.md
+— an internal analyst doc that reads CAC's actual source
+(LiveRamp/nexus, apps/access-control/).
+
+
+===========================================================
+Q: What does it mean to be a "Nexus app"?
+===========================================================
+
+A: Concretely: living as one of the subdirectories under `apps/` in the
+`LiveRamp/nexus` monorepo, owned by the same team. Quoting the doc directly:
+
+  "The nexus monorepo (GitHub: LiveRamp/nexus) is the implementation home
+   for nearly every auth domain service owned by the AAA team. Five primary
+   applications live under apps/, plus a cluster of supporting apps and
+   sync workers."
+
+So it's NOT one shared running process or one shared codebase module — each
+app (access-control/CAC, service-account, org-api, etc.) is its OWN
+independently deployed service. CAC specifically is described as: "a Go
+service backed by PostgreSQL, exposing a fasthttp REST API at
+api.liveramp.com/access/control/service." Fully separate deployment,
+separate database, separate API, from service-account.
+
+"Nexus app" = same monorepo, same owning team (AAA — Authentication,
+Authorization, Accounting, presumably), shared conventions (like the
+authnmiddleware pattern below) — but each one is its own real, independently
+running service underneath.
+
+
+===========================================================
+Q: What does "Nexus" mean?
+===========================================================
+
+A: Genuinely, almost nothing — checked the repo's own README:
+
+  "# N.E.X.U.S.
+   The nexus of Nexus. The Nexus Monorepo. Now Everyone eXpects Usable
+   Stuff."
+
+That's the entire README. It's a joke backronym, not a real acronym with
+technical meaning. Functionally, "Nexus" = the umbrella name/monorepo for
+LiveRamp's core identity & access management platform (the "auth domain"),
+owned by the AAA team. The name itself doesn't encode anything more
+specific than that.
+
+
+===========================================================
+Q: Since the JWT is issued by Nexus, and the sidecar pulls the public key
+   from Nexus to verify locally — does that mean Nexus/CAC gets called AT
+   ALL during a request, in the sidecar model?
+===========================================================
+
+A: Partially right, but don't over-extend it — only ONE of the two Nexus
+calls goes away, not both.
+
+  - Pulling the PUBLIC KEY happens rarely (background refresh, roughly
+    matching the 24h key rotation), NOT per-request. So yes — for the
+    specific act of verifying a signature, no network call happens on the
+    hot path of an individual incoming request. That part is genuinely free
+    once the key is cached.
+  - CAC (a Nexus app) is STILL called on EVERY SINGLE REQUEST that needs a
+    permission decision, in BOTH the sidecar model and the CAC-only model.
+    Confirmed directly in the agentic-core sequence diagram traced earlier:
+    authn-proxy verifies locally, THEN "A->>CAC: POST permission check" —
+    always happens, every time `require-cac=true`, regardless of whether
+    verification was local or not.
+
+So the sidecar model doesn't eliminate calling Nexus — it eliminates ONE
+specific call (signature verification) by exploiting the fact that
+signatures can be checked locally once you have a cached public key. The
+permission decision itself is never cacheable that way (permissions can
+change any minute — see the earlier doc's passport-hologram-vs-guest-list
+analogy) and always requires a live call to CAC, no matter which model
+you're using.
+
+
+===========================================================
+BONUS — closing an open loop: HOW does CAC validate MCS's forwarded token,
+if MCS has no local authn-proxy of its own?
+===========================================================
+
+This was left as "very likely, inferred, not confirmed" in an earlier doc.
+Now confirmed directly, and it's a satisfying answer. From the same
+analyst doc, section "1.2 Authn middleware — the gateway/CAC boundary":
+
+  "The authnmiddleware package reads two headers injected upstream:
+   - x-validated-access-token — JSON payload with uid and sub fields,
+     WRITTEN BY THE AUTHN-PROXY SIDECAR (source in infra_api_platform).
+     UserInjectorMiddleware wraps all handlers and parses this header into
+     request context.
+   - LR-Org-ID ..."
+
+This is the key fact: CAC's OWN application code NEVER parses a raw JWT at
+all. It only ever reads an ALREADY-VERIFIED identity header
+(`x-validated-access-token`). That header only exists because something
+upstream of CAC's app code wrote it — and that something is CAC's OWN
+authn-proxy sidecar, sitting in front of CAC's own deployment (CAC is
+"the load-bearing prerequisite for every authenticated API call on the
+platform" — of course its own inbound traffic is behind a real
+authn-proxy, it would be absurd for the single most security-critical
+service on the whole platform to skip that).
+
+So the real mechanics, corrected: when MCS forwards VMA's raw bearer token
+to CAC's `/v1/user-org-permission/actions/check` endpoint, it's not that
+"CAC's application code verifies the JWT." It's that CAC's OWN gateway
+(CAC's own authn-proxy, protecting CAC itself) verifies it FIRST, exactly
+the same mechanism every other authn-proxy-enabled service uses — and only
+THEN does CAC's actual business logic (the RBAC/permission lookup) run,
+reading the pre-verified identity off a header, same as any other Nexus-
+adjacent app.
+
+REVISED, MORE PRECISE PICTURE: verification is never skipped in either
+model. It ALWAYS happens via an authn-proxy-shaped mechanism (verify
+signature against a cached Nexus public key, write a validated-identity
+header). The only real difference between "MCS-style" and "sidecar-style"
+is WHOSE authn-proxy does it and WHERE:
+  - MCS-style (no local proxy): MCS blindly forwards the raw token; CAC's
+    OWN authn-proxy (on CAC's side of the wire) does the verification.
+  - sidecar-style (agentic-core): the RECEIVING service runs its own local
+    authn-proxy, verifying before the request even reaches its app code,
+    then separately calls CAC (whose own authn-proxy re-verifies again on
+    CAC's side too, since CAC can't just trust a header claiming to already
+    be validated from an arbitrary caller without its own gateway checking
+    it — CAC's authn-proxy sits in front of ALL of CAC's callers uniformly).
+
+Net effect: MCS-style costs one extra "hop of responsibility" (you're
+trusting CAC to do the verification that you could have done yourself
+locally) but is not literally skipping a security step — the token still
+gets properly, cryptographically verified before any permission decision is
+trusted. It's a latency/ownership tradeoff, not a security gap.

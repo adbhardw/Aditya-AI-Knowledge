@@ -1,0 +1,509 @@
+================================================================================
+DATA CONNECTION / DATA IMPORT JOB — WHERE DO WE EMIT THE EVENT?
+Service-layer explicit publish  vs  Hank GORM callback hooks
+================================================================================
+Date:    2026-07-28
+Author:  Aditya Bhardwaj
+For:     Architect design discussion (orinix / DV-13856 / DV-15090 / DV-15496)
+Scope:   Deliberately narrowed to DATA_CONNECTION (= DataImportJob) CREATE,
+         UPDATE and DELETE. Everything here is traced through real forebitt
+         code, not the design docs.
+
+Companion doc: 2026-07-27_loki-datadog-hank-event-comparision.txt
+  (that one answers "can a log store back the read API" — no; this one answers
+   "where in the code should the event be produced in the first place")
+
+[VERIFIED] = read in source on 2026-07-28.  [UNVERIFIED] = must be confirmed.
+
+================================================================================
+1. THE QUESTION IN ONE PARAGRAPH
+================================================================================
+orinix needs one event per business action, carrying {from, to}, so XMI can react
+to data-connection lifecycle changes. There are two candidate production points:
+
+  APPROACH A (service layer, explicit): add a publish block inside the gRPC
+    handler — CreateDataConnectionV2 / UpdateDataConnectionV2 / DeleteImportJob
+    — where the initial and final state are both in scope, and emit exactly one
+    fat CloudEvents message.
+
+  APPROACH B (Hank GORM hooks, implicit): let hank/db's AfterCreate /
+    AfterUpdate / AfterDelete callbacks fire automatically on every audited
+    model, and derive events from those.
+
+The intuition for B is strong: "it's already wired to 91 models, we get coverage
+for free." This document is the evidence that B does not produce the event we
+need — not because it is unimplemented, but because of where it sits in the
+stack. A is recommended.
+
+================================================================================
+2. GROUND TRUTH — WHAT ONE BUSINESS ACTION ACTUALLY DOES
+================================================================================
+This is the crux. "Create a data connection" is ONE user action and 2+N table
+writes across TWO tables.
+
+--------------------------------------------------------------------------------
+2.1  CREATE — forebitt/api/server/dataConnections_v2.go:309
+--------------------------------------------------------------------------------
+[VERIFIED] CreateDataConnectionV2 resolves everything BEFORE it writes:
+
+    dataType, notFound   := db.FetchImportDataTypeByID(...)         // :323
+    dataSource, notFound := db.FetchImportDataSourceByID(...)       // :328
+    jobModel             := models.NewImportJobFromProtoV2(...)     // :333
+    jobModel.CreatedByUserID = authUser.ID                          // :334
+    jobModel.Status          = istatus.Status_ACTIVE.String()       // :335
+    stage, notFound      := db.FetchInitialJobStage(...)            // :337
+    dbParameters         := [...]                                   // :343-354
+    err = db.InsertJobV2(ctx, s.DB, &jobModel, dbParameters)        // :356  <== single write
+    ...
+    protoDataConnection  := convertDataConnectionToProto(...)       // :372
+    protoDataConnection.JobParameters = jobParameters               // :378
+
+[VERIFIED] db.InsertJobV2 (forebitt/db/job_v2.go:13) — ONE transaction:
+    tx := hdb.BeginTxDB(ctx, db, &sql.TxOptions{})
+    tx.Create(&job)                                   -> DataImportJob INSERT
+    SetOrganizationJobParametersInTransaction(tx,...) -> see below
+    tx.Commit()
+
+[VERIFIED] SetOrganizationJobParametersInTransaction (job_parameters.go:109):
+    FetchJobByID(tx, importJobID)                      // read, no hook
+    ClearOrganizationJobParameters(tx, ...)            // :121 -> bulk DELETE
+    for each param:
+        inParamObj.ID = uuid.New().String()            // :150
+        tx.Create(inParamObj)                          // :154 -> INSERT
+
+So the DB-level trace of ONE "create data connection" is:
+
+    1  INSERT  data_import_jobs
+    1  DELETE  organization_job_parameters  (condition-scoped; matches ZERO rows
+                                             on a fresh create — a phantom)
+    N  INSERT  organization_job_parameters
+
+=> 2 + N Hank hook firings for 1 business event.
+   A typical S3 connection with 6 parameters = 8 audit lines.
+   [UNVERIFIED] that GORM v1 fires AfterDelete when RowsAffected = 0. Expected
+   yes (the callback chain runs regardless of rows matched); confirm with one
+   stage run before asserting the "phantom delete" in the meeting.
+
+--------------------------------------------------------------------------------
+2.2  UPDATE — dataConnections_v2.go:383 (UpdateDataConnectionV2)
+--------------------------------------------------------------------------------
+[VERIFIED] The before-state is fetched at the top and is in scope for the whole
+handler:
+    dbJob, notFound := db.FetchJobByID(s.DB, in.DataConnection.ID)   // :390
+    ...
+    err = db.UpdateJobV2(ctx, s.DB, &jobModel, dbParameters)         // :432
+
+[VERIFIED] db.UpdateJobV2 (job_v2.go:38) -> tx.Model(&DataImportJob{}).Updates(*job)
+then the SAME SetOrganizationJobParametersInTransaction as create.
+
+DB trace:
+    1  UPDATE  data_import_jobs
+    1  DELETE  organization_job_parameters   (this one DOES match rows)
+    N  INSERT  organization_job_parameters   (with BRAND-NEW uuids, :150)
+
+=> Editing one parameter value destroys and recreates every parameter row with
+   fresh primary keys. Row identity does not survive an edit.
+
+--------------------------------------------------------------------------------
+2.3  DELETE — forebitt/api/server/job_service.go:1846 (DeleteImportJob)
+--------------------------------------------------------------------------------
+[VERIFIED] Before-state fetched at :1858, used for stage gating at :1863, and
+still in scope when the existing thin event is published at :1913.
+
+[VERIFIED] It is a SOFT delete — db.SoftDeleteJob (forebitt/db/job.go:183):
+    tx.Scopes(IDScope(id)).Delete(&models.DataImportJob{})
+and DataImportJob carries DeletedAt *time.Time via TimeAudit
+(forebitt/models/audit.go:22-26), so GORM v1 issues UPDATE ... SET deleted_at.
+
+[VERIFIED] IDScope (forebitt/db/scopes.go:16) puts the id in the WHERE clause:
+    db.Where("id = ?", ID)
+The struct passed to Delete() is the EMPTY literal &models.DataImportJob{}.
+
+This detail matters — see 4.3.
+
+--------------------------------------------------------------------------------
+2.4  A COMPLICATION WORTH NAMING BEFORE THE ARCHITECTS DO
+--------------------------------------------------------------------------------
+[VERIFIED] There is a SECOND create path, job_service.go:1293 CreateImportJobV2,
+and it is not a create at all — it is a create-or-update orchestrator:
+  - draft with no id      -> s.CreateImportJob(...)   (INSERT)
+  - otherwise             -> s.UpdateImportJob(...)   (UPDATE)
+  - then, always          -> s.SetOrganizationJobParameters(...) (its OWN tx)
+
+Two consequences:
+  (i)  The UI's "create a data connection" frequently arrives at the DB as an
+       UPDATE, because a draft row was inserted earlier. A hook-derived stream
+       would label the user's creation as changeType=UPDATED.
+  (ii) On this path the job write and the parameter writes are in DIFFERENT
+       transactions, so there is a window where the job exists with no
+       parameters, and a partial failure leaves the job persisted.
+
+Approach A forces us to CHOOSE the event boundary explicitly. Approach B
+inherits whatever the transaction layout happens to be on each path — and it
+differs between the two entry points.
+
+================================================================================
+3. APPROACH A — EXPLICIT PUBLISH AT THE SERVICE LAYER
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1  CREATE — the "nothing to start with" case
+--------------------------------------------------------------------------------
+The concern raised was: on a create there IS no initial state, so what goes in
+`from`? Answer: the approved envelope already models this. changeType=CREATED
+means every field's `from` is null. That is not a gap — it is the definition.
+
+Insertion point: dataConnections_v2.go, immediately after InsertJobV2 succeeds
+(:358) — or after the Snowflake setup block at :371 if we want the event to mean
+"fully usable", which is a real decision to put to the architects (see 8, Q2).
+
+Everything needed is already assembled at that point, for free:
+
+    // after err = db.InsertJobV2(...) succeeds
+    orinixevents.PublishDataConnectionEvent(ctx, s.Options.Events,
+        orinixevents.DataConnectionEvent{
+            ChangeType:   "CREATED",
+            ObjectID:     jobModel.ID,
+            ObjectName:   jobModel.Name,
+            CleanroomID:  <see 8, Q1 — not present on this model>,
+            OrgID:        jobModel.OrganizationID,
+            PerformedBy:  authUser.ID,
+            From:         nil,
+            To:           protoDataConnection,   // built at :372 for the response
+        })
+
+Resulting CloudEvents payload (matches the approved v6 envelope,
+Conflunece_Design_Doc_Pated_6_07.txt:82-100):
+
+    {
+      "specversion": "1.0",
+      "id": "<uuid minted here — becomes idempotency_key>",
+      "source": "urn:habu:cleanroom:<cleanroom-id>",
+      "type": "com.habu.cleanroom.data_connection.created",
+      "time": "2026-07-28T10:14:02Z",
+      "data": {
+        "objectType":   "DATA_CONNECTION",
+        "objectId":     "d56ada74-...",
+        "objectName":   "Adidas EMEA Customer File",
+        "changeType":   "CREATED",
+        "changedFields": {
+          "name":       { "from": null, "to": "Adidas EMEA Customer File" },
+          "stage":      { "from": null, "to": "MAPPING_REQUIRED" },
+          "status":     { "from": null, "to": "ACTIVE" },
+          "dataSource": { "from": null, "to": "S3" },
+          "datasetType":{ "from": null, "to": "GENERIC" },
+          "parameters": { "from": null, "to": { "bucket": "adidas-emea",
+                                                "prefix": "customers/2026/",
+                                                "fileFormat": "CSV" } }
+        },
+        "performedBy":   "aditya.bhardwaj@liveramp.com",
+        "schemaVersion": 1
+      }
+    }
+
+ONE event. Complete. Named in the domain's language, not the ORM's.
+
+--------------------------------------------------------------------------------
+3.2  UPDATE
+--------------------------------------------------------------------------------
+Insertion point: after UpdateJobV2 succeeds (:432). `dbJob` (fetched :390) is the
+before-image; `jobModel` + `dbParameters` are the after-image. Both in scope.
+
+    "type": "com.habu.cleanroom.data_connection.updated",
+    "changedFields": {
+      "stage": { "from": "MAPPING_REQUIRED", "to": "CONFIGURATION_COMPLETE" },
+      "parameters": {
+        "from": { "prefix": "customers/2025/" },
+        "to":   { "prefix": "customers/2026/" }
+      }
+    }
+
+NOTE the parameters diff is computed by the STABLE BUSINESS KEY
+(ImportDataSourceParameterID, Name) — never by the parameter row's primary key,
+which is regenerated on every save (job_parameters.go:150). This is a real
+design constraint, not a nicety; see 8, Q3.
+
+--------------------------------------------------------------------------------
+3.3  DELETE
+--------------------------------------------------------------------------------
+Insertion point: job_service.go, right beside the EXISTING thin hevent publish at
+:1913. `dbJob` is in scope with the full before-image.
+
+    "type": "com.habu.cleanroom.data_connection.deleted",
+    "changeType": "DELETED",
+    "changedFields": { ... every field: { "from": <old>, "to": null } }
+
+--------------------------------------------------------------------------------
+3.4  WHY THE COST IS LOW — WITH RECEIPTS
+--------------------------------------------------------------------------------
+The usual objection to A is "you have to touch every mutation path." For the two
+object types in scope, the expensive part is already done:
+
+  [VERIFIED] UpdateImportJob (job_service.go:1552) already fetches the
+     before-state AND already diffs it AND already publishes a thin event:
+         dbJob, notFound := db.FetchJobByID(s.DB, in.Job.Id)          // :1552
+         if dbJob.Name != in.Job.Name || dbJob.ImportDataTypeID != ... // :1583
+             message := hevent.EventStruct{...}; events.PublishEvent(...)
+
+  [VERIFIED] DeleteImportJob (job_service.go:1858) fetches dbJob and publishes a
+     thin delete event at :1913.
+
+  [VERIFIED] UpdateDataConnectionV2 (dataConnections_v2.go:390) fetches dbJob.
+
+  [VERIFIED] UpdateImportJobStage (job_service.go:1828) fetches the row and
+     DISCARDS it — `_, notFound := db.FetchJobByID(s.DB, in.Id)`. The
+     before-image is one character away from existing.
+
+So for DATA_CONNECTION the work is: replace/augment a thin publish with a fat
+one on 3-4 handlers. It is bounded, reviewable, and each diff is local.
+
+================================================================================
+4. APPROACH B — HANK GORM HOOKS — WHAT WE WOULD ACTUALLY RECEIVE
+================================================================================
+
+--------------------------------------------------------------------------------
+4.1  WHAT THE HOOK EMITS
+--------------------------------------------------------------------------------
+[VERIFIED] hank/db/audit.go — the entire record:
+
+    type AuditLog struct {
+        ObjectID, ObjectName, ObjectType, Action  string
+        ActionByID, ActionByEmail                 string
+        ActionAt                                  time.Time
+        Method, OrgID, RequestID                  interface{}
+        ImpersonatedByID, ImpersonatedByEmail     string
+    }
+
+and getObjectDetails() marshals the model and pulls exactly two keys: "ID", and
+"Name" (falling back to "DisplayName").
+
+There are NO FIELD VALUES. Not the new ones, not the old ones. And critically:
+THERE IS NO PARENT / AGGREGATE REFERENCE. A row's foreign keys are not in the
+record.
+
+--------------------------------------------------------------------------------
+4.2  THE CREATE, AS THE ARCHITECTS WOULD RECEIVE IT
+--------------------------------------------------------------------------------
+One CreateDataConnectionV2 with 3 parameters produces five records:
+
+  1. { ObjectType: "DataImportJob",             ObjectID: "d56ada74-...",
+       ObjectName: "Adidas EMEA Customer File", Action: "CREATE" }
+  2. { ObjectType: "OrganizationJobParameter",  ObjectID: "",
+       ObjectName: "",                          Action: "DELETE" }   <-- phantom
+  3. { ObjectType: "OrganizationJobParameter",  ObjectID: "<new uuid>",
+       ObjectName: "bucket",                    Action: "CREATE" }
+  4. { ObjectType: "OrganizationJobParameter",  ObjectID: "<new uuid>",
+       ObjectName: "prefix",                    Action: "CREATE" }
+  5. { ObjectType: "OrganizationJobParameter",  ObjectID: "<new uuid>",
+       ObjectName: "fileFormat",                Action: "CREATE" }
+
+To turn that into the single event in 3.1, a consumer must independently know:
+  - that DataImportJob IS the thing the product calls a DataConnection (that
+    mapping exists only in the proto layer — models.NewImportJobFromProtoV2);
+  - that OrganizationJobParameter rows are PART OF that aggregate, not
+    standalone objects — and there is no field in the record saying so;
+  - to discard record 2 as an artifact of a delete-then-reinsert implementation;
+  - what the values actually are — which no record contains.
+
+That is not an event stream. It is a transaction log with the payload removed.
+
+[OUSTERHOUT] Information leakage / wrong layer. The hook sits at the ORM layer,
+where the only vocabulary is tables and rows. "DataConnection" does not exist
+there. Every consumer would have to re-implement forebitt's aggregate boundary
+to make sense of the stream — the definition of leaking an internal decision
+into an external contract.
+
+--------------------------------------------------------------------------------
+4.3  THE DELETE IS WORSE — THE PRIMARY OBJECT'S ID IS BLANK
+--------------------------------------------------------------------------------
+[VERIFIED] SoftDeleteJob passes an EMPTY struct and puts the id in the WHERE
+clause (job.go:185 + scopes.go:16). getObjectDetails(scope.Value) therefore finds
+ID = "" and Name = "".
+
+So deleting a data connection emits:
+
+    { ObjectType: "DataImportJob", ObjectID: "", ObjectName: "",
+      Action: "DELETE", ActionByEmail: "aditya@..." }
+
+"Someone deleted a data import job. We won't say which one."
+
+This is not a hypothetical edge case. It is THE delete path for the primary
+object in scope. Note this also means the EXISTING audit log has this defect
+today — worth raising with Josh independently of orinix (see 9, item 3).
+
+--------------------------------------------------------------------------------
+4.4  THE STEELMAN — "CORRELATE BY RequestID" — AND WHY IT FALLS SHORT
+--------------------------------------------------------------------------------
+Fair objection, and it should be raised before an architect raises it: AuditLog
+DOES carry RequestID (from hlog.LogEntryCtx(ctx).Data["requestId"]). All five
+records above share one ctx, so in principle they share a request id, and a
+consumer could group by it.
+
+Grouping is necessary but nowhere near sufficient:
+  (a) It gives you the SET of rows touched, not WHAT CHANGED. Every field value
+      is still absent, so {from,to} remains underivable. This alone is fatal.
+  (b) It does not tell you which record is the aggregate root. Record 1 and
+      records 3-5 are structurally identical in shape.
+  (c) One request is not one business event. CreateImportJobV2 (2.4) performs a
+      create-or-update plus a parameter replacement under one request id; a
+      batch endpoint would put many business events under one id.
+  (d) [UNVERIFIED] whether requestId is reliably populated on every path. The
+      Datadog row analysed on 2026-07-18 was checked for Method/OrgID/actor, not
+      for requestId. Confirm before either using or dismissing this.
+  (e) The claims gate: every hook opens with
+          tokenClaims, ctx, parsed := claims(scope); if !parsed { return nil }
+      so any mutation whose context has no parsed auth claims emits NOTHING.
+      Pipeline-driven stage transitions are the likely victims — and stage
+      changes are XMI's #1 use case.
+
+--------------------------------------------------------------------------------
+4.5  AND THE COSTS FROM THE COMPANION DOC STILL APPLY
+--------------------------------------------------------------------------------
+If we tried to fix B by enriching the hook to carry before/after values:
+  - one extra SELECT per UPDATE, fleet-wide, for all ~91 audited models;
+  - condition-scoped writes (both our DELETEs above) have no single PK to
+    before-image;
+  - GORM v1 drops zero-values from Updates(struct), so the after-image is
+    partial too — a second extra SELECT to fix;
+  - SECURITY BLOCKER: primage.Credential embeds hdb.Audit and has a Value
+    column (primage/models/models.go:219-226). A generic diff logs secrets.
+Details in 2026-07-27_loki-datadog-hank-event-comparision.txt, section 2.2.
+
+================================================================================
+5. HEAD TO HEAD
+================================================================================
+
+  Dimension                        A: service layer        B: Hank hooks
+  -------------------------------  ----------------------  ---------------------
+  Events per business action       1                       2 + N
+  Carries field values             yes                     no (none at all)
+  Carries {from, to}               yes (state in scope)    no
+  Aggregate identity               DATA_CONNECTION         DataImportJob +
+                                                           OrganizationJobParameter
+  Parent/FK reference in record    yes                     no
+  CREATE semantics                 from = null, correct    "CREATE" x N rows
+  DELETE identifies the object     yes                     no — ObjectID is ""
+  Survives param re-keying (:150)  yes (business key diff) no (pk regenerated)
+  Coverage of claim-less paths     yes (explicit call)     no (claims gate)
+  Draft flow labelled correctly    yes (we choose)         no (create -> UPDATE)
+  Transaction boundary             chosen explicitly       inherited, varies
+  Blast radius of the change       3-4 forebitt handlers   every Hank consumer
+  Security review needed           no (we pick fields)     yes (Credential.Value)
+  Work per new object type         one publish block       "free" but unusable
+
+--------------------------------------------------------------------------------
+5.1  THE ONE-LINE VERSION FOR THE MEETING
+--------------------------------------------------------------------------------
+    The GORM hook fires where the vocabulary is ROWS. orinix's contract is
+    written in RESOURCES. One business action is 2+N row writes across two
+    tables, and the aggregate boundary that turns them back into a
+    DataConnection exists only in the service layer — which is exactly where
+    the before-state and after-state are also both already in scope.
+
+    Emitting from the hook means throwing that context away and asking every
+    consumer to rebuild it. Emitting from the service layer means using the
+    context we already have.
+
+================================================================================
+6. WHAT APPROACH B IS ACTUALLY GOOD FOR (BE FAIR ABOUT THIS)
+================================================================================
+The hooks are not a bad design; they are a good design for a different problem.
+They answer "who touched what, and when" across 91 models with zero per-model
+work. That is a genuine compliance/forensics capability and it is exactly what
+Josh's audit-log expansion (M3) wants.
+
+The honest split to present:
+    "who touched what, when"      -> Hank hooks. Broad, cheap, already exists.
+    "what changed, from what, to  -> service-layer publish. Narrow, curated,
+     what, for which resource"       consumable by an external system.
+
+These are complementary, not competing. orinix M1 needs the second. Proposing to
+build the second on top of the first is what does not work.
+
+And per section 2.5 of the companion doc: IF we later modify Hank's hooks for
+M3, make them PUBLISH rather than log — the before/after capture is the same
+work either way, and publishing routes it somewhere with a cursor and an
+idempotency key instead of into a log index.
+
+================================================================================
+7. RECOMMENDATION
+================================================================================
+Approach A for M1, for DATA_CONNECTION and DATA_IMPORT_JOB, at these four sites:
+
+    dataConnections_v2.go:358   CreateDataConnectionV2  -> data_connection.created
+    dataConnections_v2.go:432   UpdateDataConnectionV2  -> data_connection.updated
+    job_service.go:1913         DeleteImportJob         -> data_connection.deleted
+                                (beside the existing thin publish)
+    job_service.go:1583         UpdateImportJob         -> data_connection.updated
+                                (the legacy path; already diffs — verify whether
+                                 both entry points are live before double-emitting)
+
+Do NOT modify Hank's hooks for M1. Revisit for M3 as a publish change, with the
+security allow/deny list resolved first.
+
+[OUSTERHOUT] Deep module: orinix's interface stays two RPCs plus a webhook, and
+the aggregate-assembly complexity is absorbed by the producer, once, where the
+data lives — instead of being exported to every consumer forever.
+[OUSTERHOUT] Define errors out of existence: emitting at the service layer means
+"which rows belonged to this event" is never a question anyone has to answer.
+
+================================================================================
+8. OPEN QUESTIONS TO PUT TO THE ARCHITECTS
+================================================================================
+Q1. CLEANROOM SCOPING. The approved envelope uses
+    "source": "urn:habu:cleanroom:<cleanroom-id>" and object_events is queried by
+    cleanroom_id. But DataImportJob has OrganizationID, not CleanroomID
+    (forebitt/models/data_import_job.go:20). A data connection is org-scoped and
+    may be used by several cleanrooms. So: is DATA_CONNECTION an org-scoped
+    event with a null/synthetic cleanroom source, or do we fan out one event per
+    cleanroom the connection is attached to? This affects the primary query key
+    and should be settled before any code is written. I do not think the v6 doc
+    resolves it.
+
+Q2. WHEN IS "CREATED" TRUE? Immediately after InsertJobV2 (:358), or after the
+    Snowflake setup block (:371)? The code at :364-371 can return an error AFTER
+    the rows are committed — so an event emitted at :358 may describe a
+    connection the user was told failed to create. Recommend emitting after the
+    full handler succeeds, but this is a genuine trade-off (an event that is
+    late-but-true vs early-but-sometimes-wrong).
+
+Q3. PARAMETER DIFFING KEY. Confirm we diff parameters by
+    (ImportDataSourceParameterID, Name) and not by row id, given job_parameters.go:150
+    regenerates the uuid on every save. Also: do external consumers ever see the
+    parameter row ids? If yes, they are unstable and we should stop exposing them.
+
+Q4. TWO CREATE PATHS. CreateDataConnectionV2 vs CreateImportJobV2 (2.4). Are both
+    live in production traffic? If so we must instrument both without
+    double-emitting when one calls the other.
+
+Q5. THIN EVENT COEXISTENCE. Do the existing hevent publishes at job_service.go:1583
+    and :1913 stay as-is (pegleg/janus consumers depend on them), with the fat
+    orinix event published alongside? Assumption: yes, both. Worth stating
+    explicitly so nobody expects a migration.
+
+================================================================================
+9. DEFECTS FOUND WHILE TRACING (separate tickets, not blockers)
+================================================================================
+1. dataConnections_v2.go:337-341 — the notFound fallback is dead code:
+       stage, notFound := db.FetchInitialJobStage(...)
+       if notFound { jobModel.Stage = CONFIGURATION_COMPLETE }
+       jobModel.Stage = stage.Stage          // unconditional, overwrites it
+   [VERIFIED] FetchInitialJobStage returns a zero-value models.JobStage on
+   not-found (forebitt/db/job_stage.go:17-25), so Stage becomes "".
+   [UNVERIFIED] the net effect — GORM v1 is expected to omit blank fields that
+   carry a `default:` tag, and the column defaults to 'STAGE_UNKNOWN'
+   (models/data_import_job.go:27), so the row probably lands as STAGE_UNKNOWN
+   rather than CONFIGURATION_COMPLETE. Either way it is not the intended value,
+   and Stage is precisely what XMI keys off.
+
+2. job_service.go:1814 UpdateImportJobStage writes
+   models.DataImportJob{Status: in.Status} — Status, not Stage — despite the
+   function name. May be intentional (it takes UpdateImportJobStatus_Request),
+   may be a latent bug. Resolve before building a stage-change event on it.
+
+3. The blank ObjectID on soft delete (4.3) is a defect in the EXISTING audit log,
+   independent of orinix. Worth raising with Josh on its own merits.
+
+4. Phantom DELETE on create (2.1) — ClearOrganizationJobParameters runs
+   unconditionally, including on brand-new jobs. Harmless for correctness,
+   noisy for auditing.

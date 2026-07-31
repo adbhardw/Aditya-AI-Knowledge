@@ -1,0 +1,178 @@
+HANK-AS-HOST + CHANGE-DATA-CAPTURE — PLAIN-ENGLISH Q&A
+Written simply, on purpose. Follow-up to
+2026-07-24_can_orinix_live_inside_hank_full_analysis.txt.
+Date: 2026-07-24
+
+
+===========================================================
+Q1: What would a library like Hank actually NEED in order to expose an
+    endpoint, call a webhook URL, or run a 24/7 loop?
+===========================================================
+
+Simplest way to think about it: a library is a RECIPE. A service is a
+KITCHEN that's actually open and cooking. A recipe can't serve food to
+anyone by itself — someone with a running kitchen has to follow it.
+
+Hank (the recipe) can contain instructions for "how to call a URL" or "how
+to run a loop." But instructions don't DO anything until a real running
+process (a kitchen) picks them up and executes them.
+
+For any of those three things to actually happen, you need a real running
+process, and that process must have:
+
+  - A always-on lifecycle. Something that stays up 24/7 and restarts itself
+    if it crashes. A library has none — it only "exists" while some other
+    program is calling into it.
+  - A network address. To expose an endpoint, you need a port + a URL + DNS
+    (like orinix.habu.com/events) + a load balancer pointing at it. A
+    library owns no address; it's just code sitting inside someone else's
+    program.
+  - Its own CPU/memory and its own scaling. To run delivery work, you need
+    compute you can grow or shrink on its own. A library borrows whatever
+    the host program has, and scales only when the host scales.
+  - Its own deploy button. To fix a delivery bug you want to redeploy just
+    that thing. A library can't be deployed by itself — it ships glued
+    inside whoever imported it.
+  - Somewhere to keep state. Retries, cursors, "which webhook, which
+    secret, is it still active" — that lives in a database the running
+    thing owns.
+
+Notice: EVERY item on that list is "a running, owned program" — which is
+the definition of a SERVICE, not a library. So the honest answer:
+
+  Hank CAN hold the CODE for "call a URL" or "run a loop."
+  Hank CANNOT be the always-on, addressable, independently-deployed PROGRAM
+  that runs it.
+
+And the trap: if you say "fine, we'll pick ONE existing service to run
+Hank's delivery code" — that one service now IS orinix, just wearing a
+different name. You didn't avoid building the service; you renamed it.
+
+The clean split that falls out of this:
+  - EMISSION ("a row was created -> shout an event") does NOT need a new
+    program, because the program that just wrote the row is ALREADY running
+    and Hank code already runs inside it. Free ride.
+  - DELIVERY ("keep trying to reach XMI, retry, track cursors") DOES need
+    its own always-on program, because none of the existing programs should
+    own that job.
+
+
+===========================================================
+Q2: The transaction gotcha, in plain English (why "just publish from the
+    Hank hook" is not as easy as it sounds)
+===========================================================
+
+When you save something to a database, it happens in two steps:
+  1. "I intend to write this" (inside a transaction).
+  2. "Okay, it's actually final now" (commit).
+
+Between step 1 and step 2, the write can still be CANCELLED (rolled back) —
+e.g. something later in the same operation fails.
+
+Hank's audit hook fires at step 1 (mid-transaction), NOT at step 2. So if
+you naively make the hook publish an event right there, you can end up
+publishing "a data import job was created!" ... for a job that then got
+rolled back and never actually existed.
+
+That's a PHANTOM EVENT — you told XMI something happened that didn't. Once
+it's sent, you can't un-send it.
+
+Fixing this means one of two things, and neither is free:
+  - Only publish AFTER the commit succeeds (after-commit hook), or
+  - Use the "transactional outbox" trick: in the SAME transaction, write the
+    event into an outbox table; a separate step reads committed outbox rows
+    and publishes them. If the transaction rolls back, the outbox row rolls
+    back too — so you can never publish a phantom.
+
+Hank's hook, where it sits today (mid-transaction), gives you NEITHER for
+free. This is the one genuinely hard part of "just do emission in Hank" —
+worth saying out loud to the architects instead of pretending it's a
+50-line change.
+
+
+===========================================================
+Q3: We need BOTH the before and after values (from -> to). What are ALL the
+    ways to capture that, and is the "let the consumer figure it out" idea
+    deterministic?
+===========================================================
+
+First, the core problem restated simply: a database, by default, does NOT
+remember what a row USED TO look like. The moment you UPDATE it, the old
+value is gone. So "from -> to" is only possible if SOMEONE captures the OLD
+value BEFORE it's overwritten. The question is just: who, and where.
+
+Here are all the realistic approaches, roughly easiest-to-hardest, each with
+the honest catch:
+
+APPROACH 1 — App reads the old row first, then diffs (the Hank hook idea)
+  Before updating, SELECT the current row, remember it, do the update, then
+  compare old vs new and emit {from, to}.
+  + Full control, exact diff.
+  - Extra read on every update. Must be in the SAME transaction or you race
+    another writer and capture the wrong "old". This is the Hank-hook
+    version from Q2 of the prior doc.
+
+APPROACH 2 — Database trigger captures it
+  A trigger inside Postgres fires ON UPDATE and has BOTH OLD and NEW rows
+  handed to it by the database itself (this is a built-in DB feature). It
+  writes {from, to} into an audit/outbox table.
+  + The database gives you old+new for free, atomically, no race.
+  + Works no matter which service did the write.
+  - Logic now lives in SQL/DB, which some teams dislike; another thing to
+    version and deploy.
+
+APPROACH 3 — Read the database's change log (CDC proper, e.g. Debezium)
+  Every database already keeps a low-level log of every change (Postgres
+  "WAL"). Tools like Debezium READ that log and emit a clean
+  "before + after" event for every insert/update/delete, with no app code
+  at all.
+  + Gold standard. Exact before/after, captured after commit (no phantoms),
+    zero change to the app, works for ALL tables uniformly.
+  + This is literally what "Change Data Capture" means in industry.
+  - Heavier infra: you run Debezium + Kafka (or similar). Bigger commitment.
+    Probably overkill unless this becomes a platform-wide need.
+
+APPROACH 4 — Event sourcing / store every change as its own row
+  Never overwrite; append a new versioned row each time. "from" = previous
+  version, "to" = new version, both always on disk.
+  + Perfect history, trivially get any before/after.
+  - Big data-model change; not realistic to retrofit onto existing tables.
+
+APPROACH 5 — Let the CONSUMER (XMI-side / orinix) reconstruct it
+  Publish only the NEW value (or even just the id). The consumer, when it
+  receives the event, queries back for the current row and tries to figure
+  out what changed.
+
+  YOUR SPECIFIC QUESTION: is this deterministic? Honest answer: NO, not
+  reliably. Here's exactly why it breaks:
+
+  - You can't get the "from" at all. By the time the consumer queries, the
+    old value is already overwritten in the source DB. The one thing you
+    need most (the BEFORE) is exactly the thing that's already gone. The
+    consumer can fetch the current value, but has nothing to compare it
+    against unless IT already stored the previous value from a past event.
+  - Even the "to" can be wrong. Between the event firing and the consumer
+    querying, the row may have changed AGAIN. So the consumer reads the
+    LATEST value, which may not be the value at the moment the event
+    happened. You get "current," not "as-of-the-event."
+  - Ordering / races. Two quick updates can arrive out of order, or the
+    consumer's query can land between them. Now the diff is nonsense.
+  - It only half-works IF the consumer keeps its own full mirror copy of
+    every row and diffs incoming-new against its-stored-old. But then the
+    consumer is maintaining a shadow database and the correctness depends on
+    never missing or reordering an event — fragile, and exactly the
+    "tedious, not sure if deterministic" feeling you already had. That
+    instinct is correct.
+
+  So: consumer-side reconstruction is possible only if the consumer holds
+  its own prior copy, and even then it's fragile under concurrency. It is
+  NOT a clean or deterministic substitute for capturing before+after at the
+  SOURCE.
+
+THE RULE OF THUMB: "before -> after" must be captured at the SOURCE, at the
+moment of the write, because that's the only place and time the old value
+still exists. Anything downstream is reconstructing history from incomplete
+information. Of the source-side options, DB trigger (Approach 2) or CDC/
+Debezium (Approach 3) give you before+after most cleanly and without the
+transaction/race pitfalls of the app-diff approach; the app-read-first
+approach (1) works but is the most error-prone to get right by hand.

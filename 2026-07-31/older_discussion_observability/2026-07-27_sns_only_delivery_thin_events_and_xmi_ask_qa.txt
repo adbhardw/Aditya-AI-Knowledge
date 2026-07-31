@@ -1,0 +1,361 @@
+CAN WE KEEP PUB/SUB IN HANK AND DROP REGISTRATION + CURSOR?
+AND SHOULD WE ASK XMI FOR THIN EVENTS INSTEAD OF FULL PAYLOADS?
+Q&A. Date: 2026-07-27
+Third doc of 2026-07-27. Follows:
+  2026-07-27_data_import_job_create_and_stage_change_full_trace_qa.txt
+  2026-07-27_data_connection_create_update_delete_worked_examples_qa.txt
+
+CONTAINS A CORRECTION TO MY OWN 07-24 POSITION. See Q2.
+
+The two questions driving this doc, both from the same instinct — get to
+the smallest thing that works, agree it with XMI, then iterate:
+  - if we drop callback registration and the cursor endpoint, can the
+    whole delivery half just be SNS/SQS that we already run?
+  - would XMI accept "this object changed, come look" instead of a full
+    before/after payload?
+
+Short answers: yes, and probably — and the second one makes the first
+one much more comfortable. Details below.
+
+
+===========================================================
+Q1: Why is ClearOrganizationJobParameters called when we are CREATING a
+    brand new data connection? There is nothing to clear.
+===========================================================
+
+Because it is the same function on both paths:
+
+  db/job_v2.go:25   InsertJobV2 -> SetOrganizationJobParametersInTransaction
+  db/job_v2.go:50   UpdateJobV2 -> SetOrganizationJobParametersInTransaction
+
+One shared helper (db/job_parameters.go:109) whose contract is "make the
+stored parameters for this job exactly equal this input list" — a
+REPLACE, not an insert. It implements that bluntly:
+
+  db/job_parameters.go:121      clear whatever is there
+  db/job_parameters.go:133-154  insert everything given
+
+On UPDATE the clear is essential — it removes parameters the user
+dropped. On CREATE there is nothing to clear, so the DELETE matches zero
+rows and is a no-op at the SQL level.
+
+Harmless at the SQL level. NOT harmless once the hook emits events: GORM
+fires AfterDelete even when zero rows matched
+(gorm@v1.9.11/callback_delete.go:59-63 checks only for errors, never
+RowsAffected). So a correct, idiomatic, do-nothing SQL statement becomes
+a wrong event the moment the hook starts publishing.
+
+AND THIS IS EXACTLY THE CTO'S / PRINCIPAL ARCHITECT'S POINT, sitting in
+this one file. They said many places do full delete-and-create instead
+of update, forcing piles of if-else to work out what actually changed.
+Confirmed: editing one S3 prefix on a connection produces 1 DELETE + 5
+INSERTs, because parameters are never UPDATEd. Deriving "the user
+changed one parameter" from that is precisely the if-else pile they
+described.
+
+Worth being clear about the blame: this is a consequence of a normal,
+sane CRUD write pattern. It is not something we would be doing wrong. It
+IS, however, a strong argument for Q5.
+
+
+===========================================================
+Q2: Can we keep the pub/sub piece in hank, drop callback registration
+    and the cursor endpoint, and just use the SNS/SQS we already have?
+===========================================================
+
+YES. And I need to correct how I framed this on 07-24.
+
+WHAT I SAID THEN: "delivery structurally requires an owned, long-lived,
+independently-scaled, stateful runtime — a library cannot be that."
+
+That part is still true. But I then jumped straight to "therefore build
+orinix", and that step does not follow. SNS/SQS IS an always-on,
+independently-scaled, stateful runtime. We already run it and already
+pay for it. The correct statement is:
+
+  A LIBRARY cannot be the delivery runtime.
+  A MANAGED SERVICE can — and we already have one.
+
+The 07-24 analysis implicitly assumed the runtime had to be OURS. It
+does not. That was a real gap in the reasoning, and dropping
+registration + cursor is what exposes it, because those two features are
+the only ones AWS cannot give us off the shelf.
+
+WHAT REPLACES EACH ORINIX PIECE:
+
+  orinix piece                  replaced by
+  ----------------------------- -------------------------------------
+  callback_registrations + CRUD SNS subscriptions, declared in
+                                terraform
+  per-consumer routing/filter   SNS message filter policies on message
+                                attributes
+  retries + DLQ                 SQS redrive policy (or SNS delivery
+                                retry policy + DLQ)
+  per-consumer HMAC signing     SNS's own message signature scheme
+  delivery observability        CloudWatch metrics + SNS delivery
+                                status logging
+  cursor pull endpoint          GONE
+  replay                        GONE
+
+The filtering piece is already half-built. Per the 07-24 trace, hank's
+events.Publish already stamps object / action / service as SNS message
+attributes — which is exactly what SNS filter policies match on. So
+"XMI only wants DataImportJob events for org X" is a subscription
+attribute, not code we write.
+
+WHAT WE ACTUALLY LOSE — three things, honestly:
+
+  1. REPLAY, beyond the queue's retention window. This is the real loss.
+     If XMI needs "resend me everything from last Tuesday", we cannot.
+  2. SELF-SERVICE REGISTRATION. Adding a consumer becomes an infra PR
+     rather than an API call. Fine at 1-2 consumers. Genuinely painful
+     at 10.
+  3. PER-CONSUMER DELIVERY STATE. No delivery_log table, no per-consumer
+     status you can query. CloudWatch instead.
+
+ON "IT WILL LEAD TO LOSS OF EVENTS" — worth correcting the framing,
+because it is better than assumed. SNS -> SQS is durable: SQS retains
+messages for 4 days by default, configurable up to 14 days. Consumer
+down for an hour, a day, a deploy — nothing is lost, the queue just
+grows. Actual loss needs either an outage longer than the retention
+window, or a poison message with no DLQ configured.
+
+So the accurate statement is not "we lose events", it is "we lose the
+ability to go back further than the retention window". That is a much
+smaller thing to accept, and it is a knob (4 -> 14 days) not a cliff.
+
+
+===========================================================
+Q3: XMI wants GCP Pub/Sub. SNS cannot publish to GCP. Does that force a
+    service back into the picture?
+===========================================================
+
+No — but it does force SOME compute, and the June analysis rejected the
+cheap version of that compute for a reason that no longer applies.
+
+The existing doc (june-post-followup-observability-2026/
+2026-06-22_tradeoff_lambda_bridge_vs_orinix.md) compared exactly two
+shapes:
+
+  Option A   SNS -> Lambda (direct)   rejected: SNS retries ~3 times
+                                      then the message is gone. No
+                                      durable buffer. Cold starts and
+                                      throttling during a burst = drops.
+  Option B   SNS -> SQS -> orinix     chosen: SQS durability, explicit
+                                      ACK, DLQ.
+
+The third shape was never on the table:
+
+  Option C   SNS -> SQS -> Lambda
+
+Lambda's event source mapping polls SQS. On failure the message returns
+to the queue after the visibility timeout and is retried; after
+maxReceiveCount it lands in the SQS DLQ. That is the SAME durability
+story as Option B — the entire durability argument against Lambda was an
+argument against the MISSING QUEUE, not against Lambda.
+
+So Option C gives us:
+  - SQS durability and DLQ (Option B's advantage)
+  - no persistent service to own, deploy, scale or staff (Option A's
+    advantage)
+  - a ~50 line function: read SQS message, publish to XMI's GCP topic
+
+The June doc's third argument against Lambda — "orinix scales to N
+consumers without N Lambdas" — is real but is an argument about a future
+with many consumers. Today there is one consumer. If a second and third
+arrive wanting different clouds, that is the moment to revisit, and by
+then we will know what they actually need.
+
+ONE THING TO CONFIRM, not assume: the exact SNS delivery retry policy
+numbers for HTTPS subscribers (configurable, but I have not verified the
+current defaults or maxima against AWS docs). If we go the HTTPS route
+rather than the GCP Pub/Sub route, someone should check those before we
+quote them in a design review.
+
+
+===========================================================
+Q4: Do we need a common database? You said it must be new, not part of
+    an existing service.
+===========================================================
+
+Your instinct is right, but there are TWO different databases being
+conflated here and they have opposite answers.
+
+  THE OUTBOX — must be PER-SERVICE. Not negotiable, and not a
+  preference. The outbox works only because the event row is INSERTed in
+  the SAME TRANSACTION as the business write, so a rollback takes both.
+  Put it in a shared database and that atomicity is gone — you are back
+  to two-phase commit or to phantom events. The mechanism IS the shared
+  transaction.
+
+  "But that's 10+ tables to manage" — it is one table DEFINITION,
+  shipped as a shared migration inside hank, applied in 10 databases.
+  Same schema everywhere, zero per-service design thought. It is not 10
+  different tables; it is the same table 10 times. That is very
+  different from the 10-connections problem you originally objected to,
+  which was one process needing credentials into 10 databases. Nothing
+  here needs cross-database access: each service's relay reads only its
+  own outbox.
+
+  THE EVENT ARCHIVE — CAN be common, and if we build it, it should be
+  new, exactly as you said. This is the thing that would serve replay
+  and a cursor-pull API. It is a separate concern from the outbox.
+
+THE USEFUL CONSEQUENCE: if we drop replay and cursor (Q2), we need NO
+common database at all. The archive is the only thing that wanted one.
+If replay later becomes a hard requirement, we add one new database at
+that point — and adding it does not disturb anything built before,
+because it just subscribes to the same topic.
+
+
+===========================================================
+Q5: Should we ask XMI whether they are fine with just "created /
+    updated / deleted" instead of a full payload?
+===========================================================
+
+YES — and I would push for it rather than merely offer it. This is the
+single highest-leverage simplification available, and it happens to
+dissolve the CTO's objection instead of solving it.
+
+THE THIN EVENT:
+
+  {
+    "eventId":    "evt-4c81e0a2-...",
+    "objectType": "DATA_CONNECTION",
+    "objectId":   "dij-7f3a1b90-...",
+    "action":     "UPDATED",
+    "orgId":      "org-adidas-8821",
+    "occurredAt": "2026-07-27T17:10:00Z"
+  }
+
+XMI calls back for current state when they care.
+
+WHAT THIS REMOVES FROM OUR SIDE:
+
+  - the pre-image read on updates. That was my entire Phase 2.
+  - changedFields diffing and the field allowlist plumbing.
+  - the delete-and-recreate reconciliation problem. Not solved —
+    ELIMINATED. We never claim to know what changed, so we never have to
+    work it out from 1 DELETE + 5 INSERTs.
+  - PII and payload surface. Nothing sensitive rides the event, so
+    OrganizationJobParameter.Value can never leak by accident.
+  - most of the phantom-event severity. A phantom thin event is
+    self-correcting: XMI looks up the object, sees current truth (or a
+    404), and moves on. It costs one wasted lookup instead of telling a
+    lie that cannot be retracted.
+
+A CLARIFICATION, so this does not look like I am contradicting myself.
+On 07-24 I concluded that consumer-side reconstruction is "not
+deterministic". That verdict stands — for FIELD-LEVEL DIFFS. You cannot
+recover a "from" value that has already been overwritten, and racing
+updates corrupt the diff. It does NOT apply to "something changed, come
+look", which is a different contract entirely and is the standard
+notification pattern. Same mechanism, different promise: I was rejecting
+"consumer computes the diff", not "consumer fetches current state".
+
+WHAT STILL NEEDS WORK EVEN WITH THIN EVENTS — one thing, and it is the
+delete case again. objectId itself is missing on deletes, because the id
+travels in a WHERE clause via Scopes (db/scopes.go:16-20) and never
+lands on scope.Value. So a BeforeDelete pre-image read is still needed —
+but it shrinks from "SELECT every allowlisted column on every update and
+every delete" to "SELECT id (and name, for XMI's UI) on deletes only".
+Roughly a tenth of the work.
+
+WHAT XMI GIVES UP: they cannot tell WHAT changed without keeping their
+own copy of the object. For their stated use cases — a dashboard or
+pipeline pointing at a connection that has been deleted, or a connection
+stuck waiting on field mapping — knowing "it changed, here is its
+current state" is enough. It is only insufficient if they need to react
+to a SPECIFIC field transition without polling.
+
+AND IT IS ADDITIVE LATER. Adding changedFields to a thin event is a
+backwards-compatible schema change. Removing it is not. Starting thin
+and growing is strictly safer than starting fat and discovering half the
+diffs are approximations.
+
+
+===========================================================
+Q6: The actual question to put to XMI
+===========================================================
+
+Keep it decision-forcing and honest about what each option costs THEM,
+not just us:
+
+  "For v1 of Habu -> XMI object events, which contract do you want?
+
+   A. THIN — {objectType, objectId, action: CREATED|UPDATED|DELETED,
+      orgId, occurredAt}. You call us back for current state.
+      Fastest for us to ship. Costs you one API call per event you care
+      about.
+
+   B. THIN + CHANGED FIELD NAMES — same, plus
+      changedFields: ["stage", "name"] — names only, no values.
+      Lets you decide whether an event is worth fetching, without us
+      shipping values.
+
+   C. FAT — full old/new per field, as in the original schema pitch.
+      No callback needed on your side. Materially more work on ours,
+      and we should be upfront: for some objects our code deletes and
+      recreates child rows rather than updating them, so certain diffs
+      would be approximations rather than exact.
+
+   Our recommendation is A or B for v1. C stays addable later without
+   breaking A or B, because extra fields are additive."
+
+Say the C caveat out loud. Better they choose A knowingly than receive a
+"diff" that quietly misrepresents a clear-then-insert. That is the kind
+of thing that erodes trust in a data feed permanently.
+
+
+===========================================================
+Q7: What v1 actually looks like if XMI says yes to thin events
+===========================================================
+
+  EMISSION (hank, in-process)
+    - root-model opt-in list; DataImportJob in, children out
+    - audit hook writes ONE outbox row per root object per transaction
+    - BeforeDelete pre-image: SELECT id, name only
+    - relay goroutine per host: read own outbox -> SNS -> mark published
+
+  TRANSPORT (AWS, already running)
+    - SNS habu-observability-events
+    - message attributes: object_type, action, org_id
+    - SQS subscription per consumer, filter policy per subscription
+
+  DELIVERY TO XMI
+    - if XMI takes SQS directly: nothing more to build
+    - if XMI needs GCP Pub/Sub: SNS -> SQS -> small Lambda (Option C, Q3)
+
+  NOT BUILT
+    - callback_registrations table and CRUD
+    - cursor pull endpoint
+    - replay
+    - common database
+    - orinix as a deployed service
+
+  STILL WORTH KEEPING even though thin events reduce its urgency: the
+  outbox. It is a small table and a ~30-line relay, it removes phantom
+  events entirely rather than merely making them survivable, and it is
+  the seam that lets capture change later (DB trigger, Debezium) without
+  anything downstream noticing. I would not drop it to save the effort.
+
+  THE HONEST TRADE, in one line: we give up replay and self-service
+  registration, and in exchange we delete an entire service, an entire
+  database, the pre-image diffing, and the delete-and-recreate problem.
+
+
+===========================================================
+Q8: Open items to close before building
+===========================================================
+
+  1. XMI: thin vs thin+names vs fat (Q6). Everything else depends on
+     this answer. Ask first.
+  2. XMI: can they consume an SQS queue directly, or do they need GCP
+     Pub/Sub? Decides whether Q3's Lambda exists at all.
+  3. Us: is replay a real requirement or an assumed one? If real, the
+     common event archive comes back and so does most of orinix. If
+     assumed, say so explicitly in the design and move on.
+  4. Us: confirm current SNS delivery retry policy defaults/maxima for
+     HTTPS subscribers before quoting numbers in review (Q3).
+  5. Forebitt owners: agree the root-model opt-in list, and confirm
+     nobody depends on child-table events.

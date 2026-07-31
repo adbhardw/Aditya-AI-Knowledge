@@ -1,0 +1,125 @@
+Slack message draft for Jon — Observability event emission + Pub/Sub approach
+Date: 2026-06-30
+
+------------------------------------------------------------------------
+
+CONTEXT BEFORE WRITING
+
+These are the facts confirmed in code before writing the message:
+
+1. CDC in pegleg: NONE. No Debezium, no outbox pattern, no WAL-based CDC anywhere in
+   pegleg. The "change data capture" Josh referred to is conceptual — pegleg explicitly
+   calls services (endCleanRoomRun, CreateCleanRoomQuestionRunStatistics) after Spark
+   finishes. It is push-from-source, not stream-from-DB.
+
+2. picanmix DOES have an SNS event system (hevent / hank-events library):
+   - PublishEvent for trigger_on_demand_export (job.go:923)
+   - PublishEvent for exportRerun (job_run.go:382)
+   - Export failure monitoring event exists but is COMMENTED OUT (job_run.go:291)
+   - No DataConnection or credential change events emitted anywhere
+
+3. ignoramus has a generic EventService gRPC (event.proto) with publishEvent RPC
+   but no service currently emits DC or credential change events through it.
+
+4. Billing already uses GCP Pub/Sub (liveramp-events-prod, billing_v2-raw-metrics)
+   via com.google.cloud.pubsub.v1.Publisher with a static SA JSON key from Primage.
+
+------------------------------------------------------------------------
+
+DRAFT SLACK MESSAGE TO JON
+
+Hey Jon, a few things I wanted to share after digging into the code.
+
+On event emission for flow run: no CDC in the current system. The emit point is
+in pegleg. When cacofonix finishes the Spark query, it triggers a "post_query"
+task that runs TeePostRunConfigCommand in a pod. That calls
+PostRunConfigService.postCRQRunProcess() where endCleanRoomRun fires the COMPLETED
+state change. That is the natural hook for emitting a FLOW_RUN completed event —
+pegleg already owns the transition, one publish call right after endCleanRoomRun.
+
+On GCP Pub/Sub for M1: we already do this for billing. pegleg publishes to
+liveramp-events-prod / billing_v2-raw-metrics using com.google.cloud.pubsub.v1.Publisher.
+Billing uses a static SA JSON key from Primage; for M1 observability delivery we
+would use Workload Identity Federation instead. SDK and pattern are proven in prod,
+so Pub/Sub as delivery channel is low-risk — just a new topic and WIF auth.
+
+Billing schema for reference (what is sent today):
+
+  {
+    "version":     2,
+    "ts":          <unix ms>,
+    "product":     "clean-room",
+    "system":      "pricing_hub",
+    "entity_type": "cac_organization",
+    "entity_id":   "<LiveRamp org ID>",
+    "group_type":  "question_run",
+    "group_id":    "<clean_room_question_run_id>",
+    "metric_type": "usage",
+    "units":       <rowAccessCount>,
+    "billable":    true,
+    "ui_groups":   [ { "id", "type", "name" } ... ],
+    "metadata": {
+      "habu_account_id":   "<habu account uuid>",
+      "habu_account_name": "<org name>",
+      "created_by":        "<user email>",
+      "owner":             true,
+      "owner_org_id":      "<habu org uuid>"
+    }
+  }
+
+On credential changes — should it be a Data Connection event or a Primage/credential
+microservice event: it should be a Data Connection event. When an SA JSON credential
+linked to DC1 is rotated, DC1 goes through ACTIVE -> VALIDATING -> ACTIVE (or FAILED).
+XMI does not care about the Primage rotation — they care about DC1's readiness.
+Emitting a Primage-level event leaks internal secrets management details that XMI
+should not need to know. The "reason" field on the DC event is the right bridge:
+
+  event type:  com.habu.dataconnection.stage.changed
+  source:      /services/ignoramus
+  data: {
+    "dataConnectionId":   "dc-uuid-...",
+    "organizationId":     "org-uuid-...",
+    "previousStage":      "ACTIVE",
+    "currentStage":       "VALIDATING",
+    "reason":             "credential_updated",
+    "credentialId":       "cred-uuid-...",
+    "triggeredAt":        "<ISO8601>"
+  }
+
+The "reason" field is the bridge — it tells XMI WHY the stage changed without
+XMI needing to know about Primage. XMI then decides whether to pause flows on
+DC1 until it is back to ACTIVE, or to proceed if stage is still ACTIVE after
+re-validation succeeds quickly.
+
+One more nuance: if the credential is rotated but validation passes immediately
+and DC1 never leaves ACTIVE state, should an event still fire? I think yes — a
+"credential_updated" event on the DC even when stage does not change gives XMI
+an audit trail and lets them decide if they want to re-run preflight checks.
+Worth confirming if XMI needs this or only cares about actual stage transitions.
+
+------------------------------------------------------------------------
+
+OPEN QUESTIONS TO ASK JON
+
+1. For credential rotation that does not affect DC stage (update succeeds silently):
+   does XMI still want a DataConnection event, or only on actual stage changes?
+
+2. For M1 Pub/Sub delivery: is XMI comfortable us publishing to a topic they own
+   (they give us IAM publisher role), or do they expect us to own the topic and
+   they subscribe? This changes who manages the topic ACLs.
+
+3. If we go Pub/Sub + CloudEvents for orinix, the billing path already proves the
+   SDK in prod. But billing uses static SA key — do we need a separate infra ticket
+   to set up WIF for orinix before M1 ships?
+
+------------------------------------------------------------------------
+
+SUMMARY OF WHAT TO TELL JON IN ONE PARAGRAPH
+
+Event emission for flow run is in pegleg PostRunConfigService (called by cacofonix
+post_query task), not CDC. Billing already uses GCP Pub/Sub with the same Java SDK
+so Pub/Sub delivery for M1 is low-risk. The billing schema above is the closest
+existing reference for what a structured event looks like from Habu to LR. For
+credential/DC events, the right granularity is a DataConnection stage change event
+with a "reason: credential_updated" field — not a raw Primage credential event.
+XMI should not need to know about Primage internals.

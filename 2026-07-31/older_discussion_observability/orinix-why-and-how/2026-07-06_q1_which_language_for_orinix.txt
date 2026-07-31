@@ -1,0 +1,145 @@
+Q1 — What language should orinix be built in? (Go / Java / hybrid)
+Date: 2026-07-06
+Status: OPEN — recommendation below, needs your confirmation before Q2
+
+------------------------------------------------------------------------
+
+WHY THIS IS THE FIRST QUESTION
+
+Every later decision (repo layout, which client libraries we import, how the
+delivery worker talks to GCP) is downstream of this one. Ousterhout's "design
+it twice" says sketch two real options and compare, not just pick the
+obvious one. So before writing a line of orinix code, here is what actually
+exists in this codebase for the two jobs orinix has to do: LISTEN to events,
+and EXPOSE endpoints.
+
+------------------------------------------------------------------------
+
+WHAT I CHECKED (grepped/read, not assumed)
+
+Service language census (checked pom.xml / go.mod / real non-generated
+source files, not just which files exist):
+
+  Go, real logic in Go, Java is just a generated "-proto" client jar:
+    unhygienix, forebitt, picanmix, gangway, moonraker
+
+  Java, real logic in Java, Go (where present) is just a generated client stub:
+    pegleg, cronos, ignoramus, external-api-server
+
+  gangway is the service the approved design doc explicitly cites as orinix's
+  precedent ("own DB, own gRPC port, nobody questions it"). gangway is Go.
+
+Shared libraries:
+  hank   (github.com/deklareddotcom/hank) — Go only, no pom.xml, no Java
+         binding. This is the SNS publish library (PublishEventAsyncWithRetry)
+         used by unhygienix/forebitt/picanmix. It has an "aws" package with
+         sns/, s3/, iam/, kms/, secretsmanager/ — but NO sqs/ package.
+         Nobody in this codebase uses hank to CONSUME SQS, only to PUBLISH SNS.
+
+  zabra  (com.habu.zabra.*) — Java only. This is what pegleg/cronos/
+         external-api-server use to call every other service (zabra-grpc-client),
+         plus zabra-aws, zabra-google, zabra-jdbc, zabra-crypto. This is the
+         thing that let BillingService.java call UnhygienixClient, MoonrakerClient,
+         PrimageClient with almost no boilerplate.
+
+The three capabilities orinix actually needs, and where they're already proven:
+
+  1. CONSUME SQS ("listen to events" — orinix's core job)
+     Proven in Java: pegleg-server/src/main/java/com/habu/pegleg/events/config/
+     AWSSQSConfiguration.java + listener/SnowflakeSqsListener.java — this is a
+     real, working SQS consumer already running in production Java code.
+     Not proven anywhere in Go. hank has zero SQS support. A Go orinix would
+     be writing this from scratch for the one thing that's literally its job.
+
+  2. PUBLISH to GCP Pub/Sub (the delivery channel you asked to reuse as SDK reference)
+     Proven in Java: pegleg-backend/.../billing/BillingMessagePublisherHelper.java
+     using com.google.cloud.pubsub.v1.Publisher. This is the exact SDK you
+     pointed me at ("we already have that SDK integrated with Pegleg for
+     billing"). It is Java. Reusing it as a reference is reuse, not translation,
+     only if orinix is also Java.
+
+  3. AWS -> GCP Workload Identity Federation (so no static SA key, unlike billing today)
+     Proven in BOTH languages, so this one doesn't tip the scale:
+       Java: zabra-aws/.../GoogleIdentityFederationAwsToken.java
+             (actually used today by tragicomix/.../google/GCS.java for
+             cross-cloud GCS access)
+       Go:   unhygienix/services/google/workload_identity_federation.go
+             + unhygienix/services/aws/signer.go
+
+  4. Expose gRPC + REST endpoints, get called by external-api-server
+     Proven in both languages equally — every service here does this, and
+     external-api-server already calls Go services (unhygienix) via generated
+     client stubs today. Calling a Java orinix would look identical from
+     external-api-server's side.
+
+One thing this surfaced that ISN'T about orinix's own language, but matters
+for M1 either way: cronos needs to publish FLOW_RUN events, and cronos
+(Java) has no existing SNS publish path at all — hank isn't available to it,
+and I found no com.amazonaws.services.sns usage anywhere in cronos. That's a
+real open dependency for whoever owns the cronos side of this, independent
+of what orinix itself is written in. Flagging it now so it doesn't surprise
+us later — Chesterton's Fence in reverse: before we assume "cronos will just
+add 3 lines like the design doc says," we should confirm cronos actually has
+somewhere to add those 3 lines to.
+
+------------------------------------------------------------------------
+
+DESIGN IT TWICE
+
+OPTION 1 — Go (matches gangway, the cited precedent; matches the majority
+of "new dedicated service" builds: unhygienix, forebitt, picanmix, moonraker)
+
+  + Structural consistency with the exact precedent your design doc leans on
+  + Native fit with the rest of the "own DB / own gRPC port" service fleet
+  + If orinix ever needs to publish its own derived events (e.g.
+    "delivery.failed"), hank is right there
+  - SQS consumption is unprecedented in Go here — hank has no SQS package,
+    no existing Go service in this codebase consumes SQS. You'd be writing
+    net-new code for orinix's actual primary job.
+  - GCP Pub/Sub delivery: Google's Go pubsub client exists and WIF is proven
+    in Go (unhygienix), but the specific reference implementation you asked
+    to reuse (BillingMessagePublisherHelper) is Java — you'd be translating
+    a pattern, not reusing code.
+
+OPTION 2 — Java (matches pegleg, cronos, ignoramus, external-api-server)
+
+  + SQS consumption already proven, in production, in pegleg
+    (AWSSQSConfiguration + SnowflakeSqsListener) — copy the pattern directly
+  + GCP Pub/Sub publish already proven in pegleg (BillingMessagePublisherHelper)
+    using the exact SDK you named as the reference
+  + WIF already proven in zabra-aws, with a real caller (tragicomix/GCS.java)
+    to model the "how do we actually use this" question on
+  + zabra gives ready-made gRPC clients to call any other service (Go or
+    Java) with no extra plumbing — same thing pegleg already leans on
+  - Breaks from the specific gangway precedent your design doc cited
+    (though gangway's actual lesson — separate DB, separate gRPC port,
+    separate ownership — is fully preserved regardless of language; that
+    lesson isn't Go-specific)
+
+OPTION 3 — Hybrid (e.g. Go ingest service + Java delivery worker, or vice versa)
+
+  Sketched and rejected. This is the "better together or apart" test from
+  the cheat sheet: ingest, storage, and delivery of the SAME event share one
+  failure domain and one deploy. Splitting them by language buys nothing —
+  the two halves aren't solving different problems, they're solving the
+  same problem twice, with a network hop and two on-call runbooks added for
+  free. Not carrying this forward as a real option.
+
+------------------------------------------------------------------------
+
+MY RECOMMENDATION (thinking as John here, not just picking the familiar one)
+
+Java.
+
+The reasoning isn't "Java is what pegleg already uses" as a vibe — it's
+that the two capabilities you named today as orinix's actual job (listen to
+events, reuse the billing Pub/Sub SDK) are both already deep, proven modules
+in this codebase, in Java, inside pegleg. gangway's precedent is real and
+worth keeping, but the part of gangway's precedent that matters — its own
+DB, its own gRPC port, its own deploy, nobody routing through it — is an
+ownership boundary, not a language. We keep that regardless of language
+choice. What we shouldn't do is rebuild SQS consumption and GCP Pub/Sub
+publish from scratch in a language that has never done either in this
+codebase, when the working version of both is sitting in pegleg right now.
+
+This is open. Confirm or push back before I touch Q2 (repo/module layout).

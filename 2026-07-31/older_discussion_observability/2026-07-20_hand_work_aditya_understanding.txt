@@ -1,0 +1,239 @@
+HANK AUDIT MECHANISM — HOW IT ACTUALLY WORKS
+Personal understanding notes, traced from source (hank, unhygienix, jinzhu/gorm)
+Date: 2026-07-20
+
+Trigger for this: understanding how hdb.Audit gives every embedding model
+(e.g. MeasurementDataset, CleanRoomQuestionRunDatasetStatistics) automatic
+create/update/delete audit behavior with zero code in the model itself.
+Relevant background for the orinix audit-logging absorption discussion
+(see 2026-07-18_for_jon_audit_log_findings_summary.txt,
+2026-07-20_confluence_audit_logging_section_for_design_review.txt) — this is
+what the CURRENT per-service audit mechanism actually does under the hood,
+service by service, before any centralization.
+
+
+===========================================================
+1. THE FOUR HOOKS, WHERE THEY LIVE
+===========================================================
+
+File: hank/db/audit.go — type Audit struct (line 84-89), embedded
+anonymously in models (e.g. unhygienix/models/measurement.go:59,
+MeasurementDataset embeds hdb.Audit).
+
+    BeforeCreateHook  (line 125-148)  — sets 4 DB columns before INSERT
+    AfterCreate       (line 150-164)  — writes a structured log line after INSERT
+    BeforeUpdateHook  (line 166-181)  — sets AuditUpdatedBy/At before UPDATE
+    AfterUpdate       (line 183-197)  — writes a structured log line after UPDATE
+    AfterDelete       (line 199-213)  — writes a structured log line after DELETE
+
+Note the naming split: BeforeCreateHook/BeforeUpdateHook use a "...Hook"
+suffix; AfterCreate/AfterUpdate/AfterDelete use GORM's plain built-in names.
+This split is deliberate and explained in section 2.
+
+
+===========================================================
+2. WHY "BeforeCreateHook" AND NOT "BeforeCreate"
+===========================================================
+
+GORM (jinzhu/gorm v1.9.16) only auto-invokes a fixed set of English method
+names via reflection (gorm/scope.go:432, callMethod):
+  create: BeforeSave -> BeforeCreate -> ... -> AfterCreate -> AfterSave
+  update: BeforeSave -> BeforeUpdate -> ... -> AfterUpdate -> AfterSave
+  delete: BeforeDelete -> ... -> AfterDelete
+(registered in gorm/callback_create.go:10-18, callback_update.go:12-20,
+callback_delete.go:10-14)
+
+hdb.Audit's Before-hooks are named "...Hook" specifically so they do NOT
+collide with GORM's own BeforeCreate/BeforeUpdate — because hank injects its
+OWN callback step to invoke them, positioned deliberately after GORM's
+built-in step:
+
+File: hank/db/service.go
+    applyEmbeddedHooks(db)  (line 83-91), called once from hdb.New() (line 66)
+    when a DB connection is first opened:
+
+        beforeCreateCallback := *db.Callback().Create()
+        beforeCreateCallback.After("gorm:before_create")
+        beforeCreateCallback.Register("gorm:audit_before_create", auditBeforeCreate)
+
+        beforeUpdateCallback := *db.Callback().Update()
+        beforeUpdateCallback.After("gorm:before_update")
+        beforeUpdateCallback.Register("gorm:audit_before_update", auditBeforeUpdate)
+
+    auditBeforeCreate (line 71-75) -> scope.CallMethod("BeforeCreateHook")
+    auditBeforeUpdate (line 77-81) -> scope.CallMethod("BeforeUpdateHook")
+
+AfterCreate/AfterUpdate/AfterDelete don't need this trick — GORM's own
+built-in after_create/after_update/after_delete callbacks already call
+scope.CallMethod("AfterCreate") etc. directly (callback_create.go:189-196,
+callback_update.go, callback_delete.go:59-63), and Audit happens to use
+those exact names on purpose.
+
+
+===========================================================
+3. HOW A METHOD ON hdb.Audit ENDS UP CALLABLE ON MeasurementDataset
+===========================================================
+
+scope.CallMethod ultimately does (gorm/scope.go:432):
+
+    if methodValue := reflectValue.MethodByName(methodName); methodValue.IsValid() { ... }
+
+Pure reflection on *MeasurementDataset. It has no idea MeasurementDataset
+never wrote AfterCreate itself. Because hdb.Audit is embedded anonymously
+(models/measurement.go:59: "hdb.Audit", no field name), Go's method
+promotion puts (*Audit).AfterCreate, (*Audit).BeforeCreateHook, etc into
+(*MeasurementDataset)'s method set automatically — and reflect.MethodByName
+sees promoted methods exactly like directly-declared ones. No interface
+assertion, no registration per model — purely structural. Any model that
+embeds hdb.Audit gets all 5 hooks silently, forever, with zero code.
+
+Sibling note: MeasurementDataset ALSO embeds a plain UUID struct
+(unhygienix/models/audit.go:15-21) which defines BeforeCreate (the real
+GORM name, not "...Hook") — that one runs earlier in the same chain and is
+what actually generates the row's primary key (scope.SetColumn("ID",
+uuid.New().String())). Separate struct, separate concern, same promotion
+mechanism, easy to conflate with hdb.Audit's hooks when reading a trace.
+
+
+===========================================================
+4. WHAT ACTUALLY GETS WRITTEN, IN ORDER (Create example)
+===========================================================
+
+Traced concretely via unhygienix/db/measurement.go:38-46
+(CreateMeasurementDataset):
+
+    tx := hdb.BeginTxDB(ctx, db, ...)      // stashes ctx (JWT claims) via
+                                            // tx.InstantSet("context", ctx) — audit.go:221-225
+    tx.Model(&MeasurementDataset{}).Create(dataset)
+        -> gorm:before_create      (built-in) CallMethod("BeforeCreate") -> UUID.BeforeCreate: generates ID
+        -> gorm:audit_before_create (hank's injected step) CallMethod("BeforeCreateHook")
+               -> (*Audit).BeforeCreateHook, audit.go:125-148
+               -> claims(scope) reads back the ctx from step 1 (audit.go:33-41)
+               -> sets 4 DB columns ONLY:
+                    audit_created_by_user, audit_updated_by_user,
+                    audit_created_at, audit_updated_at
+               -> if caller is a service token with no user claim, falls
+                  back to platform-superuser id (audit.go:137-142)
+        -> gorm:create              actual INSERT, now carrying those columns
+        -> gorm:after_create        (built-in) CallMethod("AfterCreate")
+               -> (*Audit).AfterCreate, audit.go:150-164 — see section 5
+
+IMPORTANT GOTCHA: claims(scope) only finds anything if the write went
+through hdb.BeginDB/BeginTxDB. A bare db.Create(...) on a *gorm.DB that
+never had InstantSet("context", ctx) called on it makes claims(scope)
+return parsed=false, and ALL FIVE hooks just `return nil` immediately — no
+columns set, no log line, no error raised. Silent no-op. Worth checking any
+new model's create/update path actually uses BeginDB/BeginTxDB before
+assuming audit behavior is active.
+
+
+===========================================================
+5. AfterCreate — CONFIRMED AGAINST A REAL DATADOG LOG
+===========================================================
+
+AfterCreate does NOT touch the database. It logs a JSON blob
+(hlog.LogEntryCtx(ctx).Infof("Audit Log: %s", ...), audit.go:161) built from
+NewAuditLogFromAudit (audit.go:58-82) into the AuditLog struct
+(audit.go:43-56):
+
+    type AuditLog struct {
+        ObjectID, ObjectName, ObjectType string
+        Action, ActionByID, ActionByEmail string
+        ActionAt time.Time
+        Method, OrgID, RequestID interface{}
+        ImpersonatedByID, ImpersonatedByEmail string
+    }
+
+No json tags at all -> no omitempty -> EVERY field always appears in the
+output, blank or not. Confirmed against a real Datadog log entry
+(screenshot 2026-07-18 10.50.05 AM, service=unhygienix,
+container=unhygienix, RPC=/proto.CleanRoomRunStatsService/
+CreateCleanRoomQuestionRunStatistics, model=CleanRoomQuestionRunDatasetStatistics):
+
+    "ObjectID": "d56ada74-d619-40ef-8788-87823e3def94"   <- getObjectDetails, audit.go:241-267 (JSON "ID" key)
+    "ObjectName": ""                                      <- model has no Name/DisplayName field
+    "ObjectType": "CleanRoomQuestionRunDatasetStatistics"<- getModelName, audit.go:227-239 (Go struct name via reflection)
+    "Action": "CREATE"                                    <- constant, audit.go:20
+    "ActionByID": ""                                      <- see finding below
+    "ActionByEmail": ""
+    "ActionAt": "2026-07-18T04:01:18Z"
+    "Method": "/proto.CleanRoomRunStatsService/CreateCleanRoomQuestionRunStatistics"
+    "OrgID": ""
+    "RequestID": "5279e26a-a60d-4ca3-9b1c-a6e37f1113a3"
+    "ImpersonatedByID": ""
+    "ImpersonatedByEmail": ""
+
+FIELD PROVENANCE for Method/OrgID/RequestID: these are NOT computed by
+audit.go — they're pulled straight from requestInfo :=
+hlog.LogEntryCtx(ctx).Data["method"/"organizationID"/"requestId"], i.e.
+whatever's already sitting in the request-scoped logger fields by the time
+AfterCreate fires.
+  - RequestID: traced concretely to hank/http/middleware/logging.go:93-110
+    (WithContextLogger) -> hlog.AddFieldsContext(ctx, logrus.Fields{"requestId": reqId})
+    called BEFORE the handler runs — genuinely present in ctx by the time
+    AfterCreate executes. Matches the screenshot value exactly.
+  - Method: value shape (/proto.Service/Method) matches gRPC FullMethod.
+    NOT explained by hank's gRPC logging interceptor
+    (grpc/interceptors/logging_server.go:16-44) — that one only attaches
+    "method" to its OWN post-handler completion log line (after
+    handler(ctx,req) already returned), never persists it via
+    AddFieldsContext for the handler's own use. Exact source not confirmed
+    — likely a service-specific interceptor in unhygienix not yet located.
+    Flagging as open, not guessing further.
+  - OrgID: blank in this example — plausible this call's organizationID was
+    never added to logger fields (only some handlers explicitly call
+    hlog.AddFieldsContext with "orgId", not "organizationID" — key
+    mismatch spotted in unhygienix/api/server/clean_room_contract.go:232,
+    demodata.go:57/232/294; those use "orgId" not the "organizationID" key
+    audit.go actually reads, so they wouldn't populate this field even when
+    present).
+
+REAL FINDING — DB and LOG DISAGREE for service-originated writes:
+ActionByID/ActionByEmail are BLANK in the log even though this row was
+created by a real, working service call (clientName: zabra, visible as a
+separate Datadog-indexed field, not part of the AuditLog JSON itself).
+Reason: AfterCreate (audit.go:155, user := tokenClaims.User) reads the JWT
+user claim RAW, with no fallback. BeforeCreateHook, by contrast,
+EXPLICITLY substitutes the platform-superuser id when the caller is a
+service token with no user claim (audit.go:137-142). So for this exact row:
+the DB column (audit_created_by_user) almost certainly holds the
+platform-superuser id, while this log line's ActionByID stayed empty. Two
+different, disagreeing answers to "who created this," one in Postgres, one
+in the log stream — asymmetric by construction, not a data quality bug.
+
+FIELDS VISIBLE IN DATADOG BUT NOT PART OF AuditLog's JSON (separate,
+sibling logrus fields Datadog indexes independently of the log MESSAGE
+text):
+  - purpose, action, actionBy   <- audit.go:160, added right alongside the
+                                    Infof call, redundant with keys already
+                                    inside the JSON blob (by design)
+  - caller: "audit.go:161"      <- auto-added by hlog itself; literally the
+                                    source file:line of the Infof call site
+  - clientName: "zabra"         <- NOT from audit.go. Set by unrelated,
+                                    handler-specific code elsewhere (e.g.
+                                    clean_room_contract.go:250,
+                                    demodata.go:74), so it only shows up on
+                                    endpoints that happen to add it — not a
+                                    universal field
+  - level, time                 <- standard logrus/Datadog metadata
+
+
+===========================================================
+6. QUICK REFERENCE — FULL CALL CHAIN, CREATE
+===========================================================
+
+hdb.BeginTxDB(ctx, db, opts)                         hank/db/audit.go:221-225
+  -> tx.InstantSet("context", ctx)
+tx.Create(model)
+  -> gorm:before_create        (gorm built-in)        jinzhu/gorm callback_create.go:22-29
+       CallMethod("BeforeSave")   -> no-op (not defined)
+       CallMethod("BeforeCreate") -> UUID.BeforeCreate (unhygienix/models/audit.go:19-21) generates ID
+  -> gorm:audit_before_create  (hank injected)         hank/db/service.go:83-86
+       CallMethod("BeforeCreateHook") -> Audit.BeforeCreateHook (audit.go:125-148)
+       writes: audit_created_by_user, audit_updated_by_user,
+               audit_created_at, audit_updated_at  (DB COLUMNS ONLY)
+  -> gorm:create                actual INSERT
+  -> gorm:after_create          (gorm built-in)        callback_create.go:189-196
+       CallMethod("AfterCreate") -> Audit.AfterCreate (audit.go:150-164)
+       writes: one JSON log line, full AuditLog struct, always (LOG ONLY,
+               never touches the DB)

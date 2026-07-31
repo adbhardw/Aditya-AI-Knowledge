@@ -1,0 +1,121 @@
+Q8 — RegisterCallback vs actual delivery, why no PostXMIEvents RPC, and a real
+schema-drift bug this surfaced
+Date: 2026-07-15
+Status: Answered, and a real bug found + fixed as a result
+
+------------------------------------------------------------------------
+
+Q: Is RegisterCallback the RPC that calls XMI's callback URL, or the one
+that registers it?
+
+A: Registration only, never the call itself.
+
+RegisterCallback is a one-time setup RPC — XMI (via external-api-server's
+POST /v1/cleanrooms/{id}/callbacks) tells us their callback_url or GCP
+topic, and this RPC validates it and writes one row into
+callback_registrations. It never makes an HTTP call to XMI.
+
+The actual "call XMI's URL" action is a completely separate, later,
+repeatedly-triggered path: WebhookDeliveryChannel.deliver(), invoked by
+CallbackDeliveryWorker once per event, off an SQS dispatch message —
+unrelated to RegisterCallback except that it reads the row RegisterCallback
+wrote. One is rare and XMI-initiated (save an address); the other is
+constant and our-pipeline-initiated (use that saved address).
+
+------------------------------------------------------------------------
+
+Q: Why is there no PostXMIEvents (or similar) RPC in orinix.proto? Is it
+missing because the customer doesn't call it, we call them?
+
+A: Correct instinct, confirmed.
+
+orinix.proto only needs to define the surface OTHERS call ON orinix
+(GetCleanroomEvents, RegisterCallback — both called by external-api-
+server). The actual delivery is the opposite direction: orinix is the
+CALLER, not the callee.
+
+  Webhook: orinix POSTs to whatever URL XMI gave us — a plain HTTPS
+  endpoint, not a gRPC server implementing our proto. There's no proto
+  contract to define because gRPC isn't even the protocol in play; the
+  real "contract" is the CloudEvents JSON shape + the X-Habu-Signature/
+  X-Habu-Event-Id header convention (documented in the Confluence draft,
+  not in orinix.proto).
+
+  Pub/Sub: orinix calls GOOGLE's publish API
+  (com.google.cloud.pubsub.v1.Publisher) — not our proto, Google's.
+
+So CallbackDeliveryWorker needing nothing from the generated proto classes
+isn't a gap, it's the correct shape — confirmed by the code, not just the
+theory.
+
+------------------------------------------------------------------------
+
+FOLLOW-UP Q: Could the pull API and the webhook payload actually have
+different schemas for "the same" event? (Flagged as a real possibility,
+not accepted as just a theoretical risk.)
+
+A: Checked the actual code rather than speculating further. YES — real
+bug, four concrete divergences, found by directly comparing
+OrinixServiceImpl.toProto() against WebhookDeliveryChannel's
+toCloudEventJson():
+
+  1. changed_fields was MISSING ENTIRELY from the pull API response —
+     OrinixServiceImpl.toProto() never mapped it. The single most
+     important piece of information (what actually changed) was silently
+     dropped for every pull API consumer.
+
+  2. spec_version and time were never set in the proto response either —
+     silently defaulting to empty string for every event.
+
+  3. The webhook payload double-encoded changed_fields. It's stored on
+     ObjectEventEntity as a raw JSON String column. Naive
+     objectMapper.writeValueAsString(event) serialized that String field
+     AS a JSON string value — producing
+     "changedFields": "{\"stage\":{\"from\":\"X\",\"to\":\"Y\"}}"
+     instead of a clean nested object. Doesn't match the documented
+     CloudEvents shape at all.
+
+  4. "id" meant two DIFFERENT things in the two payloads. In the pull API,
+     id correctly comes from event.getIdempotencyKey() (the real
+     CloudEvents id, meant for dedup). In the naive webhook serialization,
+     Jackson serialized the WHOLE entity including its own database
+     primary key field (also named id) — so the webhook payload's "id"
+     was the DB row's UUID, and the actual CloudEvents id ended up under a
+     completely different key, "idempotencyKey". Anyone consuming both
+     feeds and assuming "id" meant the same thing in both would have been
+     silently wrong.
+
+FIX: added orinix-backend/src/main/java/com/habu/orinix/event/
+ObjectEventMapper.java — the one shared place that builds the CloudEvents
+envelope shape (with a proper nested "data" object, correct id, parsed
+changed_fields) from an ObjectEventEntity. Both OrinixServiceImpl.toProto()
+and WebhookDeliveryChannel.toCloudEventJson() now derive from this same
+method instead of each independently re-deriving "what does this event
+look like" — which is exactly how they drifted apart in the first place,
+with no compiler or test catching it.
+
+Committed (62338d1 "Fix schema drift between pull API and webhook
+delivery") and pushed onto the still-open PR #1 (add-orinix-scaffold
+branch — confirmed via gh pr view that PR #1 was never actually merged,
+despite an assumption to the contrary mid-fix that got caught and
+corrected before it caused any real damage).
+
+------------------------------------------------------------------------
+
+OUSTERHOUT TIE-IN
+
+  BETTER TOGETHER OR APART (ch. 8) — "what does this event look like" is
+  ONE piece of logic, not two. Two independent hand-written mappings of
+  the same entity were "apart" when they should have been "together" —
+  exactly the failure mode this chapter warns about, and exactly what
+  caused the bug.
+
+  DEFINE ERRORS OUT OF EXISTENCE (ch. 9) — the fix doesn't just correct
+  today's divergence, it removes the category of bug: with one shared
+  mapper, the two paths structurally cannot drift apart silently again —
+  a change to the CloudEvents shape now has exactly one place to make it.
+
+  INFORMATION HIDING (ch. 4) — ObjectEventMapper hides "changed_fields is
+  actually stored as a raw JSON string, not a real object" from both
+  callers. Neither OrinixServiceImpl nor WebhookDeliveryChannel needs to
+  know that implementation detail anymore.

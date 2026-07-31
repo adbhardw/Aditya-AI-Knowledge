@@ -1,0 +1,142 @@
+Miro Prompt V2 — Swimlane (by actor, not by phase)
+Date: 2026-07-08
+Note: built without reading the PDF. Alternative structure to V1 (Design It Twice) —
+same content, organized by WHO does it (three lanes) instead of top-to-bottom
+sequence. Every box stays short (3-6 lines), no inline code blocks. orinix is the
+only consumer — no pegleg lane.
+
+---
+
+```
+Create an enterprise architecture flowchart titled:
+"orinix — Who Does What: Producers, orinix, XMI"
+Subtitle: "Three lanes · registration once · delivery on every mutation · DLQ + replay"
+
+LAYOUT: TOP-TO-BOTTOM. THREE vertical swimlanes, full height. Horizontal phase
+bands cut across all three lanes. Arrows within a lane point down; arrows
+crossing lanes are horizontal. Keep every box to 3-6 short lines, no embedded
+JSON/proto — name the artifact only.
+
+THREE swimlanes:
+  Lane 1 (blue):   "Producers + SNS/SQS"
+  Lane 2 (purple): "orinix"
+  Lane 3 (orange): "external-api-server + XMI"
+
+======================================================================
+PHASE 1 BAND: "SETUP — one-time registration"
+======================================================================
+
+[Lane 3] Box 1.1: "XMI registers once"
+  POST /v1/cleanrooms/{id}/callbacks
+  Picks WEBHOOK or PUBSUB (or both — two rows)
+
+Arrow left → Lane 2
+
+[Lane 2] Box 1.2: "CallbackRegistrationService"
+  Validates URL (WEBHOOK) or topic (PUBSUB)
+  Mints signing_secret (WEBHOOK only)
+  Writes callback_registrations row
+
+Arrow right → Lane 3
+
+[Lane 3] Box 1.3: "Registration response"
+  registration_id + signing_secret (once)
+  XMI stores secret like a credential
+
+======================================================================
+PHASE 2 BAND: "RUNTIME — a mutation happens"
+======================================================================
+
+[Lane 1] Box 2.1: "unhygienix / forebitt / picanmix"
+  Mutation committed
+  Mints event id once (CloudEvents id)
+  Publishes to SNS post-commit
+
+Arrow down:
+
+[Lane 1] Box 2.2: "SNS → SQS"
+  habu-observability-events
+  → sqs-habu-observability-internal
+
+Arrow right → Lane 2
+
+[Lane 2] Box 2.3: "orinix — SQS Consumer"
+  Reads queue, plain method call
+  Idempotent insert (unique event id)
+
+Arrow down:
+
+[Lane 2] Box 2.4: "object_events"
+  Append-only Postgres
+  cursor_position — global sequence
+  changed_fields { from, to }
+
+Arrow down:
+
+[Lane 2] Box 2.5: "DeliveryDispatcher"
+  One event → N registrations
+  One message per registration
+  Per-consumer delivery queue
+
+======================================================================
+PHASE 3 BAND: "DELIVERY — three paths, XMI's choice"
+======================================================================
+
+[Lane 2] Box 3.1: "CallbackDeliveryWorker"
+  Reads delivery_type per row
+  Strategy: WebhookDeliveryChannel or PubSubDeliveryChannel
+
+Arrow right → Lane 3, split into three:
+
+[Lane 3] Box 3.2a (green): "Pull"
+  external-api-server calls
+  orinix.GetCleanroomEvents
+  since_cursor, limit → XMI polls
+
+[Lane 3] Box 3.2b (orange): "Webhook push"
+  HTTP POST, HMAC-SHA256 signed
+  X-Habu-Signature, X-Habu-Event-Id
+
+[Lane 3] Box 3.2c (purple): "Pub/Sub push"
+  orinix publishes to XMI's GCP topic
+  Auth: WIF or static key (open)
+
+[Lane 3] Box 3.3: "XMI idempotency check — REQUIRED"
+  Same event id across all 3 paths
+  Delivery is at-least-once, not exactly-once
+  Dedupe before processing, every path
+
+======================================================================
+PHASE 4 BAND (RED): "FAILURE — webhook + pubsub only"
+======================================================================
+
+[Lane 2] Box 4.1 (red): "Retry"
+  5 attempts, backoff + jitter
+  SQS native, no Postgres counter
+
+[Lane 2] Box 4.2 (red): "DLQ"
+  Exhausted → dead letter queue
+  CloudWatch alarm → Habu on-call
+
+[Lane 2] Box 4.3 (red): "Replay"
+  On-call confirms fix
+  Redrive to source queue
+  XMI never paged directly (M1)
+
+======================================================================
+BOTTOM: "Why this design — Ousterhout, short form"
+======================================================================
+
+Box (dark blue, full width):
+  Deep Modules — one insert call hides all queue/DB wiring
+  Information Hiding — delivery_type hides "how," not "if"
+  Strategy Pattern — one interface, two channels, zero branching
+  Design It Twice — language, delivery pattern, both compared honestly
+  Chesterton's Fence — reused pegleg's proven SQS + Pub/Sub code, not rebuilt
+
+COLOR SPEC:
+  Lane 1 blue = producers, Lane 2 purple = orinix, Lane 3 orange = external-
+  api-server/XMI (green/purple sub-boxes for pull/pubsub inside Lane 3),
+  Red = failure/DLQ/replay band, Dark blue = closing principles box.
+Every box 3-6 short lines max. No inline JSON/proto blocks anywhere.
+```

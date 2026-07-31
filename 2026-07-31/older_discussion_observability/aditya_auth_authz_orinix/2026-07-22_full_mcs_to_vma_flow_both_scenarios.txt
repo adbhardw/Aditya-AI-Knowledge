@@ -1,0 +1,145 @@
+FULL MCS -> VMA CALL FLOW, BOTH SCENARIOS, PLUS: DOES CAC HAVE ITS OWN
+authn-proxy OR CALL A CENTRALIZED NEXUS AUTHN SERVICE?
+Follow-up to 2026-07-22_what_is_a_nexus_app_and_does_sidecar_skip_calls.txt
+Date: 2026-07-22
+
+
+===========================================================
+Q: Does service-account sit in the same folder as CAC?
+===========================================================
+
+A: Yes, confirmed directly — literal sibling directories, same level:
+
+    LiveRamp/nexus/apps/access-control/     <- CAC
+    LiveRamp/nexus/apps/service-account/    <- token issuer/verifier-key source
+
+Both under `apps/` in the same monorepo, same team (AAA).
+
+
+===========================================================
+Q: Full flow for MCS -> VMA, scenario 1 (CAC involved — this IS the
+   current, actual case)
+===========================================================
+
+Confirmed VMA's own Helm values match MCS exactly:
+`value-mapping-api/kubernetes-helm-deployment/value-mapping-api/base-values.yaml:126-133`
+    kongGatekeeper: enabled: false
+    authnProxy:     enabled: false      <- same as MCS, no local verify sidecar
+    accessTokenGetter: enabled: true    <- same as MCS, has its own token-issuer
+
+So MCS and VMA are symmetric — neither runs a local verification sidecar.
+This is genuinely the real, current setup on both sides.
+
+FULL FLOW, step by step (MCS calling VMA's `/v2/mappings/{id}/qa-result`):
+
+  1. MCS's app code calls `VMAApiClient().get(...)`, no token passed in.
+  2. `LiveRampApiClientBase` (liveramp_apis.py) needs a token, calls
+     `token_getter.get_access_token()`.
+  3. That asks MCS's OWN access-token-getter sidecar (in MCS's pod) for a
+     token. The sidecar already holds a cached token (or fetches a fresh one
+     from Nexus's service-account/Authenticator using MCS's
+     credentials.json from Vault, cache ~300s).
+  4. MCS sends `GET /v2/mappings/{id}/qa-result` to VMA, with
+     `Authorization: Bearer <MCS's token>` + `LR-Org-ID`.
+  5. VMA's endpoint code (v3_mappingsmap_api.py-style handler) calls
+     `common_init_ctx(...)`, which calls `cac.cac_is_authorized(auth_token,
+     lr_org_id, permission, alt_permission=restricted_permission)`.
+  6. VMA's cac.py POSTs that RAW, unverified-by-VMA token straight to CAC's
+     `/v1/user-org-permission/actions/check` (or the restricted variant),
+     at `api.liveramp.com/access/control/service/...`.
+  7. CAC receives this. CAC's OWN inbound gateway (CAC's own authn-proxy —
+     see next section) verifies the token's signature FIRST, before CAC's
+     business logic runs, and writes the verified identity onto
+     `x-validated-access-token` for CAC's own handlers to read.
+  8. CAC's `authnmiddleware` (`UserInjectorMiddleware`) parses that header,
+     CAC's RBAC logic (`accessmodel`, loaded from real-config.json) checks
+     whether "MCS's service account" holds the requested permission for
+     this org.
+  9. CAC responds `{"allAllowed": true/false}`.
+  10. VMA's `common_init_ctx` gets that answer. If false -> 403 to MCS
+      immediately, request never proceeds. If true -> VMA's endpoint code
+      actually runs, returns the QA data.
+
+Neither MCS nor VMA ever locally verifies a signature themselves in this
+flow. That job is fully delegated to CAC (and, underneath CAC, to CAC's own
+authn-proxy — see below). This is genuinely the CURRENT, real setup.
+
+
+===========================================================
+Q: Full flow, scenario 2 — the sidecar-based (agentic-core-style) version
+===========================================================
+
+Your instinct was right to push back here: "no CAC involved" isn't a real
+scenario that exists anywhere in what's been traced. CAC ALWAYS stays in
+the flow, in every model — the only thing that changes is whether
+VERIFICATION also happens a second time, locally, before the request even
+reaches VMA's app code. So this is the accurate second flow to compare
+against — not "no CAC," but "CAC + a local pre-check":
+
+  1-4. Same as above — MCS gets a token from its own sidecar, sends it to
+       VMA with Authorization + LR-Org-ID.
+  5. IF VMA ran its own authn-proxy (it doesn't today, but hypothetically):
+     that sidecar intercepts the request BEFORE VMA's app code sees it,
+     verifies the signature locally against a public key it cached earlier
+     from Nexus's service-account app (via periodic JWKS fetch, not
+     per-request), and writes `x-validated-access-token` itself.
+  6. VMA's app code (`@auth.authenticate`-equivalent) reads that header —
+     already trusts the identity, no need to ask anyone else "is this
+     token real."
+  7. VMA's app code STILL calls CAC for the permission check — exactly the
+     same call as step 5-9 above, unchanged. This step never goes away.
+  8. CAC still does its own thing exactly as before (its own authn-proxy
+     re-verifies on CAC's side too, then RBAC lookup, then answer).
+  9. VMA acts on CAC's answer, same as before.
+
+DIFFERENCE BETWEEN THE TWO FLOWS: only step 5-6. In scenario 1, VMA trusts
+CAC's answer completely and never independently checks the token itself. In
+scenario 2, VMA ALSO independently verifies the token locally before even
+bothering to ask CAC anything (defense in depth / fail fast on garbage
+tokens without a network round trip) — but the CAC call for the actual
+permission decision is identical, mandatory, and unavoidable in BOTH
+scenarios. There is no real-world flow anywhere in what's been traced where
+CAC is skipped entirely — your suspicion about that was correct.
+
+
+===========================================================
+Q: Does CAC have its own authn-proxy, or does CAC call a centralized Nexus
+   authn SERVICE (as an API) instead?
+===========================================================
+
+A: It's the FIRST one — CAC sits behind its own authn-proxy instance,
+using the exact same standard sidecar pattern every other service uses. It
+is NOT making a special API call out to some other "centralized authn
+service" as a distinct mechanism.
+
+Evidence, direct: `apps/access-control/app/internal/pkg/authnmiddleware/
+authnmiddleware.go` reads `x-validated-access-token` — a header ONLY ever
+written by an authn-proxy sidecar. CAC's own code never parses a raw JWT.
+
+Confirming this isn't special-cased just for CAC — the EXACT SAME pattern
+(reading `x-validated-access-token`, calling it `AuthnProxyHeader`) shows up
+verbatim in THREE other sibling Nexus apps' own source:
+  - apps/org-api/internal/pkg/server/server.go
+      `const AuthnProxyHeader = "x-validated-access-token"`
+  - apps/service-account/test/features/acceptance_test.go
+      tests literally set `X-Validated-Access-Token` header to simulate the
+      proxy
+  - apps/thirdshield/acceptancetests/features/acceptance_test.go
+      same pattern again
+
+So every Nexus app, including CAC itself, uniformly sits behind its own
+authn-proxy and reads the same pre-verified header — there's no separate,
+different "centralized Nexus authn API" that CAC calls into instead. The
+authn-proxy pattern IS how Nexus apps (including the one that dispenses
+permission decisions) protect their own inbound traffic. CAC isn't special
+here — it follows its own platform's standard pattern like everyone else.
+
+One honest caveat: I found this at the CODE level (the header-reading
+pattern, repeated identically across 4 sibling apps) but not CAC's specific
+deployment YAML/Helm values proving the sidecar container is literally
+wired into CAC's pod (Nexus's Go services deploy differently than
+MCS/VMA's Python services, so I haven't located that manifest format yet).
+The code-level evidence across 4 independent apps is strong and consistent
+enough to be confident in the answer, but flagging it as inference from a
+very consistent pattern, not a directly-read deployment manifest for CAC
+specifically.

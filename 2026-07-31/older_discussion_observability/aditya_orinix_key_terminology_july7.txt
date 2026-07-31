@@ -1,0 +1,220 @@
+orinix — key terminology, with real examples
+Date: 2026-07-07
+
+A glossary of the terms that keep showing up across the orinix design docs,
+each with a concrete example pulled from the actual scaffolded code
+(Habu_Cloned_Repo/orinix), not an abstract description.
+
+------------------------------------------------------------------------
+
+delivery_type
+
+  A column on callback_registrations. Says WHICH mechanism this particular
+  registered consumer wants: "WEBHOOK" or "PUBSUB". This is the single
+  switch that decides which DeliveryChannel implementation handles a given
+  row — nothing else in the system branches on it.
+
+  Example: XMI registers twice for the same cleanroom, once each way —
+  two rows, two delivery_type values, both live at once:
+
+    Row 1: delivery_type = "WEBHOOK"
+    Row 2: delivery_type = "PUBSUB"
+
+------------------------------------------------------------------------
+
+delivery_config
+
+  A JSONB column on the same table, right next to delivery_type. Holds
+  whatever fields THAT mechanism actually needs — the shape of this JSON
+  is different depending on delivery_type, which is why it's a flexible
+  JSONB blob instead of a fixed set of columns (a WEBHOOK row has no use
+  for a GCP project id, a PUBSUB row has no use for a URL).
+
+  Example for a WEBHOOK registration:
+    { "callback_url": "https://events.xmi.liveramp.com/habu-webhook" }
+
+  Example for a PUBSUB registration:
+    { "gcp_project_id": "xmi-prod-12345", "gcp_topic_id": "habu-cleanroom-events" }
+
+  In code: WebhookDeliveryChannel.deliver() reads config.path("callback_url"),
+  PubSubDeliveryChannel.deliver() reads config.path("gcp_project_id") /
+  config.path("gcp_topic_id") — from the exact same column, just parsed
+  differently depending on which implementation is handling that row.
+
+------------------------------------------------------------------------
+
+object_events
+
+  The one append-only table every event ever gets written to, regardless
+  of who eventually needs it or how it gets delivered to them. Think of it
+  as the permanent record; delivery is a separate concern layered on top.
+
+  Example row (simplified): a DataConnection moved from MAPPING_REQUIRED to
+  CONFIGURATION_COMPLETE —
+    object_type = "DATA_CONNECTION"
+    object_id = "97b6cf60-f8be-48aa-b7a0-ec112c1fb801"
+    change_type = "UPDATED"
+    changed_fields = { "stage": { "from": "MAPPING_REQUIRED", "to": "CONFIGURATION_COMPLETE" } }
+    cursor_position = 4821   (auto-assigned, see below)
+
+------------------------------------------------------------------------
+
+changed_fields — the { from, to } shape
+
+  Every object type (QUESTION, DATA_CONNECTION, EXPORT_JOB, FLOW, FLOW_RUN)
+  represents a change the exact same way, so a consumer can parse any event
+  with one piece of code, no branching per object type.
+
+  Example — a Question's SQL changing:
+    { "sqlQuery": { "from": "SELECT ... WHERE amount > 100", "to": "SELECT ... WHERE amount > 50" } }
+
+  Example — an ExportJob's destination changing:
+    { "destination": { "from": "s3://a/a.csv", "to": "s3://b/b.csv" } }
+
+------------------------------------------------------------------------
+
+cursor_position / since_cursor
+
+  cursor_position: an auto-incrementing number (Postgres BIGSERIAL) stamped
+  on every object_events row in insertion order. since_cursor: the request
+  parameter a consumer sends back to say "give me everything after this
+  point." Together, this is what makes the pull API work without a
+  timestamp (timestamps can collide or drift; a monotonic counter can't).
+
+  Example call:
+    GetCleanroomEvents(cleanroom_id="cr-abc", since_cursor=4820, limit=50)
+    -> returns the row above (cursor_position 4821) and anything newer,
+       plus a next_cursor value the caller stores for their next poll.
+
+------------------------------------------------------------------------
+
+idempotency_key
+
+  The CloudEvents envelope's own event id (a UUID), stored with a UNIQUE
+  constraint on object_events. This is what makes it safe for SQS to
+  redeliver the same message twice (which it will, by design — SQS is
+  "at-least-once," never "exactly-once") without creating two rows for one
+  real-world event.
+
+  Example: SqsEventConsumer receives the same message twice due to a
+  network retry. Both times it tries to insert a row with
+  idempotency_key = "evt-a1b2c3d4-...". The second insert is rejected by
+  the unique constraint (or short-circuited by
+  existsByIdempotencyKey() first) — one event, one row, no duplicate
+  delivery downstream.
+
+------------------------------------------------------------------------
+
+signing_secret / HMAC-SHA256 / X-Habu-Signature
+
+  signing_secret: a random string minted once, at registration time, only
+  for WEBHOOK consumers (e.g. "whsec_9f8e7d6c5b4a..."). It's used to prove
+  to XMI that a webhook POST genuinely came from Habu and wasn't forged.
+
+  How it's used: before every webhook delivery, WebhookDeliveryChannel
+  computes an HMAC-SHA256 hash of the payload using this secret as the key,
+  and sends the result in a header:
+    X-Habu-Signature: 7a3f9c2e...  (the hex-encoded HMAC)
+  XMI's webhook handler recomputes the same hash on their end using the
+  same secret (given to them once, at registration) and checks it matches
+  — if someone else tried to POST a fake event to XMI's endpoint, they
+  couldn't produce a matching signature without knowing the secret.
+
+------------------------------------------------------------------------
+
+DeliveryChannel (the Strategy pattern)
+
+  One Java interface — deliver(registration, event) -> DeliveryResult —
+  with two implementations: WebhookDeliveryChannel and
+  PubSubDeliveryChannel. "Strategy pattern" just means: the actual delivery
+  behavior is swapped in at runtime based on delivery_type, rather than one
+  big method with if/else branches for every mechanism.
+
+------------------------------------------------------------------------
+
+DeliveryDispatcher (fan-out) vs CallbackDeliveryWorker (dispatch)
+
+  Two different jobs that are easy to accidentally lump into one:
+
+  DeliveryDispatcher answers "WHO needs to hear about this event?" — given
+  one object_events row, it looks up every ACTIVE registration for that
+  cleanroom+object_type and sends one small message per registration onto
+  that consumer's own delivery queue. One event in, potentially many
+  messages out.
+
+  CallbackDeliveryWorker answers "HOW do we actually reach this ONE
+  consumer?" — it picks up one of those dispatch messages, looks at that
+  registration's delivery_type, and calls the matching DeliveryChannel.
+
+  Example: a FLOW_RUN completed event has 2 active registrations (XMI via
+  webhook, a hypothetical second consumer via Pub/Sub). DeliveryDispatcher
+  fires twice (fan-out = 2). Each of those two dispatch messages then goes
+  through CallbackDeliveryWorker independently, each picking a different
+  DeliveryChannel.
+
+------------------------------------------------------------------------
+
+SNS vs SQS
+
+  SNS (Simple Notification Service): a "topic" that broadcasts one message
+  to every subscriber at once — nobody has to poll it.
+  SQS (Simple Queue Service): a "queue" that holds messages until something
+  reads and deletes them — this is what orinix actually polls.
+
+  In this design: unhygienix/forebitt/picanmix publish to the SNS topic
+  habu-observability-events. That topic fans out to an SQS queue,
+  sqs-habu-observability-internal, which is what SqsEventConsumer actually
+  reads from. SNS is the "everyone who cares, hear this now" layer; SQS is
+  the durable "hold it until orinix is ready" layer sitting right behind it.
+
+------------------------------------------------------------------------
+
+Redrive policy / DLQ (Dead Letter Queue)
+
+  When CallbackDeliveryWorker fails to deliver (e.g. XMI's endpoint is
+  down), it doesn't delete the SQS message — SQS makes it visible again
+  after a timeout and retries. A "redrive policy" caps this at N attempts
+  (5, per the approved design doc) before moving the message to a separate
+  DLQ instead of retrying forever. The DLQ is where "we gave up, a human
+  needs to look at this" messages land.
+
+  This is still an OPEN QUESTION in the design (see Q2's open items) — the
+  scaffold assumes SQS's own redrive policy handles this counting, rather
+  than a hand-rolled attempts column in Postgres, but that hasn't been
+  explicitly confirmed as the intended design yet.
+
+------------------------------------------------------------------------
+
+Workload Identity Federation (WIF)
+
+  A way for orinix (an AWS-hosted Java service) to get a short-lived GCP
+  credential by proving its AWS identity, WITHOUT ever storing a
+  long-lived GCP service-account JSON key anywhere. Contrast with pegleg's
+  billing publisher today, which DOES use a static stored key — the thing
+  this design is explicitly trying to avoid repeating for orinix's Pub/Sub
+  delivery channel.
+
+------------------------------------------------------------------------
+
+@GrpcClient / -proto jar
+
+  The calling convention external-api-server uses for every backend
+  service, including (once wired up) orinix. orinix-proto is a small
+  published artifact containing only the generated gRPC stub classes
+  compiled from orinix.proto — external-api-server adds it as a Maven
+  dependency, then annotates a field:
+    @GrpcClient("orinix")
+    private OrinixServiceGrpc.OrinixServiceBlockingStub orinixStub;
+  and Spring wires up the network connection automatically, based on a
+  matching address entry in external-api-server's own config.
+
+------------------------------------------------------------------------
+
+org_id / cleanroom_id scoping
+
+  Every table and every query in this design carries both. org_id is which
+  Habu customer owns the data (used to enforce "you can only see your own
+  events"); cleanroom_id is which specific cleanroom the event happened in
+  (a customer can have many). Every read filters on both — this is what
+  makes org isolation automatic rather than something each caller has to
+  remember to check.

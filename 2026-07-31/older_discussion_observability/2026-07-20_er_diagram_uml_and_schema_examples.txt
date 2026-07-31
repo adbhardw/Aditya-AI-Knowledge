@@ -1,0 +1,247 @@
+2026-07-20 — Entity Relationship, UML, and schema examples for the
+Design Review
+
+Purpose: consolidate the brainstorm on (1) how to show a table
+relationship diagram, and (2) sample object_events payload examples,
+for tomorrow's presentation. Everything under "M1" below is real —
+already part of the approved v6 design (2026-06-01/
+cloudevents_real_payload_examples_2026-06-01.md), not invented for
+visual effect. One correction and one explicit "don't add this" are
+included, because a diagram with a wrong or redundant box is worse
+than a diagram with three honest ones.
+
+================================================================================
+1. ENTITY RELATIONSHIP — WHAT ALREADY EXISTS IN M1
+================================================================================
+
+Good news: you don't need to invent tables to get a real ER diagram.
+M1 already has three, and they relate to each other properly — you
+just hadn't drawn them as a set yet.
+
+  object_events            — the source of truth. One row per
+                              cleanroom mutation. Append-only, never
+                              updated.
+
+  callback_registrations   — the subscriber registry. One row per
+                              consumer's registered webhook or
+                              Pub/Sub target for a cleanroom+object
+                              type.
+
+  delivery_log             — one row per DELIVERY ATTEMPT: this event,
+                              sent to this registration, with this
+                              outcome.
+
+THE RELATIONSHIP (this is the diagram):
+
+    object_events (1) ----< delivery_log >---- (1) callback_registrations
+         event_id                                    registration_id
+
+delivery_log is the associative table resolving a genuine many-to-many:
+one event can fan out to many registrations (many subscribers care
+about the same cleanroom), and one registration receives many events
+over its lifetime. That many-to-many, plus per-attempt facts
+(attempt_number, http_status, latency_ms, outcome) that don't belong
+on either parent row, is exactly what an associative/fact table is for
+— a textbook pattern, worth naming as such in the review.
+
+Neither FK is DB-enforced (object_events is intentionally append-only
+with no constraints pointing at it — noted directly in its own DDL
+comment), but the logical relationship is real and worth drawing
+that way.
+
+--------------------------------------------------------------------------------
+CORRECTION — idempotency isn't delivery_log's job
+--------------------------------------------------------------------------------
+
+Worth being precise about this before the review, since it's an easy
+thing to misstate live: the table that ENFORCES idempotency is
+object_events itself — idempotency_key has a UNIQUE constraint,
+which is what prevents a duplicate INSERT if a publisher retries.
+delivery_log records attempt HISTORY (did XMI get evt-789, what was
+the outcome) — useful for SLA evidence and debugging, but it's an
+audit trail, not the mechanism preventing duplicates. Two different
+jobs, don't conflate them in the diagram's legend.
+
+--------------------------------------------------------------------------------
+SHOULD WE ADD A DLQ TABLE? — no, and here's the reasoning
+--------------------------------------------------------------------------------
+
+Recommend NOT adding a fourth table for this. Two things already cover
+it, and a third mechanism would be pure duplication:
+
+  1. SQS's own native visibility-timeout + redrive policy is the
+     actual failure-retry/DLQ mechanism in the current scaffold — this
+     was a deliberate choice (see [[project_orinix_observability]]),
+     not an oversight. AWS already solves "retry N times, then park
+     it" — reimplementing that in Postgres duplicates a mechanism SQS
+     already owns and operates correctly.
+
+  2. delivery_log.outcome already has the failure states that matter
+     for visibility — FAILURE_RETRYABLE, FAILURE_TERMINAL, TIMEOUT —
+     so "show me what's failing" is already a query against a table
+     you're already diagramming, not a new one.
+
+  Recovery, separately, is already built: object_events' own
+  cursor-based replay (ReplayService, shipped 2026-07-08) covers
+  reprocessing/backfill beyond what SQS's ~14-day queue retention
+  allows — a second, longer-range recovery path that doesn't need a
+  DLQ table either.
+
+  Ousterhout tie-in worth saying out loud in the review: pulling
+  complexity downward (ch. 8) means using SQS's already-correct DLQ
+  mechanics instead of re-deriving them in Postgres. A fourth table
+  here wouldn't add a real capability — it would just be a second,
+  weaker copy of what SQS and delivery_log already do together.
+
+================================================================================
+2. UML CLASS DIAGRAM — OPTIONAL, RECOMMENDED FOR ONE SPECIFIC THING
+================================================================================
+
+Don't diagram the whole domain model — that's what the ER diagram
+above is for. There IS one genuinely presentation-worthy class
+structure already built: the delivery Strategy pattern. It shows real
+engineering thought (pluggable delivery mechanism, not a hardcoded
+if/else) and it's a small, clean diagram, not a sprawling one.
+
+    <<interface>> DeliveryChannel
+          + deliver(registration, event)
+                 ^
+                 |
+        -----------------
+        |               |
+  WebhookDeliveryChannel   PubSubDeliveryChannel
+  (HMAC-SHA256 signing)    (WIF / static-key auth)
+
+    DeliveryDispatcher
+      - Map<String, DeliveryChannel> channels   (Spring auto-collects
+                                                   by @Component name —
+                                                   no factory class)
+      + dispatch(event) -> fans out to every matching registration
+
+    CallbackDeliveryWorker
+      - consumes SQS dispatch messages, one per registration
+      + deliverToRegistration(registration, event)  (shared method,
+                                                        also used by
+                                                        ReplayService)
+
+    ObjectEventMapper
+      + toCloudEvent(ObjectEventEntity) -> the ONE shared mapping used
+        by both the pull API and webhook delivery (added specifically
+        to fix a real schema-drift bug — see Q8 in the why-and-how
+        folder — worth mentioning live if asked "how do you keep pull
+        and push consistent")
+
+Recommend including this one diagram alongside the ER diagram, not in
+place of it — they answer different questions a reviewer will ask
+("how is the data modeled" vs. "how is delivery extensible").
+
+================================================================================
+3. CNCF SCHEMA — WHAT MORE TO PRESENT
+================================================================================
+
+One addition makes the CNCF section noticeably more rigorous without
+adding new content: separate what's actually PART OF the CloudEvents
+spec from what's Habu's own payload design. Right now the doc shows
+one flat JSON example — a reviewer who knows the spec will want to see
+you know which parts are the standard and which parts you designed.
+
+  CloudEvents CORE attributes (spec-mandated, every event has these):
+    specversion, id, source, type, time, datacontenttype
+
+  CloudEvents EXTENSION attributes (spec explicitly allows custom
+  ones; you're already using two):
+    traceparent   — W3C Trace Context, a well-known CloudEvents
+                    extension, not something Habu invented
+    schemaurl     — points at Habu's own schema registry
+
+  Habu's PAYLOAD design (everything inside `data` — this is where
+  YOUR design decisions live, not the spec's):
+    orgId, cleanroomId, objectType, objectId, objectName, changeType,
+    changedFields, context, performedBy, schemaVersion, idempotencyKey,
+    cursor
+
+This three-way split is a small thing to add but it directly answers
+the kind of question a principal architect asks in a review — "which
+of this is the standard and which is yours" — before they have to ask
+it.
+
+================================================================================
+4. SAMPLE PAYLOAD EXAMPLES
+================================================================================
+
+--------------------------------------------------------------------------------
+Example 1 — DATA_CONNECTION (M1, real, already validated)
+--------------------------------------------------------------------------------
+
+{
+  "specversion": "1.0",
+  "id": "evt-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "source": "urn:habu:cleanroom:cr-abc",
+  "type": "com.habu.cleanroom.data_connection.updated",
+  "time": "2026-02-05T04:18:35.095472Z",
+  "datacontenttype": "application/json",
+  "data": {
+    "orgId": "26ffde05-f377-4115-98a7-158aecd3174a",
+    "cleanroomId": "cr-cleanroom-uuid-here",
+    "objectType": "DATA_CONNECTION",
+    "objectId": "97b6cf60-f8be-48aa-b7a0-ec112c1fb801",
+    "objectName": "cvs_lcr-modified_txns_hq",
+    "changeType": "UPDATED",
+    "changedFields": {
+      "stage": { "from": "CONFIGURATION_COMPLETE", "to": "MAPPING_REQUIRED" }
+    },
+    "performedBy": "sreekar.s@liveramp.com",
+    "schemaVersion": 1
+  }
+}
+
+Good slide example because it's a real production-shaped case (schema
+push triggered a re-mapping requirement) and shows changedFields doing
+real work — a reviewer can see the "why" (XMI needs to pause its
+workflow) directly from the diff.
+
+--------------------------------------------------------------------------------
+Example 2 — Credential change (ILLUSTRATIVE — Section 4 future
+extension only, not a current M1 object_type)
+--------------------------------------------------------------------------------
+
+Flag this clearly as belonging to Section 4, not M1, when you present
+it — Credential lives in primage and isn't in today's object_type
+enum (QUESTION, DATA_CONNECTION, EXPORT_JOB, plus M1's Flow/Dataset
+additions). This example illustrates the chained-relationship
+principle from the why-and-how Q13/Q15 work: one event per row that
+actually changed, with affected resources referenced, not fabricated.
+
+{
+  "specversion": "1.0",
+  "id": "evt-f1a2b3c4-...",
+  "source": "urn:habu:org:26ffde05-...",
+  "type": "com.habu.credential.updated",
+  "time": "2026-07-20T09:14:02.000000Z",
+  "datacontenttype": "application/json",
+  "data": {
+    "orgId": "26ffde05-f377-4115-98a7-158aecd3174a",
+    "objectType": "CREDENTIAL",
+    "objectId": "<OrganizationCredential.ID — the stable bundle ID>",
+    "objectName": "Acme Corp Snowflake Credentials",
+    "changeType": "UPDATED",
+    "changedFields": {
+      "value": { "from": "<redacted>", "to": "<redacted>" }
+    },
+    "context": {
+      "affectedDataConnectionIds": [
+        "<DataImportJob IDs referencing this credential>"
+      ]
+    },
+    "performedBy": "admin@acme.com",
+    "schemaVersion": 1
+  }
+}
+
+Two things worth saying live if this slide comes up: (1) changedFields
+values would be redacted, never the real secret — worth stating
+explicitly since a reviewer WILL ask; (2) affectedDataConnectionIds is
+populated by a reverse lookup that already exists as a callable RPC in
+forebitt today (GetDataConnectionCountByCredential) — so this isn't
+speculative plumbing, the read path forebitt would need is already
+built, only the wiring into a publish step is new.

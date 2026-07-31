@@ -1,0 +1,119 @@
+orinix — M1 Delivery Scope (working draft)
+Date: 2026-07-06
+Status: DRAFT — component list is stable, file/package layout pending Q1
+        (see orinix-why-and-how/2026-07-06_q1_which_language_for_orinix.txt)
+
+------------------------------------------------------------------------
+
+WHAT M1 ACTUALLY HAS TO DO
+
+Two jobs, same shape as pegleg (listens to events, exposes endpoints):
+
+  1. LISTEN  — consume habu-observability-events (SNS -> SQS), write every
+              event durably to object_events. This never depends on who's
+              downstream.
+  2. DELIVER — push-based, BOTH mechanisms in M1 (confirmed by XMI + Josh):
+              (a) XMI registers a callback URL with us, we POST CloudEvents
+                  payloads to it, and
+              (b) XMI subscribes via GCP Pub/Sub and we publish directly.
+              One registration row picks one mechanism; both are live
+              delivery paths in M1, not phased.
+
+------------------------------------------------------------------------
+
+M1 COMPONENTS
+
+  1. object_events table (+ migration)
+     Append-only. This is the module every consumer depends on. Confirmed
+     schema already drafted in 2026-06-22_orinix_design_ask.md — reuse as-is.
+
+  2. callback_registrations table (+ migration)
+     Columns: cleanroom_id, delivery_type, delivery_config (JSONB), status,
+     created_by. delivery_type is an enum: WEBHOOK or PUBSUB — BOTH populated
+     in M1, both live. delivery_config holds whichever fields that mechanism
+     needs: { "callback_url": ... } for WEBHOOK, { "gcp_project_id": ...,
+     "gcp_topic_id": ... } for PUBSUB. One table, one row per registration,
+     the delivery_type value is what tells CallbackDeliveryWorker which
+     DeliveryChannel implementation to invoke for that row — a webhook
+     registration and a Pub/Sub registration coexist without either the
+     ingest path or the registration API branching on which one it's looking at.
+
+  3. SQS consumer
+     Reads sqs-habu-observability-internal, INSERT INTO object_events,
+     delete message only after the write commits (at-least-once, matches
+     the ack-then-mark-sent shape in pegleg's BillingService.sendBillingMetrics
+     — publish/attempt, get an ack, then mark done).
+
+  4. DeliveryChannel interface + BOTH implementations
+     One interface: deliver(registration, event) -> DeliveryResult.
+     WebhookDeliveryChannel: HTTP POST the CloudEvents payload to
+     delivery_config.callback_url, record the response/ack.
+     PubSubDeliveryChannel: publish the CloudEvents payload to
+     delivery_config.gcp_project_id/gcp_topic_id via
+     com.google.cloud.pubsub.v1.Publisher (same SDK pegleg's billing path
+     proves out), record the message ack ID. Both are M1 — this is the SDK
+     integration you asked for, modeled directly on
+     BillingMessagePublisherHelper.
+
+  5. CallbackDeliveryWorker
+     Pulls undelivered rows for registered consumers, looks up delivery_type,
+     calls the matching DeliveryChannel, updates delivery status. Scoped to
+     ONE event type end-to-end for M1 first commit: FLOW_RUN completed
+     (XMI's flow-chaining use case — the one with the sub-5-second latency
+     requirement, so it's also the best proof that the pipe is fast enough) —
+     but exercised through BOTH delivery channels for that one event type,
+     since both are confirmed M1 requirements.
+
+  6. gRPC server: RecordObjectEvent, GetCleanroomEvents
+     Pull-API stays in scope per the original design doc — it's the
+     foundation for the Activity Feed UI later and a fallback for any
+     consumer that doesn't want push.
+
+  7. Callback registration endpoint
+     POST /v1/cleanrooms/{id}/callbacks — XMI registers either a callback_url
+     (WEBHOOK) or a GCP project+topic (PUBSUB) through this, one row either
+     way. Minimal validation in M1 (URL reachability check for WEBHOOK, topic
+     existence/IAM check for PUBSUB). HMAC-SHA256 signing MOVED INTO M1 (was
+     M2) — registration returns a signingSecret (matches the approved
+     Confluence doc's Approach 2 response shape exactly), every webhook
+     delivery carries X-Habu-Signature. Small addition on top of
+     WebhookDeliveryChannel (sign the payload before POST), not a new
+     component. Self-service registration UI stays M2 — that's a UI/product
+     surface, unrelated to whether the wire format is signed.
+
+  8. Terraform: new SNS topic habu-observability-events + SQS queue
+     Additive only. The existing operational hevent topic (drives picanmix/
+     cronos job triggers) is untouched — confirmed already in the June design
+     doc, repeating here because it's a "do not touch" invariant, not a
+     suggestion.
+
+------------------------------------------------------------------------
+
+WHAT'S DELIBERATELY OUT OF M1 FIRST COMMIT
+
+  - delivery_log per-attempt audit table, circuit breaker, DLQ admin UI (V2 hardening)
+  - All object types except FLOW_RUN (DATA_CONNECTION, QUESTION, EXPORT_JOB
+    publishers come once the FLOW_RUN path is proven end-to-end)
+  - Activity Feed UI (V3, separate consumer of GetCleanroomEvents, PM-owned)
+
+------------------------------------------------------------------------
+
+CORRECTED — publisher for FLOW_RUN events
+
+Earlier draft of this doc named cronos as the FLOW_RUN publisher and called
+out a missing SNS path there. That was wrong — cronos is the Habu Scheduler
+Service (Quartz-based cron trigger), it has no Flow/FlowRun domain code at
+all. The actual owner is unhygienix (Go) — proto/flows.proto, models/flows.go,
+db/flows.go, api/server/flows_*.go all live there, and unhygienix already has
+hank in go.mod, same as it does for QUESTION events. No missing publisher
+path, no open dependency here. Full correction:
+orinix-why-and-how/2026-07-06b_correction_cronos_and_dual_delivery.txt
+
+------------------------------------------------------------------------
+
+NEXT (once Q1 language is confirmed)
+
+  Q2 — repo/module layout in the chosen language, mapped to the 8 components above
+  Q3 — DeliveryChannel interface shape in that language (this is the "SDK"
+       you want integrated — modeled on BillingMessagePublisherHelper)
+  Q4 — what "first commit" literally contains vs. what's PR #2

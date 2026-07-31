@@ -1,0 +1,120 @@
+Q1: HOW DOES CAC VERIFY A TOKEN WITHOUT KNOWING IN ADVANCE IF IT'S FROM
+    ORINIX, MCS, OR VMA?
+Q2: IS RATE-LIMITING/CACHING REALLY THE MAIN BENEFIT OF THE SIDECAR, GIVEN
+    THE SECRET IS ALREADY IN VAULT EITHER WAY?
+Follow-up to 2026-07-22_FINAL_orinix_xmi_callback_approach.txt.
+Date: 2026-07-22
+
+
+===========================================================
+Q1: How does CAC's authn-proxy verify a JWT without knowing who sent it?
+===========================================================
+
+Good catch on the real question underneath this — the answer is that
+VERIFICATION doesn't need to know identity in advance at all. It's
+identity-agnostic by design. Only the SEPARATE, later authorization step
+needs to know a specific identity. These are two different questions,
+answered two different ways:
+
+  VERIFICATION ("is this signature genuine?") — identity-agnostic.
+  AUTHORIZATION ("does this specific identity hold this permission?") —
+  identity-specific.
+
+Here's why verification doesn't need to "recognize" MCS/VMA/orinix
+specifically:
+
+  - There is ONE shared signing key pair at Nexus (rotated together, every
+    24h), used to sign EVERY LiveRamp v2 service account's tokens — not a
+    separate key per service. MCS's token and orinix's token are both
+    signed with the SAME private key, at Nexus.
+  - The token itself, as a payload, carries CLAIMS that self-declare who it
+    belongs to (the `{uid, sub, cid}` fields from the earlier plantuml
+    diagram) — e.g. a token might carry `sub: "mcs-service-account-id"` or
+    `sub: "orinix-service-account-id"`. The proxy doesn't need to already
+    know these values ahead of time; it just reads whatever the token says.
+  - The signature's ONLY job is proving those self-declared claims haven't
+    been tampered with — i.e., that this token, with THESE specific claims,
+    really was produced by Nexus and not forged or altered by anyone else.
+  - Verifying that signature is done with ONE cached public key — the SAME
+    key regardless of whose token it is. The proxy runs the exact same
+    check for a token claiming to be MCS, VMA, or orinix. It never needs
+    per-service knowledge to do this step.
+
+Analogy: checking a passport's security hologram doesn't require the border
+agent to already know the specific traveler. The verification method
+(compare against a known, universal security pattern) works identically for
+ANY genuine passport from that issuing authority. It's a completely separate
+question — checked against a guest list, not the hologram — whether THIS
+now-confirmed-genuine traveler is allowed into this specific building today.
+
+CONCRETELY, for MCS -> VMA: VMA forwards MCS's token to CAC. CAC's proxy
+verifies the signature (works the same for anyone's token, doesn't need to
+"know MCS" beforehand) and extracts the claims, which say "this is MCS."
+THEN, and only then, does CAC's own RBAC database get consulted — "does the
+identity that just verified as 'MCS' hold the permission VMA is asking
+about." THAT lookup does require CAC to have a pre-existing, specific record
+for MCS (a granted permission) — which is exactly the Nexus role-granting
+step (section 3d/step 7 in the final approach doc). Verification asks
+nothing in advance; authorization requires a specific answer to already
+exist.
+
+
+===========================================================
+Q2: Is rate-limiting/caching really the sidecar's main benefit? Since the
+    secret's already in Vault regardless, what does the sidecar actually add?
+===========================================================
+
+Fair pushback — and honestly, if rate-limiting/caching were the ONLY
+benefit, you'd be right that it's a weak justification for a whole extra
+container (a few lines of in-memory token caching in orinix's own code
+would mostly solve that too). That's not actually the strongest reason. The
+real reason is security isolation, and it's worth being precise about why
+Vault alone doesn't already give you that.
+
+WHAT VAULT ACTUALLY PROTECTS, AND WHAT IT DOESN'T:
+
+Vault controls WHO/WHAT is ALLOWED to retrieve the secret (access policy)
+and protects it AT REST before retrieval. But once ANY process pulls that
+secret out of Vault and holds it (in memory, in a mounted file), Vault's job
+is done — from that point on, the security of the secret depends entirely
+on the security of whatever process now holds it. If that process has a
+vulnerability, the secret is exposed, regardless of how well Vault protected
+it beforehand.
+
+So the real question isn't "is the secret safe in Vault" (yes, in both
+options) — it's "which process, after retrieval, holds the long-lived
+secret in memory, and how big/exposed is that process."
+
+  OPTION A (sidecar): the ONLY thing that ever holds credentials.json in
+  memory is a small, single-purpose binary that does almost nothing else —
+  no business logic, no parsing of untrusted external input, no HTTP
+  endpoints handling arbitrary requests from the internet or from other
+  services. A tiny attack surface.
+
+  OPTION B (orinix calls Nexus directly): credentials.json has to be
+  mounted into ORINIX'S OWN APPLICATION CONTAINER — the same process that
+  runs your actual business logic, parses whatever untrusted
+  input/events/callbacks orinix normally handles, pulls in your full
+  dependency tree, etc. If ANY vulnerability exists anywhere in that much
+  larger surface (a dependency RCE, an SSRF bug, a debug endpoint left on,
+  a logging bug that echoes environment variables) — that vulnerability now
+  has a path to the long-lived, indefinitely-reusable secret, not just a
+  short-lived token.
+
+That's the actual point of the sidecar split: not caching, but reducing
+BLAST RADIUS. A compromise of orinix's app in option A leaks, at worst, a
+token that expires in minutes and can't mint new tokens on its own. A
+compromise of orinix's app in option B potentially leaks the long-lived
+credential itself — full, standing, reusable access, until someone notices
+and manually rotates it.
+
+Being fully honest with the tradeoff: if orinix's app is small, has a very
+tight/trusted dependency footprint, and the caching argument alone
+resolves your operational concern, option B isn't reckless — it's a real,
+defensible choice some teams could make. But it does give up a genuine
+security property (not just a minor convenience), and it's the one thing
+you can't easily replicate by just adding an in-memory cache yourself. If
+you're optimizing purely for "avoid hammering Nexus," you're right that a
+sidecar is overkill for that alone. If you're weighing "keep the long-lived
+secret as far away from application code as possible," that's where the
+sidecar actually earns its cost.

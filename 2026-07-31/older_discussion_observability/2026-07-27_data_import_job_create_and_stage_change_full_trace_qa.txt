@@ -1,0 +1,665 @@
+DATA IMPORT JOB — FULL CODE TRACE FOR CREATE AND STAGE CHANGE,
+AND WHAT XMI ACTUALLY RECEIVES UNDER THE OUTBOX DESIGN
+Q&A. Everything below verified against real source, file:line given.
+Date: 2026-07-27
+Follow-up to 2026-07-24_best_approach_hank_vs_orinix_vs_cdc_qa.txt
+
+READ THIS FIRST: this document CORRECTS two things I said on 07-24.
+See Q1 (wrong column) and Q7 (my "Phase 1 = CREATED + DELETED" suggestion
+does not work as written). Both corrections are code-proven below.
+
+
+===========================================================
+Q1: Which service owns data import jobs, and is "waiting for file ->
+    mapping required" really a change to the STATUS field?
+===========================================================
+
+Service: FOREBITT. Not unhygienix. The model is
+forebitt/models/data_import_job.go:15.
+
+And no — that transition is NOT the Status field. The model has TWO
+separate columns and they are easy to confuse:
+
+  data_import_job.go:25   Status  varchar(20)
+  data_import_job.go:27   Stage   varchar(100)  default 'STAGE_UNKNOWN'
+
+They are backed by two different enums in
+forebitt/proto/job_domain.pb.go:
+
+  ForebittStatus (line ~34):  STATUS_UNKNOWN, DRAFT, ACTIVE, PAUSED
+  ForebittStage  (line ~94):  STAGE_UNKNOWN, CONSENT_REQUIRED,
+                              MAPPING_REQUIRED(2), WAITING_FOR_FILE(3), ...
+
+So WAITING_FOR_FILE and MAPPING_REQUIRED are STAGE values
+(job_domain.pb.go:95-96). Your example is a change to the `stage` column.
+
+WHY THIS MATTERS — it is not pedantry:
+  1. The registration in orinix would have to list monitored_fields =
+     ["stage"]. If someone writes ["status"] because the UI calls it
+     "status", XMI receives NOTHING and nobody notices for weeks. Silent
+     no-op, worst kind of bug.
+  2. XMI's schema has an eventType called STATUS_CHANGED
+     (xmi_event_schema_pitch.md:135). The obvious reading is "the Status
+     column changed." But the event your example wants is a STAGE change.
+     We must decide and write down: does STATUS_CHANGED mean the DB
+     `status` column, or "any lifecycle field including stage"? Ask XMI
+     now, not after go-live.
+  3. A job going ACTIVE -> PAUSED (real Status change) and a job going
+     WAITING_FOR_FILE -> MAPPING_REQUIRED (Stage change) are different
+     business events. Consumers probably want to subscribe separately.
+
+
+===========================================================
+Q2: Trace the CREATE path end to end. Real files, real lines.
+===========================================================
+
+THE APPLICATION CHAIN (before GORM is even involved):
+
+  api/server/job_service.go:1082  CreateImportJob() — gRPC entry point
+  api/server/job_service.go:1136  jobModel := NewImportJobFromProto(...)
+  api/server/job_service.go:1138  jobModel.Status = "ACTIVE"
+  api/server/job_service.go:1144-1161
+                                  work out the starting Stage
+                                  (e.g. WAITING_FOR_FILE)
+  api/server/job_service.go:1164  db.InsertJob(ctx, s.DB, &jobModel)
+
+  db/job.go:146   InsertJob()
+  db/job.go:147     tx := hdb.BeginTxDB(ctx, db, &sql.TxOptions{})
+                    ^^^ FOREBITT OPENS ITS OWN TRANSACTION HERE.
+                        (hdb.BeginTxDB is hank/db/audit.go:221)
+  db/job.go:148     InsertJobInTransaction(tx, job)
+  db/job.go:163       tx.Create(&job)      <-- GORM starts here
+  db/job.go:153     tx.Commit()            <-- THE REAL COMMIT
+
+Hold on to those two facts: the transaction is opened at job.go:147 by
+forebitt, and it is committed at job.go:153 by forebitt. GORM does not
+own it.
+
+
+THE GORM CHAIN, when tx.Create(&job) runs at db/job.go:163.
+Registered order is fixed in gorm@v1.9.11/callback_create.go:10-18.
+
+ #  callback name                  where the code lives        what happens
+ -- ------------------------------ --------------------------- ------------
+ 1  gorm:begin_transaction         callback_create.go:10       NO-OP. See Q3.
+ 2  gorm:before_create             callback_create.go:11       calls the
+                                                               model's
+                                                               BeforeCreate
+ 2a   -> UUID.BeforeCreate         forebitt/models/audit.go:18 generates the
+                                                               UUID:
+                                                               SetColumn("ID")
+ 3  gorm:audit_before_create       hank/db/service.go:86       hank's own,
+                                                               inserted right
+                                                               after #2
+ 3a   -> Audit.BeforeCreateHook    hank/db/audit.go:125        stamps
+                                                               audit_created_by
+                                                               / _at from the
+                                                               JWT claims
+ 4  gorm:save_before_associations  callback_create.go:12       nothing here
+ 5  gorm:update_time_stamp         callback_create.go:13       CreatedAt,
+                                                               UpdatedAt
+ 6  gorm:create                    callback_create.go:14       THE ACTUAL
+                                                               INSERT SQL
+ 7  gorm:force_reload_after_create callback_create.go:15       -
+ 8  gorm:save_after_associations   callback_create.go:16       -
+ 9  gorm:after_create              callback_create.go:17       calls the
+                                                               model's
+                                                               AfterCreate
+ 9a   -> Audit.AfterCreate         hank/db/audit.go:150        builds AuditLog,
+                                                               WRITES A DATADOG
+                                                               LOG LINE, and
+                                                               NOTHING ELSE
+10  gorm:commit_or_rollback        callback_create.go:18       NO-OP. See Q3.
+
+  ... GORM is now finished and returns to db/job.go:163 ...
+
+11  db/job.go:153  tx.Commit()   <-- THE ROW IS ACTUALLY DURABLE ONLY NOW
+
+
+THE ONE-LINE VERSION:
+  the audit hook (step 9a) runs BEFORE the real commit (step 11).
+  That gap is the entire problem.
+
+SIDE NOTE, because it explains a piece of hank that looks odd:
+Why is hank's hook called "BeforeCreateHook" instead of "BeforeCreate"?
+Because forebitt's UUID struct already defines BeforeCreate
+(models/audit.go:18), and DataImportJob embeds BOTH UUID and hdb.Audit
+(data_import_job.go:16-17). In Go, if two embedded structs define the
+same method name, the method is ambiguous and gets promoted to NEITHER
+— so GORM would have called neither one. Hank sidesteps this by using a
+non-colliding name and registering its own callback by hand
+(hank/db/service.go:83-91).
+
+
+===========================================================
+Q3: Why do you keep saying steps 1 and 10 are "no-ops"? Show me.
+===========================================================
+
+This is the single most important mechanical fact in the whole design,
+so here is the actual source.
+
+GORM's begin, gorm@v1.9.11/scope.go:403:
+
+    func (scope *Scope) Begin() *Scope {
+        if db, ok := scope.SQLDB().(sqlDb); ok {        // <-- line 404
+            if tx, err := db.Begin(); scope.Err(err) == nil {
+                scope.db.db = interface{}(tx).(SQLCommon)
+                scope.InstanceSet("gorm:started_transaction", true)  // 407
+            }
+        }
+        return scope
+    }
+
+`sqlDb` means "something that has a Begin() method". A *sql.DB has one.
+A *sql.Tx does NOT. Forebitt already handed GORM a *sql.Tx (opened at
+db/job.go:147), so the check on line 404 FAILS, and line 407 never runs.
+The flag `gorm:started_transaction` is never set.
+
+GORM's commit, gorm@v1.9.11/scope.go:414:
+
+    func (scope *Scope) CommitOrRollback() *Scope {
+        if _, ok := scope.InstanceGet("gorm:started_transaction"); ok {  // 415
+            ... commit or rollback ...
+        }
+        return scope
+    }
+
+Line 415 checks for the flag that was never set. So it returns
+immediately. It commits nothing. Silently.
+
+THE CONSEQUENCE, stated bluntly:
+On 07-24 the plan said "make emission after-commit, non-negotiable."
+The natural way to do that is to register a publish callback AFTER
+gorm:commit_or_rollback_transaction. On this code path that callback
+would fire at step 10 — which commits nothing — while forebitt's real
+transaction is still wide open and can still roll back at step 11.
+
+It would look correct in code review, pass a single-write unit test, and
+be wrong in production. That is worse than not doing it.
+
+
+A CONCRETE PHANTOM, in real code you can point at.
+Look at the v2 create, db/job_v2.go:13-36:
+
+    tx := hdb.BeginTxDB(ctx, db, &sql.TxOptions{})       // line 19
+    err := tx.Create(&job).Error                         // line 20
+    if err != nil { tx.Rollback(); return err }
+    err = SetOrganizationJobParametersInTransaction(...)  // line 25
+    if err != nil { tx.Rollback(); return err }          // line 27-30
+    err = tx.Commit().Error                              // line 31
+
+Sequence if line 25 fails:
+    line 20  INSERT the job         -> AfterCreate fires
+                                    -> (if wired) XMI is told "job created"
+    line 25  parameters write FAILS
+    line 28  tx.Rollback()          -> the job row never existed
+    XMI now holds an event for a job that is not in the database.
+    If XMI calls back to fetch it, it gets a 404.
+    You cannot un-send that event.
+
+That is not theoretical. That is lines 19-31 of a file in the repo.
+
+
+===========================================================
+Q4: Now trace the STAGE CHANGE (WAITING_FOR_FILE -> MAPPING_REQUIRED).
+===========================================================
+
+THE APPLICATION CHAIN:
+
+  api/server/data_in_local_file.go:611
+        db.UpdateJobStageInTransaction(s.DB, in.JobID,
+                                       proto.MAPPING_REQUIRED.String())
+
+  (This is the real trigger: the user has uploaded their file, so the
+   job stops waiting for a file and now needs field mapping.)
+
+  Careful — despite the name "...InTransaction", it is passed s.DB,
+  the raw database handle, NOT a transaction. Naming lie. It matters,
+  see below.
+
+  db/job.go:242  UpdateJobStageInTransaction(tx, jobID, stage)
+  db/job.go:243    job := models.DataImportJob{Stage: stage}
+  db/job.go:244    job.ID = jobID
+  db/job.go:245    tx.Model(&models.DataImportJob{}).Updates(job)
+
+Note what is in that struct: ONLY Stage and ID. Every other field
+(Name, Status, OrganizationID, ...) is the zero value.
+
+
+THE GORM UPDATE CHAIN, order fixed in callback_update.go:12-20:
+
+ #  callback name                    where                    what happens
+ -- -------------------------------- ------------------------ ------------
+ 1  gorm:assign_updating_attributes  callback_update.go:12    builds the SET
+                                                              list. IMPORTANT,
+                                                              see Q5.
+ 2  gorm:begin_transaction           callback_update.go:13    THIS TIME IT
+                                                              REALLY BEGINS
+                                                              (s.DB is a real
+                                                              *sql.DB)
+ 3  gorm:before_update               callback_update.go:14    -
+ 3a gorm:audit_before_update         hank/db/service.go:90    hank's, right
+                                                              after #3
+ 3b   -> Audit.BeforeUpdateHook      hank/db/audit.go:166     stamps
+                                                              audit_updated_by
+                                                              / _at
+ 4  gorm:save_before_associations    callback_update.go:15    -
+ 5  gorm:update_time_stamp           callback_update.go:16    UpdatedAt
+ 6  gorm:update                      callback_update.go:17    THE ACTUAL
+                                                              UPDATE SQL
+ 7  gorm:save_after_associations     callback_update.go:18    -
+ 8  gorm:after_update                callback_update.go:19    calls the
+                                                              model's
+                                                              AfterUpdate
+ 8a   -> Audit.AfterUpdate           hank/db/audit.go:183     builds AuditLog,
+                                                              WRITES A DATADOG
+                                                              LOG LINE, and
+                                                              NOTHING ELSE
+ 9  gorm:commit_or_rollback          callback_update.go:20    REAL COMMIT HERE
+
+So on THIS path GORM does own the transaction, and step 9 genuinely
+commits. Same library, same hook, opposite transaction behaviour,
+decided entirely by whether the caller passed s.DB or a tx.
+
+That inconsistency is exactly why "just publish after commit" is not a
+one-line rule you can apply library-wide. Some call sites give you a
+real commit at step 9; others (Q2/Q3) give you a no-op. The library
+cannot tell which without inspecting the handle.
+
+
+===========================================================
+Q5: At step 8a, what does the audit hook actually SEE? (the crux)
+===========================================================
+
+To answer this you need one piece of GORM internals,
+gorm@v1.9.11/scope.go:906-932, `updatedAttrsWithValues`:
+
+    for key, value := range convertInterfaceToMap(value, true, scope.db) {
+        if field, ok := scope.FieldByName(key); ok && ... {
+            ...
+            err := field.Set(value)          // <-- line 919
+            ...
+        }
+    }
+
+Line 919 WRITES the incoming values onto the scope's own object. So
+`scope.Value`, which started life as the empty `&models.DataImportJob{}`
+from db/job.go:245, gets ID and Stage filled in — and nothing else.
+
+By the time hank's AfterUpdate runs (audit.go:183), scope.Value is:
+
+    DataImportJob{
+        ID:    "job-7f3a...",           <- set, because job.go:244 set it
+        Stage: "MAPPING_REQUIRED",      <- the NEW value
+        Name:  "",                      <- zero
+        Status:"",                      <- zero
+        ... every other field zero ...
+    }
+
+Now run hank's own code against that. `getObjectDetails`
+(hank/db/audit.go:241-267) JSON-marshals scope.Value and reads "ID" and
+"Name". Result:
+
+    ObjectID   = "job-7f3a..."     OK
+    ObjectName = ""                EMPTY
+    the OLD stage                  NOT PRESENT ANYWHERE
+    which fields changed           only inferable as "the non-zero ones",
+                                   which is wrong for any field whose new
+                                   value is legitimately zero/false/""
+
+Three separate gaps, all in one hook call:
+
+  (a) NO "from". Confirms what we already believed. GORM never loads the
+      old row for an Updates() call, so WAITING_FOR_FILE is simply not
+      available at step 8a. It is still in the database at that instant
+      — nobody read it.
+  (b) NO objectName. XMI's schema (xmi_event_schema_pitch.md:138)
+      requires objectName, "name of the object at the time of the
+      event". On a partial update we do not have it. This was NOT in the
+      07-24 analysis.
+  (c) "Which fields changed" is guesswork. Setting IsInvisible=false or
+      ErrorMessage="" is indistinguishable from "not part of this
+      update", because both look like the zero value.
+
+
+===========================================================
+Q6: What about DELETE? (this one is worse, and it changes the plan)
+===========================================================
+
+db/job.go:183, SoftDeleteJob:
+
+    tx := hdb.BeginTxDB(ctx, db, &sql.TxOptions{})     // line 184
+    err := tx.Scopes(IDScope(id)).Delete(&models.DataImportJob{})  // 185
+    ...
+    return tx.Commit().Error                            // line 190
+
+And IDScope, db/scopes.go:16-20:
+
+    func IDScope(ID string) func(db *gorm.DB) *gorm.DB {
+        return func(db *gorm.DB) *gorm.DB {
+            return db.Where("id = ?", ID)          // <-- line 18
+        }
+    }
+
+The id goes into a WHERE CLAUSE. It never touches scope.Value.
+Unlike the update path, there is no `field.Set` to fill it in — WHERE
+conditions are SQL, not struct fields.
+
+So when Audit.AfterDelete runs (hank/db/audit.go:199), scope.Value is
+still the completely empty `&models.DataImportJob{}`, and
+getObjectDetails returns:
+
+    ObjectID   = ""      <-- EMPTY
+    ObjectName = ""      <-- EMPTY
+
+MEANING: today's delete audit log cannot say WHICH job was deleted.
+(And note this path also uses hdb.BeginTxDB at line 184, so it has the
+Q3 no-op commit problem too.)
+
+CORRECTION TO THE 07-24 PLAN: I proposed "Phase 1 = ship CREATED and
+DELETED, hold UPDATED back until we have from->to." That is wrong.
+DELETED is in worse shape than UPDATED — an update at least gives you
+the object id; a delete gives you nothing to identify the row.
+
+Revised: Phase 1 can ship CREATED only. DELETED needs the same
+pre-image work as UPDATED. Which turns out to be convenient, see Q9.
+
+
+===========================================================
+Q7: SUMMARY — what today's hook can and cannot tell you
+===========================================================
+
+  path            objectId  objectName  old value  new value  real commit
+                                                              at gorm step?
+  --------------- --------- ----------- ---------- ---------- ------------
+  CREATE          yes       yes         n/a        yes        NO (job.go:153)
+  (job.go:146)              (full row)  (nothing
+                                        existed)
+
+  UPDATE stage    yes       NO          NO         yes        yes
+  (job.go:242 via                                             (callback_
+   data_in_local_                                             update.go:20)
+   file.go:611)
+
+  DELETE          NO        NO          NO         n/a        NO (job.go:190)
+  (job.go:183)
+
+CREATE is the only row that is nearly complete, because on an insert the
+whole object genuinely is in scope.Value. That is why CREATED is the one
+event type shippable with almost no new capture work.
+
+
+===========================================================
+Q8: EXAMPLE 2 — creating a data import job. What happens under the new
+    design, and what does XMI receive?
+===========================================================
+
+Say Adidas creates a data connection for a loyalty CSV.
+
+WHAT CHANGES IN CODE — one new step, inserted at step 9a of the Q2 table
+(inside Audit.AfterCreate, hank/db/audit.go:150). Instead of only
+writing a Datadog line, it also INSERTs one row into an outbox table in
+the SAME transaction it is already sitting in:
+
+  new table, in forebitt's own Postgres:
+
+    CREATE TABLE event_outbox (
+      id             uuid PRIMARY KEY,
+      object_type    varchar,   -- 'DataImportJob'
+      object_id      varchar,
+      object_name    varchar,
+      action         varchar,   -- CREATE / UPDATE / DELETE
+      changed_fields jsonb,
+      actor_email    varchar,
+      org_id         varchar,
+      occurred_at    timestamptz,
+      published_at   timestamptz NULL   -- NULL = not yet sent
+    );
+
+SO THE FULL SEQUENCE BECOMES:
+
+  db/job.go:147   forebitt opens the transaction
+  ...
+  step 6          INSERT INTO data_import_jobs (...)      <- business row
+  step 9a         INSERT INTO event_outbox (...)          <- event row
+                  ^^ both inside the SAME transaction
+  db/job.go:153   tx.Commit()   <- BOTH become real, together
+
+  Later (milliseconds): a small relay goroutine inside forebitt polls
+  `SELECT * FROM event_outbox WHERE published_at IS NULL`, publishes to
+  SNS habu-observability-events, sets published_at.
+
+  If db/job.go:153 had rolled back instead, the outbox row would have
+  vanished with the job row. No event. No phantom. Not "unlikely" —
+  impossible, because Postgres cannot commit half a transaction.
+
+THE OUTBOX ROW WRITTEN AT STEP 9a:
+
+  object_type    "DataImportJob"
+  object_id      "dij-7f3a1b90-..."         (generated at step 2a)
+  object_name    "Adidas Q3 Loyalty CSV"    (available — full row on create)
+  action         "CREATE"
+  actor_email    "sarah@adidas.com"         (from claims, audit.go:151-155)
+  org_id         "org-adidas-8821"
+  occurred_at    2026-07-27T14:02:11Z
+  changed_fields {
+                   "name":   {"old": null, "new": "Adidas Q3 Loyalty CSV"},
+                   "status": {"old": null, "new": "ACTIVE"},
+                   "stage":  {"old": null, "new": "WAITING_FOR_FILE"},
+                   "category": {"old": null, "new": "FIRST_PARTY_DATA"}
+                 }
+
+Note "old": null everywhere. On a create there IS no previous value, and
+saying so explicitly is more useful to XMI than omitting the key.
+Only allowlisted columns appear here — see Q10.
+
+WHAT ORINIX SENDS TO XMI:
+
+  {
+    "eventId":     "evt-4c81e0a2-...",        <- the outbox row id,
+                                                 so XMI can dedupe
+    "eventType":   "CREATED",
+    "objectType":  "DATA_CONNECTION",
+    "objectId":    "dij-7f3a1b90-...",
+    "objectName":  "Adidas Q3 Loyalty CSV",
+    "cleanroomId": "cr-adidas-media-mix",
+    "orgId":       "org-adidas-8821",
+    "performedBy": "sarah@adidas.com",
+    "eventTime":   "2026-07-27T14:02:11Z",
+    "changedFields": {
+      "name":   {"old": null, "new": "Adidas Q3 Loyalty CSV"},
+      "status": {"old": null, "new": "ACTIVE"},
+      "stage":  {"old": null, "new": "WAITING_FOR_FILE"}
+    }
+  }
+
+Note orinix does the last bit of translation: forebitt's internal
+"DataImportJob" becomes XMI's contract name "DATA_CONNECTION", and
+orinix drops any field not in that registration's monitored_fields. The
+outbox stays internal vocabulary; orinix owns the external contract.
+
+OPEN ITEM, flagging rather than guessing: cleanroomId is NOT on the
+DataImportJob model (data_import_job.go:15-39 — there is OrganizationID
+but no CleanRoomID). XMI's schema requires it, and orinix's dispatcher
+looks up registrations BY cleanroom_id. A data import job is org-level
+and may be used in several cleanrooms. So we must decide: does orinix
+fan out to every cleanroom the connection is linked to, or does XMI
+register at org level for this object type? This needs answering before
+build — it is a design hole, not an implementation detail.
+
+
+===========================================================
+Q9: EXAMPLE 1 — the stage change. Same walk-through.
+===========================================================
+
+WHAT CHANGES IN CODE — one read added, at step 3b of the Q4 table
+(inside Audit.BeforeUpdateHook, hank/db/audit.go:166):
+
+    SELECT <allowlisted columns> FROM data_import_jobs WHERE id = ?
+
+then stash it on the scope (scope.InstanceSet("hank:pre_image", row)),
+and at step 8a diff it against the new values.
+
+WHY THIS READ IS SAFE HERE — and this is the nice part. The read happens
+at step 3b, which is AFTER gorm:begin_transaction (step 2) and BEFORE
+gorm:update (step 6). So it is inside the same transaction that is about
+to do the UPDATE. Nobody else can slip a write in between and corrupt
+your "from" — the usual race that makes read-then-diff dangerous simply
+does not apply at this position in the chain. We get the correct old
+value for the same structural reason the outbox cannot produce phantoms.
+
+SEQUENCE:
+
+  step 2   BEGIN
+  step 3b  SELECT ... -> stage = "WAITING_FOR_FILE"     <- the "from"
+  step 6   UPDATE data_import_jobs SET stage='MAPPING_REQUIRED', ...
+  step 8a  diff pre-image vs new -> INSERT INTO event_outbox (...)
+  step 9   COMMIT                <- update + event, together
+  later    relay publishes to SNS
+
+THE OUTBOX ROW:
+
+  object_type    "DataImportJob"
+  object_id      "dij-7f3a1b90-..."
+  object_name    "Adidas Q3 Loyalty CSV"   <- FROM THE PRE-IMAGE.
+                                              Fixes gap (b) from Q5.
+  action         "UPDATE"
+  actor_email    "sarah@adidas.com"
+  occurred_at    2026-07-27T16:45:03Z
+  changed_fields {
+                   "stage": {"old": "WAITING_FOR_FILE",
+                             "new": "MAPPING_REQUIRED"}
+                 }
+
+Only `stage` appears, because only `stage` actually differs between the
+pre-image and the new values. This also fixes gap (c) from Q5: we are
+now comparing real old vs real new, so setting a field to false or ""
+is correctly detected as a change, and a field that was already
+MAPPING_REQUIRED and got re-written produces no event at all.
+
+WHAT ORINIX SENDS TO XMI:
+
+  {
+    "eventId":     "evt-9d20f5c4-...",
+    "eventType":   "STATUS_CHANGED",
+    "objectType":  "DATA_CONNECTION",
+    "objectId":    "dij-7f3a1b90-...",
+    "objectName":  "Adidas Q3 Loyalty CSV",
+    "cleanroomId": "cr-adidas-media-mix",
+    "orgId":       "org-adidas-8821",
+    "performedBy": "sarah@adidas.com",
+    "eventTime":   "2026-07-27T16:45:03Z",
+    "changedFields": {
+      "stage": {"old": "WAITING_FOR_FILE", "new": "MAPPING_REQUIRED"}
+    }
+  }
+
+This matches XMI's Scenario B shape exactly
+(xmi_event_schema_pitch.md:192-198: {"old": ..., "new": ...}).
+
+WHAT XMI DOES WITH IT: "Adidas uploaded their file; the connection is
+now waiting on a human to map fields." XMI can nudge the owner, or hold
+back a pipeline that was about to run against an unmapped connection.
+Without `old`, XMI only knows "it is MAPPING_REQUIRED now" and cannot
+tell a fresh arrival from a repeated status ping — which is the whole
+reason they asked for from->to.
+
+
+===========================================================
+Q10: One pre-image read fixes three problems at once
+===========================================================
+
+This is the argument I would lead with in the design review, because it
+turns "an extra SELECT, ugh" into obviously good value.
+
+  problem (Q5a) no "from" on updates      -> pre-image gives it
+  problem (Q5b) no objectName on updates  -> pre-image gives it
+  problem (Q6)  no objectId AND no
+                objectName on deletes     -> pre-image gives BOTH
+
+For deletes the pre-image is not an enhancement, it is the ONLY way. The
+row is gone after step 6; if you did not read it before, the information
+does not exist anywhere. So a BeforeDelete pre-image read is mandatory
+if we want usable DELETED events at all — which is why Q6 corrects the
+07-24 phasing.
+
+And it is one mechanism, registered once in hank's applyEmbeddedHooks
+(hank/db/service.go:83-91), covering update and delete alike.
+
+COST, honestly: one extra SELECT per audited UPDATE and DELETE, on
+allowlisted tables only. Reads on a primary key, inside a transaction
+that is already open. This is cheap. If a specific hot table ever proves
+otherwise, that table can move to a Postgres trigger later — writing to
+the SAME event_outbox, so nothing downstream changes. The outbox is the
+stable interface; how a row gets into it is swappable (trigger today,
+Debezium in three years).
+
+THE COLUMN ALLOWLIST — why capture cannot be driven by monitored_fields:
+monitored_fields lives in orinix's database, in callback_registrations,
+and changes whenever a consumer edits their subscription. Forebitt's
+hook cannot read orinix's table, and we are certainly not shipping a
+forebitt deploy every time XMI adds a field. So:
+
+  CAPTURE  a fixed allowlist per table, in forebitt's code, reviewed
+           like any code. This is also the PII gate — a column not on
+           the list never enters SNS at all.
+  FILTER   orinix drops fields not in monitored_fields at dispatch time.
+           It already reads that table to find registrations.
+
+Capture broad, filter narrow.
+
+
+===========================================================
+Q11: Revised phasing (supersedes the 07-24 version)
+===========================================================
+
+PHASE 0 — outbox + relay, no behaviour change visible to anyone.
+  - event_outbox table in forebitt.
+  - Audit.AfterCreate/AfterUpdate/AfterDelete (hank/db/audit.go:150,
+    183, 199) additionally INSERT one outbox row. Keeps the existing
+    Datadog logging untouched.
+  - relay goroutine in hank, started by the host, polls its own outbox
+    and publishes to the existing SNS topic.
+  - Per-model opt-in flag, or every hdb.Audit-embedding model in all ~15
+    services starts emitting on day one.
+  Why first: this is what makes everything after it phantom-proof, and
+  it neutralises the Q3 problem completely — we never need after-commit,
+  because we never send anything from inside a transaction.
+
+PHASE 1 — CREATED events for DataImportJob, end to end.
+  - Real, consumable events. Proves outbox -> relay -> SNS -> SQS ->
+    orinix -> XMI webhook, all of it.
+  - CREATED only. Not DELETED (see Q6).
+
+PHASE 2 — pre-image read; UPDATED and DELETED go live.
+  - BeforeUpdateHook / BeforeDelete: SELECT allowlisted columns, stash
+    on scope.
+  - AfterUpdate / AfterDelete: diff, write changed_fields.
+  - Unblocks the stage-change example, and makes DELETED usable.
+
+RESERVE — Debezium. Unchanged from 07-24, and now a clean swap behind
+  the outbox rather than a rewrite.
+
+Note what did NOT change between phases: the outbox table, the relay,
+the SNS topic, orinix. Phase 2 adds a column's worth of data to rows
+that are already flowing. There is no cutover, no double-emit window,
+no per-table kill switch. That was the flaw in the 07-24 phasing, where
+Phase 2 (DB trigger) would have replaced Phase 1 (hank hook) and both
+would have been live on the same table at once.
+
+
+===========================================================
+Q12: The three things to settle with other teams before building
+===========================================================
+
+  1. XMI: does STATUS_CHANGED mean the `status` column, or any
+     lifecycle field including `stage`? Our headline example is a STAGE
+     change. (Q1)
+  2. XMI + orinix: cleanroomId is not on DataImportJob (org-level
+     object), but the schema requires it and the dispatcher queries by
+     it. Fan out per linked cleanroom, or register at org level? (Q8)
+  3. Forebitt owners: agree the column allowlist for data_import_jobs.
+     Starting proposal — name, status, stage, category,
+     import_data_source_id, error_code. Explicitly excluded:
+     error_message (free text, 10k chars, may contain customer data),
+     error_params. (Q10)

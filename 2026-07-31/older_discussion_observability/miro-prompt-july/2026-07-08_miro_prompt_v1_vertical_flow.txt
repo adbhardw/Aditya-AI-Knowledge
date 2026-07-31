@@ -1,0 +1,185 @@
+Miro Prompt V1 — Vertical Flow (single spine, three delivery branches)
+Date: 2026-07-08
+Note: built without reading the PDF, styled after the existing miro_prompt_full_diagram
+and miro_prompts_tlm_final files, but every box text is deliberately SHORT (3-6 words
+per line, no embedded code blocks) so nothing collapses/truncates in Miro. Full
+schemas/proto live in the Confluence doc, referenced by name only, not pasted in-box.
+orinix is the ONLY consumer — no pegleg option, that path is gone.
+
+---
+
+```
+Create an enterprise architecture flowchart titled:
+"orinix — Cleanroom Observability: Ingest, Store, Deliver"
+Subtitle: "One consumer, one store, three delivery paths — Pull, Webhook, Pub/Sub"
+
+LAYOUT: Strictly TOP-TO-BOTTOM vertical flowchart. Single center spine down to
+the delivery split. Keep EVERY box body to 3-6 short lines max — no paragraphs,
+no embedded JSON/proto blocks. Rounded corners, drop shadows, monospace only for
+short field names, never for full payloads.
+
+======================================================================
+SECTION A — PRODUCERS (full width, three boxes horizontal)
+======================================================================
+
+  Box A1 (blue): "unhygienix"
+    QUESTION, FLOW, FLOW_RUN
+    Publishes on mutation
+
+  Box A2 (teal): "forebitt"
+    DATA_CONNECTION
+    Publishes on mutation
+
+  Box A3 (orange): "picanmix"
+    EXPORT_JOB
+    Publishes on mutation
+
+  Side sticky (gray, short): "No service calls another. SNS only."
+
+All three → one arrow down: "SNS publish, post-commit"
+
+======================================================================
+SECTION B — INGEST (full width)
+======================================================================
+
+  Box B1 (orange): "SNS — habu-observability-events"
+    Fan-out topic
+
+  Arrow down: "SNS → SQS"
+
+  Box B2 (purple, large): "orinix — SQS Consumer"
+    Reads sqs-habu-observability-internal
+    Idempotent insert (event id = key)
+    Plain method call, not gRPC (same process)
+
+  Side sticky (teal): "DEEP MODULE — simple insert, hides all queue wiring"
+
+  Arrow down: "INSERT"
+
+  Box B3 (purple): "object_events (orinix Postgres)"
+    Append-only, no update/delete
+    cursor_position — global sequence
+    changed_fields { from, to } — uniform shape
+
+  Side sticky (gray): "Cursor is global, query is cleanroom-scoped"
+
+======================================================================
+SECTION C — FAN-OUT (full width)
+======================================================================
+
+  Box C1 (purple): "DeliveryDispatcher"
+    One event → N registrations
+    Sends one message per registration
+    Per-consumer SQS delivery queue
+
+  Side sticky (teal): "OBSERVER PATTERN — fan-out kept separate from dispatch"
+
+────────────────────────────────────────────────────────────────────
+SPLIT — three delivery branches, columns side by side
+Label: "Pull (cursor)  |  Webhook (push)  |  Pub/Sub (push)"
+────────────────────────────────────────────────────────────────────
+
+======================================================================
+SECTION D-LEFT — PULL (green column)
+======================================================================
+
+  Box D-L1 (green): "external-api-server"
+    GET /v1/cleanrooms/{id}/events
+    since_cursor, limit
+    @GrpcClient("orinix")
+
+  Box D-L2 (green): "orinix.GetCleanroomEvents"
+    Returns events[] + next_cursor
+    Same RPC for UI + XMI
+
+  Box D-L3 (green): "XMI polls on schedule"
+    No inbound endpoint needed
+    30-60s latency, simplest path
+
+======================================================================
+SECTION D-MID — WEBHOOK (orange column)
+======================================================================
+
+  Box D-M1 (orange): "Registration — one time"
+    POST /v1/cleanrooms/{id}/callbacks
+    delivery_type = WEBHOOK
+    Returns signing_secret (once)
+
+  Box D-M2 (orange): "CallbackDeliveryWorker"
+    Reads per-consumer delivery queue
+    Strategy pattern → WebhookDeliveryChannel
+
+  Box D-M3 (orange): "HTTP POST to XMI"
+    HMAC-SHA256 signed (symmetric)
+    X-Habu-Signature, X-Habu-Event-Id
+    application/cloudevents+json
+
+  Side sticky (red): "Symmetric secret — same sensitivity both sides"
+
+======================================================================
+SECTION D-RIGHT — PUB/SUB (purple column)
+======================================================================
+
+  Box D-R1 (purple): "Registration — one time"
+    delivery_type = PUBSUB
+    gcp_project_id + gcp_topic_id
+
+  Box D-R2 (purple): "CallbackDeliveryWorker"
+    Same worker, same queue
+    Strategy pattern → PubSubDeliveryChannel
+
+  Box D-R3 (purple): "Publish to XMI's GCP topic"
+    com.google.cloud.pubsub.v1.Publisher
+    Auth: WIF or static key (open decision)
+    Same SDK proven by pegleg billing
+
+  Side sticky (teal): "STRATEGY PATTERN — one interface, two channels, zero
+    branching in the worker or the registration API"
+
+======================================================================
+SECTION E — IDEMPOTENCY, full width, applies to ALL three branches
+======================================================================
+
+  Box E1 (yellow): "Idempotency — one id, everywhere"
+    Producer mints event id once
+    Same id: SNS → SQS → object_events → header/attribute
+    orinix dedupes on insert (unique constraint)
+    XMI MUST dedupe too — delivery is at-least-once
+
+  Side sticky (gray): "Not exactly-once. Same event id twice = same event."
+
+======================================================================
+SECTION F — FAILURE PATH, full width (webhook + pubsub only)
+======================================================================
+
+  Box F1 (red): "Retry"
+    5 attempts, exponential backoff + jitter
+    SQS native — no Postgres attempt counter
+
+  Box F2 (red): "DLQ on exhaustion"
+    CloudWatch alarm → Habu on-call
+    XMI never paged directly (M1)
+
+  Box F3 (red): "Replay"
+    On-call confirms root cause fixed
+    Redrive DLQ message to source queue
+    Manual for M1, native AWS action
+
+======================================================================
+SECTION G — WHY THIS DESIGN (full width, bottom, short callouts only)
+======================================================================
+
+  Box G1 (dark blue): "Ousterhout principles applied"
+    Deep Modules — SQS consumer hides everything behind one insert
+    Information Hiding — delivery_type hides "how" from ingest
+    Design It Twice — Java vs Go vs Hybrid, Strategy vs 4 alternatives
+    Define Errors Out of Existence — cursor + idempotency key built in
+    Pull Complexity Downward — one worker, one dispatch point
+
+COLOR SPEC:
+  Blue = unhygienix, Teal = forebitt, Orange = picanmix / webhook branch,
+  Purple = orinix / pubsub branch, Green = pull branch, Yellow = idempotency,
+  Red = failure/DLQ/replay, Dark blue = principles summary.
+Keep every box to 3-6 short lines. No inline JSON/proto — name the artifact,
+point to the Confluence doc for full schema.
+```

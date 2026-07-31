@@ -1,0 +1,395 @@
+DATA CONNECTION (DATA IMPORT JOB) — WORKED EXAMPLES FOR CREATE, UPDATE
+AND DELETE UNDER THE OUTBOX DESIGN
+Q&A. All code references verified, file:line given.
+Date: 2026-07-27
+Follow-up to 2026-07-27_data_import_job_create_and_stage_change_full_trace_qa.txt
+
+Running example throughout: Adidas connects an S3 bucket of loyalty data.
+  org        org-adidas-8821
+  user       sarah@adidas.com
+  connection "Adidas Q3 Loyalty CSV"
+  5 parameters: bucket, prefix, region, file_pattern, delimiter
+
+BIGGEST FINDING, up front: one user action does NOT produce one event.
+Creating this single data connection fires the audit hook SEVEN times.
+Naively wired, XMI would receive seven events for one click. Part 1
+explains why; Parts 2-4 work it through for each operation.
+
+
+===========================================================
+PART 1 — THE GRANULARITY PROBLEM (read this first)
+===========================================================
+
+The audit hook is a GORM callback. GORM callbacks fire PER TABLE WRITE.
+XMI wants events PER BUSINESS OBJECT. Those are not the same thing.
+
+Which forebitt models embed hdb.Audit — i.e. which ones fire the hook:
+
+  models/data_import_job.go:17                 DataImportJob
+  models/organization_job_parameter.go:12      OrganizationJobParameter
+  models/data_import_job_field_configuration.go:16
+                                               DataImportJobFieldConfiguration
+  models/data_import_job_links.go:14           DataImportJobLink
+  ... and every other model embedding it, across all ~15 services.
+
+So the moment we wire the hook to the outbox, EVERY write to ANY of
+these tables produces an event row. The DataImportJob is the thing XMI
+cares about; parameters and field configurations are its internal guts.
+
+THE RULE THAT FALLS OUT:
+
+  ROOT models   -> emit an event. DataImportJob is a root.
+  CHILD models  -> do NOT emit on their own. Parameters, field
+                   configurations, links are children.
+
+This must be an explicit opt-in list in code, not a default. If we
+default to "everything with hdb.Audit emits", we ship a firehose to SNS
+on day one across 15 services.
+
+A second rule (Part 3 shows why): when several writes happen inside ONE
+transaction, they are ONE business event. The outbox must collapse them,
+not emit a row per write.
+
+
+===========================================================
+PART 2 — CREATE. Adidas creates the data connection.
+===========================================================
+
+THE PATH:
+  api/server/dataConnections_v2.go:356  db.InsertJobV2(ctx, s.DB, &jobModel, dbParameters)
+  db/job_v2.go:13                       InsertJobV2()
+  db/job_v2.go:19                         tx := hdb.BeginTxDB(...)     <- tx opens
+  db/job_v2.go:20                         tx.Create(&job)              <- write 1
+  db/job_v2.go:25                         SetOrganizationJobParametersInTransaction(tx, ...)
+  db/job_parameters.go:121                    ClearOrganizationJobParameters(tx, ...)
+  db/job_parameters.go:76-81                      .Delete(OrganizationJobParameter{})  <- write 2
+  db/job_parameters.go:133-154                for each param: tx.Create(inParamObj)    <- writes 3-7
+  db/job_v2.go:31                         tx.Commit()                  <- REAL COMMIT
+
+WHAT THE HOOK DOES TODAY, write by write:
+
+  write 1  INSERT data_import_jobs         -> AfterCreate (hank/db/audit.go:150)
+  write 2  DELETE organization_job_params  -> AfterDelete (hank/db/audit.go:199)
+  writes 3-7  INSERT organization_job_params x5 -> AfterCreate x5
+
+Seven hook firings. One user action.
+
+AND WRITE 2 IS A GHOST. On a brand-new connection there are no existing
+parameters, so that DELETE matches ZERO rows. Does the hook still fire?
+Yes. gorm@v1.9.11/callback_delete.go:59-63:
+
+    func afterDeleteCallback(scope *Scope) {
+        if !scope.HasError() {
+            scope.CallMethod("AfterDelete")
+        }
+    }
+
+It checks only for errors. It never looks at RowsAffected. So a bulk
+delete that deleted nothing still fires AfterDelete — and per the
+previous doc, that event carries objectId="" because the ids were in a
+WHERE clause. An event that says "something was deleted", cannot say
+what, and in fact nothing was.
+
+(Why Clear is called at all on a create: see PART 6.)
+
+WHAT WE DO INSTEAD:
+
+  1. Only DataImportJob is on the root list, so writes 2-7 produce no
+     outbox row. Write 2's ghost disappears for free.
+  2. Write 1 produces ONE outbox row, in the same transaction.
+  3. db/job_v2.go:31 commits. Job row + outbox row become real together.
+     If db/job_parameters.go:136 had failed instead, the rollback at
+     db/job_v2.go:29 takes the outbox row with it. XMI hears nothing,
+     which is correct, because nothing happened.
+
+THE OUTBOX ROW:
+
+  id             evt-4c81e0a2-...
+  object_type    DataImportJob
+  object_id      dij-7f3a1b90-...     (generated at gorm step 2a,
+                                       models/audit.go:18)
+  object_name    Adidas Q3 Loyalty CSV
+  action         CREATE
+  actor_email    sarah@adidas.com
+  org_id         org-adidas-8821
+  occurred_at    2026-07-27T14:02:11Z
+  published_at   NULL
+  changed_fields {
+                   "name":     {"old": null, "new": "Adidas Q3 Loyalty CSV"},
+                   "status":   {"old": null, "new": "ACTIVE"},
+                   "stage":    {"old": null, "new": "WAITING_FOR_FILE"},
+                   "category": {"old": null, "new": "FIRST_PARTY_DATA"}
+                 }
+
+WHAT XMI RECEIVES:
+
+  {
+    "eventId":     "evt-4c81e0a2-...",
+    "eventType":   "CREATED",
+    "objectType":  "DATA_CONNECTION",
+    "objectId":    "dij-7f3a1b90-...",
+    "objectName":  "Adidas Q3 Loyalty CSV",
+    "orgId":       "org-adidas-8821",
+    "performedBy": "sarah@adidas.com",
+    "eventTime":   "2026-07-27T14:02:11Z",
+    "changedFields": {
+      "name":   {"old": null, "new": "Adidas Q3 Loyalty CSV"},
+      "status": {"old": null, "new": "ACTIVE"},
+      "stage":  {"old": null, "new": "WAITING_FOR_FILE"}
+    }
+  }
+
+The five parameters are NOT in the payload, deliberately.
+OrganizationJobParameter.Value (models/organization_job_parameter.go:19)
+holds raw connection parameter values — you can see
+db/job_parameters.go:152 rewriting "S3://" to "s3://" inside it. That is
+exactly the kind of field that must never reach SNS by accident.
+Suppressing child models is a security control, not just noise control.
+
+
+===========================================================
+PART 3 — UPDATE. Two shapes; the second is the hard one.
+===========================================================
+
+SHAPE A — the stage change (simple, one write).
+
+  api/server/data_in_local_file.go:611  db.UpdateJobStageInTransaction(s.DB, jobID, MAPPING_REQUIRED)
+  db/job.go:242-246                       tx.Model(&DataImportJob{}).Updates(job)
+
+  step 2   BEGIN                              (gorm owns it here — s.DB
+                                               was passed, not a tx)
+  step 3b  SELECT allowlisted cols WHERE id=? -> stage="WAITING_FOR_FILE"
+  step 6   UPDATE ... SET stage='MAPPING_REQUIRED'
+  step 8a  diff -> INSERT INTO event_outbox
+  step 9   COMMIT
+
+  changed_fields {"stage": {"old": "WAITING_FOR_FILE",
+                            "new": "MAPPING_REQUIRED"}}
+  -> XMI eventType STATUS_CHANGED.
+
+SHAPE B — editing the connection itself (db/job_v2.go:38, UpdateJobV2).
+
+Adidas changes the connection name AND edits the S3 prefix:
+
+  db/job_v2.go:44   tx := hdb.BeginTxDB(...)
+  db/job_v2.go:45   tx.Model(&DataImportJob{}).Updates(*job)       <- write 1
+  db/job_v2.go:50   SetOrganizationJobParametersInTransaction(tx, ...)
+  db/job_parameters.go:121  ClearOrganizationJobParameters         <- write 2
+                            (this time it DOES delete 5 rows)
+  db/job_parameters.go:154  5 x tx.Create(inParamObj)              <- writes 3-7
+  db/job_v2.go:56   tx.Commit()
+
+Note what "editing a parameter" is in this codebase: delete all five and
+re-insert all five. There is no UPDATE of a parameter row. This is
+exactly the delete-and-recreate pattern the CTO and principal architect
+raised — and it is real, here, in this file.
+
+Naive hook firing count: 1 update + 1 delete + 5 creates = 7 again.
+
+With the root-model rule: writes 2-7 suppressed. One outbox row:
+
+  action         UPDATE
+  object_id      dij-7f3a1b90-...
+  object_name    Adidas Q3 Loyalty CSV     <- from the pre-image
+  changed_fields {"name": {"old": "Adidas Q3 Loyalty CSV",
+                           "new": "Adidas Q3+Q4 Loyalty CSV"}}
+
+HONEST GAP: the S3 prefix change is invisible in this event. It lives in
+organization_job_parameters, which we deliberately suppressed. So XMI
+learns the name changed but not that the data location moved.
+
+Three options — a product decision, not a technical one:
+  (a) Accept it. XMI's stated use cases are about dashboards and
+      pipelines breaking when a connection's shape or lifecycle changes,
+      not where the bytes come from. Simplest; probably right for v1.
+  (b) Roll children into the parent event. Needs transaction-scoped
+      collapsing plus a strict allowlist of WHICH parameter names may
+      appear (never credential-bearing ones).
+  (c) A separate DATA_CONNECTION_PARAMETERS event type. More faithful,
+      more schema surface, more chances to leak a value.
+  Recommend (a) for v1, (b) noted as the growth path.
+
+TRANSACTION-SCOPED COLLAPSE, needed regardless: if two writes to the
+SAME root object happen in one transaction, they are one business event.
+Key the outbox insert on (transaction, object_type, object_id) and merge
+changed_fields rather than appending per hook firing. Much easier in
+Phase 0 than retrofitted once consumers exist.
+
+
+===========================================================
+PART 4 — DELETE. Weakest area in today's code.
+===========================================================
+
+TWO delete paths, different behaviour.
+
+PATH 1 — SoftDeleteJob, db/job.go:183:
+
+  tx := hdb.BeginTxDB(ctx, db, &sql.TxOptions{})            // 184
+  tx.Scopes(IDScope(id)).Delete(&models.DataImportJob{})    // 185
+  tx.Commit()                                               // 190
+
+DataImportJob embeds TimeAudit (models/data_import_job.go:19), which has
+DeletedAt (models/audit.go:25). GORM checks for that field at
+callback_delete.go:36-38 and issues:
+
+  UPDATE data_import_jobs SET deleted_at = now() WHERE id = ?
+
+So it is a SOFT delete — but it still runs the DELETE callback chain, so
+AfterDelete fires, not AfterUpdate.
+
+PATH 2 — DeleteDataImportJobAndAssociatedRecords, db/job.go:193:
+
+  tx := hdb.BeginTxDB(...)                                       // 194
+  tx.Scopes(...).Delete(DataImportJobFieldConfiguration{})       // 197  write 1
+  tx.Scopes(...).Delete(OrganizationJobParameter{})              // 207  write 2
+  tx.Scopes(IDScope(...)).Delete(&models.DataImportJob{})        // 215  write 3
+  tx.Commit()                                                    // 222
+
+Writes 1 and 2 are child models (suppressed). Write 3 is the one we want.
+
+THE PROBLEM: all three put the id in a WHERE clause via Scopes
+(db/scopes.go:16-20 — `db.Where("id = ?", ID)`). Nothing is written onto
+scope.Value. So AfterDelete (hank/db/audit.go:199) calls
+getObjectDetails (hank/db/audit.go:241) on an empty struct:
+
+  ObjectID   = ""
+  ObjectName = ""
+
+We would emit "a DataImportJob was deleted" with no id and no name.
+
+THE FIX — pre-image read in a BeforeDelete hook:
+
+  BEGIN
+  BeforeDelete: SELECT allowlisted cols WHERE <the delete's conditions>
+                -> id, name, stage, status
+  the DELETE / soft-delete SQL runs
+  AfterDelete:  write the outbox row from the stashed pre-image
+  COMMIT
+
+For deletes this is not an optimisation, it is the only way. After the
+row is gone the information does not exist anywhere. (On the soft-delete
+path the row technically survives, but relying on that breaks the moment
+someone hard-deletes, so read the pre-image on both.)
+
+WRINKLE: a delete's WHERE can match MANY rows (writes 1 and 2 delete
+every child of a job). The pre-image read must be "SELECT the rows this
+delete is about to hit", and if it returns N rows we emit N events — or,
+for suppressed child models, zero. For our root model the delete is
+always by id, so N=1.
+
+THE OUTBOX ROW:
+
+  action         DELETE
+  object_id      dij-7f3a1b90-...      <- from the pre-image. Else "".
+  object_name    Adidas Q3 Loyalty CSV <- from the pre-image. XMI's schema
+                                          (xmi_event_schema_pitch.md:138)
+                                          wants the name "preserved even
+                                          on delete".
+  changed_fields {
+                   "status": {"old": "ACTIVE",           "new": null},
+                   "stage":  {"old": "MAPPING_REQUIRED", "new": null}
+                 }
+
+Mirror image of CREATE: there old was null; here new is null.
+
+WHAT XMI RECEIVES:
+
+  {
+    "eventId":     "evt-b7710f33-...",
+    "eventType":   "DELETED",
+    "objectType":  "DATA_CONNECTION",
+    "objectId":    "dij-7f3a1b90-...",
+    "objectName":  "Adidas Q3 Loyalty CSV",
+    "orgId":       "org-adidas-8821",
+    "performedBy": "sarah@adidas.com",
+    "eventTime":   "2026-07-27T18:20:44Z",
+    "changedFields": {
+      "status": {"old": "ACTIVE",           "new": null},
+      "stage":  {"old": "MAPPING_REQUIRED", "new": null}
+    }
+  }
+
+This is the event XMI most needs — a dashboard pointed at a deleted
+connection is broken right now — and the one today's hook is least able
+to produce.
+
+
+===========================================================
+PART 5 — THE RULES, collected
+===========================================================
+
+  1. ROOT MODELS ONLY. Explicit opt-in list. DataImportJob yes;
+     OrganizationJobParameter, FieldConfiguration, JobLink no.
+     Reason: per-write vs per-business-object, plus it keeps parameter
+     values out of SNS entirely.
+
+  2. COLLAPSE PER TRANSACTION. Key the outbox row on (txn, object_type,
+     object_id), merge changed_fields. One transaction, one event per
+     object.
+
+  3. PRE-IMAGE READ ON UPDATE AND DELETE. Not optional for delete —
+     without it there is no id and no name. Runs after BEGIN and before
+     the write, so it is race-free by position.
+
+  4. COLUMN ALLOWLIST AT CAPTURE. Static, in code. Never
+     OrganizationJobParameter.Value, never error_message.
+
+  5. NEVER ASSUME ROWS WERE AFFECTED. GORM fires AfterDelete even when
+     zero rows matched (callback_delete.go:59-63). Drive events off the
+     pre-image rows actually found, not off the fact that a delete ran.
+
+  6. CLEANROOM IS NOT FOREBITT'S JOB. The datasets join
+     (unhygienix/models/dataset.go:102-104) lives in unhygienix's
+     database. Emit org-scoped; resolve at dispatch. Never a
+     cross-service call from inside a transaction. (Deferred for now.)
+
+
+===========================================================
+PART 6 — WHY IS ClearOrganizationJobParameters CALLED ON A CREATE?
+===========================================================
+
+Because it is the same function on both paths. Verified:
+
+  db/job_v2.go:25   InsertJobV2 -> SetOrganizationJobParametersInTransaction
+  db/job_v2.go:50   UpdateJobV2 -> SetOrganizationJobParametersInTransaction
+
+One shared helper, db/job_parameters.go:109. Its contract is "make the
+stored parameters for this job exactly equal to this input list" — a
+replace, not an insert. It implements that the blunt way:
+
+  db/job_parameters.go:121   clear whatever is there
+  db/job_parameters.go:133-154  insert everything given
+
+On the UPDATE path the clear is essential — it removes parameters the
+user dropped. On the CREATE path there is nothing to clear, so the
+DELETE matches zero rows and is a harmless no-op at the SQL level.
+
+Harmless at the SQL level. NOT harmless once the hook emits events —
+that is the ghost DELETE event in Part 2. This is the single clearest
+example of why "just call events.Publish from the audit hook" is not a
+50-line change: a correct, idiomatic, do-nothing SQL statement becomes a
+wrong event the moment the hook starts publishing.
+
+It also explains the CTO's and principal architect's point exactly.
+"Set" semantics implemented as clear-then-insert is a normal, sane way
+to write CRUD. It is only when you try to derive "what changed" from
+row-level events that it becomes painful — you see 1 delete and 5
+inserts and have to work backwards to "the user edited one parameter".
+That reconstruction is the if-else pile they described, and it is a
+direct consequence of the write pattern, not of anything we would do
+wrong.
+
+
+===========================================================
+PART 7 — WHAT XMI SEES FOR THE WHOLE LIFECYCLE
+===========================================================
+
+One connection, four events, in order:
+
+  14:02  CREATED         name/status/stage from null       (7 firings -> 1)
+  16:45  STATUS_CHANGED  WAITING_FOR_FILE -> MAPPING_REQUIRED  (1 -> 1)
+  17:10  UPDATED         name changed                      (7 firings -> 1)
+  18:20  DELETED         status/stage to null, name kept   (3 firings -> 1)
+
+That collapsing IS the design work. The transport was never the hard
+part.

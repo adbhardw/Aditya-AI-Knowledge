@@ -1,0 +1,204 @@
+HOW XMI/LIVERAMP DOES SERVICE-TO-SERVICE CALLBACK AUTH (CAC)
+Model to copy for Cleanroom -> XMI callback auth (per Max Handler)
+Traced from: LiveRamp/measurement-control-service PR #735 (MCS, callee)
+             LiveRamp/value-mapping-api PR #302 (VMA, caller)
+Repos cloned to: ~/Documents/xmi-callback-auth-study/
+Date: 2026-07-21
+
+Max's summary: "we fully use CAC for auth, and have callback roles between our
+own services... we've given the SA for the app the internal role, basically."
+Caveat from Max: "tbd if that's 100% working lol, it's fairly new and was a
+side project." So treat as a working reference pattern, not a battle-hardened
+standard.
+
+Direction of the example: VMA (caller) fires a POST to MCS (callee) when a
+user finishes a map. MCS is the one that ADDS the protected callback endpoint
++ the new permission. For our case, Cleanroom = caller (like VMA), XMI =
+callee (like MCS) — so the endpoint-side work (MCS PR #735) is the half we'd
+mirror on XMI, and the caller-side work (VMA PR #302) is the half we'd mirror
+on Cleanroom.
+
+
+===========================================================
+THE BIG PICTURE — ONE SENTENCE
+===========================================================
+
+There is NO special service-to-service auth. The caller authenticates as its
+own Google service account (gets a bearer token from a local token-getter),
+sends it as a normal Authorization header, and the callee runs the SAME CAC
+permission check it runs for a human user — the only trick is a dedicated
+"restricted/" permission that only the caller's SA has been granted (via a
+role in Nexus). Machine identity flows through the exact same authz path as
+human identity.
+
+
+===========================================================
+PART A — CALLEE SIDE (MCS PR #735) = what XMI would build
+===========================================================
+
+1. Declare a new permission constant.
+   File: src/app/implementations/permissions.py
+       PERMISSION_RESTRICTED_VMA_MAP_CALLBACK =
+           "restricted/measurementControl:callback.vmaMap"
+   The "restricted/" prefix is meaningful (see Part C) — it routes to a
+   different CAC endpoint and is the kind of permission you grant to a
+   service account rather than to human org-members.
+
+2. The endpoint enforces it via the shared context manager.
+   File: src/app/implementations/endpoints/vma_map_updated_..._api.py
+       async def vma_map_updated_...(authorization, lr_org_id, ...):
+           with common_init_ctx(
+               authorization=authorization,
+               lr_org_id=lr_org_id,
+               permission=PERMISSION_MP_MAPPING_DATA_UPDATE,          # normal human perm
+               restricted_permission=PERMISSION_RESTRICTED_VMA_MAP_CALLBACK,  # SA perm
+               campaign_id=v1campaignsId,
+           ) as ctx:
+               ... do the work ...
+   Note the endpoint takes `authorization` and `lr_org_id` as normal request
+   params — nothing callback-specific about how the token arrives. It's just
+   a bearer token in the Authorization header + an LR-Org-ID header.
+
+3. common_init_ctx does the actual check (fail-closed 403).
+   File: src/app/utils/api_common.py:434
+       allowed, perm_used = cac.cac_is_authorized(
+           authorization, lr_org_id, permission, alt_permission=restricted_permission
+       )
+       if not allowed:
+           raise HTTPException(status_code=403, detail="Permission Denied")
+   KEY DESIGN: it passes BOTH a normal permission and the restricted one as
+   an alternative. cac_is_authorized checks the first; if that fails AND an
+   alt is given, it checks the alt (cac.py:135-145). So the endpoint is
+   reachable EITHER by a human who holds the normal permission OR by a
+   service account that holds the restricted callback permission. One
+   endpoint, two legitimate caller types, same code path.
+
+4. The CAC call itself is just an HTTP POST to the CAC service.
+   File: src/app/lr_common/cac.py:8-26 (check_permission)
+       data = {"orgID": lr_org_id, "permission": permission}
+       if permission.startswith("restricted/"):
+           endpoint = "v1/user-org-restricted-permission/actions/check"
+           data.pop("orgID", None)          # restricted perms are org-less
+       else:
+           endpoint = "v1/user-org-permission/actions/check"
+       resp_json = self.post(endpoint, lr_org_id, auth_token, data)
+   CAC decodes the bearer token (figures out WHO the caller is — human or SA),
+   looks up whether that identity holds the permission, returns
+   {"allAllowed": bool}. MCS never decodes the token itself; it delegates the
+   entire "who are you + are you allowed" question to CAC.
+
+
+===========================================================
+PART B — CALLER SIDE (VMA PR #302) = what Cleanroom would build
+===========================================================
+
+1. Store/config the callee URL. VMA keeps callback URLs on the mapping row
+   (add_callback / remove_callback endpoints, PR #302), and also has an env
+   config VMA_MCS_CALLBACK_URL for the static internal MCS URL. For us this
+   is just "where does the Cleanroom-side know to POST XMI."
+
+2. Fire the callback — fire-and-forget, never block the main operation.
+   File: src/app/utils/callbacks.py
+       _executor = ThreadPoolExecutor(max_workers=4, ...)
+       def notify_map_updated(mapping_id, callbacks):
+           for url in callbacks:
+               _executor.submit(_post_map_updated, mapping_id, url)   # async
+       def _post_map_updated(mapping_id, url):
+           try:
+               client = LiveRampApiClient(base_url)
+               client.post(endpoint, body={"mapping_id": mapping_id})
+           except Exception:
+               logger.exception(...)      # swallow ALL errors
+   Design principle worth copying: a failed callback must NEVER break the
+   user's actual save. Runs on a thread pool, catches everything.
+
+3. WHERE THE AUTH TOKEN COMES FROM (the actual answer to "how do the two
+   services authenticate"):
+   LiveRampApiClient.post -> _make_headers (liveramp_apis.py:295-318):
+       if "Authorization" not in _headers:
+           bearer = self._auth_token_to_bearer_token(auth_token)   # -> "Bearer <token>"
+           _headers["Authorization"] = bearer
+       _headers["LR-Org-ID"] = lr_org_id
+   With no explicit token passed, it calls self.get_token() ->
+   token_getter.get_access_token (token_getter.py:23-29):
+       if mode == "SOCKET": read token off a local unix socket ("TOKEN\n")
+       elif mode == "IP":  GET config.token_getter_url
+   i.e. there's a sidecar/local token-getter (the app's Google service
+   account identity) that hands out a fresh bearer token. The app never
+   holds long-lived secrets in code — it asks the local getter each time.
+   That SA-issued bearer token IS the service-to-service credential. It's the
+   same shape a human's token would be; CAC just resolves it to the SA
+   identity.
+
+   (Sidenote: MCSApiClient adds an extra "MR-Authorization" header via
+   extra_auth_headers — liveramp_apis.py:199-200,312-314 — a secondary
+   internal-routing auth header some LR services require in addition to the
+   bearer. Mentioned for completeness; the primary mechanism is the bearer.)
+
+
+===========================================================
+PART C — THE MISSING PIECE: NEXUS ROLE / SA GRANT
+===========================================================
+
+Code alone does nothing until the caller's service account is actually
+GRANTED the restricted permission. That's the "roles I added in Nexus" +
+"we've given the SA for the app the internal role" part of Max's message —
+config/data in LiveRamp's auth system (Nexus), NOT in either repo:
+
+  - Define a role that includes the restricted permission
+    (restricted/measurementControl:callback.vmaMap).
+  - Grant that role to the CALLER app's service account (VMA's SA).
+
+Without this grant, VMA's SA calls MCS, CAC says allAllowed=false, MCS
+returns 403. WITH it, the exact same call passes. So the security boundary
+is: (a) a purpose-scoped restricted permission that ONLY the intended caller
+holds, enforced by (b) CAC resolving the SA's bearer token to that grant.
+Not IP allowlists, not shared secrets, not mTLS — identity + a narrow grant.
+
+
+===========================================================
+WHAT THIS MEANS FOR CLEANROOM -> XMI (our task)
+===========================================================
+
+Mapping the pattern onto our direction (Cleanroom pushes events TO XMI):
+
+  XMI (callee, mirror MCS #735):
+    - Add a restricted permission, e.g.
+      "restricted/xmi:callback.cleanroomEvent" (or whatever the XMI CAC
+      namespace is).
+    - Add the callback endpoint that runs the CAC check with that permission
+      as restricted_permission (via XMI's equivalent of common_init_ctx).
+    - Return 403 fail-closed if not allowed; 202/async-enqueue if allowed
+      (MCS enqueues a Celery task and returns immediately — good model for
+      not doing heavy work inline in a callback).
+
+  Cleanroom (caller, mirror VMA #302):
+    - Get a bearer token from Cleanroom's own SA via the local token-getter
+      (Cleanroom already mints service tokens today — e.g. picanmix/unhygienix
+      CreateServiceToken; need to confirm whether Cleanroom's SA can obtain a
+      CAC-recognized token, or if a Google-SA/token-getter path like VMA's is
+      required).
+    - POST to XMI's callback URL with Authorization: Bearer <token> +
+      LR-Org-ID, fire-and-forget on a thread pool, swallow errors so a failed
+      XMI notify never breaks the Cleanroom operation.
+
+  Nexus (the grant, mirror Max's role work):
+    - Define + grant a role containing the XMI restricted callback permission
+      to Cleanroom's service account.
+
+OPEN QUESTIONS TO CONFIRM (before mirroring):
+  1. Does Cleanroom's existing service identity produce a token CAC can
+     resolve, or does XMI expect a Google-SA bearer via a token-getter
+     sidecar like VMA has? (Cleanroom's current service tokens are internal
+     JWTs checked against per-service allowlists — a DIFFERENT mechanism from
+     CAC. This is the crux to resolve with Josh/Max.)
+  2. What is XMI's CAC permission namespace + is XMI even a CAC-integrated
+     service on the callee side, or only the LR-native apps (MCS/VMA) are?
+  3. Who owns creating the Nexus role + granting it to Cleanroom's SA.
+  4. Is the "MR-Authorization" internal header required to reach XMI, or just
+     the bearer?
+
+These four are exactly the auth-mechanism questions Aditya was raising with
+Josh/Max in the Slack thread — this doc is the concrete code answer to
+"here's the CAC model Max pointed at," with the integration gaps for our
+side called out explicitly.

@@ -1,0 +1,156 @@
+XMI callback auth follow-up — CAC/Nexus internal role proposal
+Date: 2026-07-17
+Context: cleanroom event delivery (orinix) — webhook callback auth thread with XMI
+team (Joel Minor - organizer, Aditya Bhardwaj, Max Handler, Pamela McA'Nulty, Andy
+McConaghie, Mike Dometita - optional, Laurence Wilson - optional, Josh Wo - optional,
+Shruthi Alekha - optional)
+
+------------------------------------------------------------------------
+
+BACKGROUND — WHAT WAS ASKED
+
+Slack message sent to the XMI thread, referencing the Observability Cleanroom
+Pub/Sub design doc:
+https://liveramp.atlassian.net/wiki/spaces/~7120200751337419d4448994eb0175e31894fe/pages/5602181406/Observability+Cleanroom+Pub+Sub+Design
+
+  "Hey all — quick one on auth for the push delivery mechanism described in the
+  Observability design doc. You'll register a callback URL with us so we can push
+  cleanroom events to you, and we wanted to check what auth you'd like us to use
+  on those calls. We know you typically use OAuth when calling external APIs — do
+  you want that here too, or would a static bearer token or mutual TLS work better
+  on your side?"
+
+Options originally considered on our side, before this reply (background, not
+sent verbatim to XMI):
+  1. Static bearer token — one-time key handed over at registration, used as-is on
+     every delivery. No re-auth handshake, no token-issuing infra needed on either
+     side. Best fit for one-way, high-frequency, no-human-in-the-loop delivery.
+  2. OAuth2 client-credentials — extra network call before every delivery, assumes
+     a token-issuing server exists just for this, and is the wrong direction (OAuth
+     is "borrow access to someone else's resource," not "push my own data to you").
+  3. Mutual TLS — cryptographically strong, but real PKI operational overhead
+     (issue/rotate/revoke certs), and see the SAN caveat below.
+  HMAC-SHA256 payload signing (Stripe/GitHub/Slack convention) was already decided
+  independently of which of the above is used for the callback call itself.
+
+------------------------------------------------------------------------
+
+XMI'S REPLY (verbatim, from Slack)
+
+  "Gotcha, we fully use CAC for auth, and have callback roles between our own
+  services, so you could use that as a model perhaps? I recently did some
+  callbacks between our MCS and VMA apps - check out
+  https://github.com/LiveRamp/measurement-control-service/pull/735 and
+  https://github.com/LiveRamp/value-mapping-api/pull/302 plus the roles i added
+  in Nexus
+
+  #735 feat(CHI-914): Add callback endpoint to refresh VMA % unmapped on map
+  update — LiveRamp/measurement-control-service | May 6th | Added by GitHub
+  #302 feat(CHI-913): Add MCS callback notification on map update —
+  LiveRamp/value-mapping-api | May 6th | Added by GitHub
+
+  so we've given the SA for the app the internal role, basically."
+
+------------------------------------------------------------------------
+
+WHAT THIS ACTUALLY MEANS — VERIFIED AGAINST THE REAL PR CODE (not guessed)
+
+Pulled both diffs directly (gh pr diff) rather than taking the summary at face
+value:
+
+VMA side (value-mapping-api PR #302, src/app/utils/callbacks.py):
+  - notify_map_updated() fires an outbound POST via LiveRampApiClient
+    (lr_common.liveramp_apis) — an internal shared HTTP client.
+  - The calling code never manually builds an auth header — client.post(endpoint,
+    body=...) is called directly; LiveRampApiClient attaches the caller's internal
+    service identity automatically under the hood.
+
+MCS side (measurement-control-service PR #735):
+  - The receiving endpoint
+    (vma_map_updated_v1_campaignscampaigndatasetscampaigndatasetmappings_api.py)
+    takes an `authorization` header and an `lr_org_id` header, and validates the
+    caller through a shared `common_init_ctx()` helper.
+  - Authorization is a PERMISSION CHECK, not a shared-secret or signature check —
+    specifically PERMISSION_RESTRICTED_VMA_MAP_CALLBACK =
+    "restricted/measurementControl:callback.vmaMap" (implementations/permissions.py).
+  - The "restricted/" prefix marks this as a narrowly-scoped, machine-only
+    permission, distinct from normal user-facing permissions in the same file.
+
+So concretely:
+  - "SA" = Service Account. VMA's app has its own registered Service Account in
+    LiveRamp's internal identity system.
+  - "the internal role" = that Service Account was granted ONE specific permission
+    (restricted/measurementControl:callback.vmaMap), scoped to exactly this one
+    callback action, nothing broader.
+  - "Nexus" = their internal tool/console for managing and assigning those roles —
+    NOT Sonatype Nexus (the artifact repo); a different internal system that
+    happens to share the name.
+  - "CAC" = presumably the name of the internal identity/authorization platform
+    itself (what issues the Service Account's credentials and what
+    common_init_ctx checks against). NOT CONFIRMED from the code pulled — worth
+    asking directly rather than assuming the expansion of the acronym.
+
+Net proposal: instead of cleanroom's delivery service authenticating with a
+shared secret/token it manages itself, it would get its own Service Account in
+LiveRamp's internal identity system, be granted a narrow "restricted/..." style
+permission scoped just to "call XMI's callback endpoint," and XMI's endpoint
+would check that permission on every call — same shape MCS/VMA already use
+between themselves.
+
+------------------------------------------------------------------------
+
+OPEN FLAG — NOT YET RESOLVED, RAISED BACK TO XMI
+
+This whole mechanism (Service Accounts, Nexus roles, LiveRampApiClient) only
+works because both MCS and VMA are LiveRamp-internal services sitting inside the
+same identity system. That fits M1 scope (XMI, internal users) fine.
+
+M2 (external customers registering their own webhook) will NOT have a LiveRamp
+Service Account or a Nexus role to be granted — so this pattern covers the
+internal case XMI is suggesting it for, but does not extend to external
+customers the way the original bearer-token/HMAC scheme was designed to.
+
+ACTION: confirm with XMI whether this CAC/Nexus-role suggestion is scoped to M1
+only (internal, which is consistent with how they'd use it) or whether they're
+assuming it also covers M2 external customers (which it structurally can't,
+without those customers being onboarded into LiveRamp's internal identity
+system — not realistic for external partners).
+
+HMAC-SHA256 payload signing decision is unaffected either way — that's a
+separate, orthogonal decision from the transport-auth mechanism being discussed
+here.
+
+------------------------------------------------------------------------
+
+RELATED — mTLS / SAN CLARIFICATION (background reasoning already covered, for
+this thread's context)
+
+mTLS proves cryptographic possession of a certificate signed by a trusted CA —
+it does NOT by itself prove "this specific service." If XMI's server trusted any
+cert signed by a shared root CA, any other internal service with a cert from
+that same CA (not just orinix) would authenticate identically. The fix any real
+mTLS deployment needs is a second, application-layer check: inspect the
+presented cert's SAN (Subject Alternative Name) — the X.509 extension that lists
+which hostnames a cert is valid for, the modern replacement for using CN (Common
+Name) for this purpose — and compare it against an explicit allowlist (e.g. only
+accept calls where the client cert's SAN is exactly orinix.internal.liveramp.net).
+Without that check, mTLS gives authentication (proof of possessing a valid cert)
+but not authorization (proof that this identity is allowed to call this
+endpoint) — two different layers.
+
+CN was deprecated for hostname verification because: (1) it was a free-text
+field never designed for strict hostname matching, (2) it can only hold one
+value per cert vs SAN's list support, (3) it caused real exploitable bugs (null-
+byte injection attacks — a CN like "www.paypal.com\0.attacker.com" could fool
+C-style null-terminated string comparisons), and (4) RFC 6125 (2011) and the
+CA/Browser Forum Baseline Requirements formally deprecated it, with Chrome 58
+(2017) being the point major browsers stopped honoring CN as a fallback at all.
+
+OUSTERHOUT TIE-IN: XMI's CAC/Nexus suggestion is Consistency (ch. 17) working
+correctly IF scoped to M1 — reuse an existing, proven, org-wide internal
+mechanism instead of inventing a new bespoke auth scheme, same reasoning as
+recommending orinix's CI match the org's dominant Jenkins convention rather than
+staying on a one-off GitHub Actions setup. The mTLS/SAN gap above is a Different
+Layer, Different Abstraction (ch. 7) miss when deployed naively: transport-layer
+proof of "holds a CA-signed cert" is being silently treated as application-layer
+proof of "is specifically this service," which are not the same guarantee.

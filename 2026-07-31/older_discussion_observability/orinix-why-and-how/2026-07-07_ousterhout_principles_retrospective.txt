@@ -1,0 +1,223 @@
+orinix — Ousterhout principles retrospective: what was built, mapped to why
+Date: 2026-07-07
+Status: Summary of everything done so far — language decision through the actual
+        local commit (04b4e50). Principle first, then how the work aligns with it.
+
+------------------------------------------------------------------------
+
+1. NATURE OF COMPLEXITY (ch. 1) — complexity is hard-to-understand-or-change,
+   built up in small drops, not one big mistake
+
+  Three real complexity risks were caught early instead of surfacing later as
+  production incidents:
+    - SQS consumption being unproven in Go anywhere in this codebase (would
+      have been discovered the hard way mid-implementation if Go had been
+      picked without checking first)
+    - The wrong claim that cronos needed a new SNS publish path (caught and
+      corrected before any code was written against that assumption)
+    - "Webhook first, Pub/Sub later" quietly drifting into the wrong M1 scope
+      until corrected to "both, per XMI/Josh"
+  Each was a small, checkable fact — the discipline was checking them before
+  they compounded into rework.
+
+------------------------------------------------------------------------
+
+2. TACTICAL vs STRATEGIC PROGRAMMING (ch. 2)
+
+  The Java decision itself IS this principle in practice: XMI wants push now,
+  which is exactly the pressure that invites a tactical shortcut ("just build
+  it fast in whatever language, harden later"). Choosing Java instead of Go
+  was choosing to reuse already-hardened production code (pegleg's SQS
+  listener, pegleg's GCP Pub/Sub publisher) over building the same
+  capabilities from scratch under deadline pressure in a language where
+  neither exists yet.
+
+------------------------------------------------------------------------
+
+3. DEEP MODULES vs SHALLOW MODULES (ch. 3)
+
+  - object_events + the SQS consumer expose almost nothing to callers (in the
+    final scaffold, not even a gRPC method — ingestion is a plain in-process
+    call) while hiding all SNS/SQS wiring, idempotency, and schema.
+  - Template Method was rejected as the delivery-dispatch pattern specifically
+    because the "shared skeleton" across webhook and Pub/Sub would have been
+    shallow — the two mechanisms differ too much for a common base class to
+    hide anything real.
+  - The Hybrid (Go+Java split) option was rejected because whatever crossed
+    the language boundary would be a complex interface hiding nothing new —
+    both halves are already inside Habu's trust boundary.
+
+------------------------------------------------------------------------
+
+4. INFORMATION HIDING (ch. 4)
+
+  delivery_type + delivery_config on callback_registrations hides "how do we
+  push to this consumer" from both the ingest path and the registration API.
+  Neither piece of code branches on WEBHOOK vs PUBSUB — that decision lives
+  in exactly one place (CallbackDeliveryWorker's map lookup) and nowhere else.
+
+------------------------------------------------------------------------
+
+5. GENERAL-PURPOSE MODULES (ch. 5)
+
+  DeliveryChannel + Spring's auto-collected Map<String, DeliveryChannel> is
+  general enough for "N delivery mechanisms, chosen per row" without either
+  under-building (a hand-rolled Factory Method that needs editing for every
+  new mechanism) or over-building (a dynamic Plugin/Registry system solving
+  a "swap delivery mechanisms without a redeploy" problem M1 doesn't have).
+
+------------------------------------------------------------------------
+
+6. DIFFERENT LAYER, DIFFERENT ABSTRACTION (ch. 6)
+
+  OrinixServiceImpl is real translation work, not a passthrough: raw JPA
+  entity rows in, CloudEvents-shaped proto messages out. Conversely, the
+  proto was deliberately kept to ONE RPC set (GetCleanroomEvents,
+  RegisterCallback) rather than also adding a RecordObjectEvent RPC for the
+  ingest write — that would have been a network-shaped layer translating
+  nothing, since the SQS consumer and the DB write live in the same process.
+
+------------------------------------------------------------------------
+
+7. PULL COMPLEXITY DOWNWARD (ch. 7)
+
+  - CallbackDeliveryWorker is the only place that knows dispatch happens via
+    a string-keyed map lookup — ingest and the registration endpoint don't.
+  - external-api-server's existing JwtBearerInterceptor and
+    RequestIdInterceptor absorb auth and tracing for every @GrpcClient stub
+    automatically — orinix inherits both for free the moment it's wired in,
+    with zero new code on the caller's side.
+
+------------------------------------------------------------------------
+
+8. BETTER TOGETHER OR APART (ch. 8)
+
+  - Rejected Hybrid because ingest and delivery share one event's lifecycle
+    — splitting them by language would be "apart" applied to something that
+    wants to be "together."
+  - Kept fan-out (DeliveryDispatcher: one event, many registrations) and
+    dispatch (DeliveryChannel: one registration, which mechanism) as two
+    separate classes rather than one conflated interface — these are
+    genuinely different concerns that happened to look like one problem.
+
+------------------------------------------------------------------------
+
+9. DEFINE ERRORS OUT OF EXISTENCE (ch. 9)
+
+  - gRPC + proto means "client and server disagree about a message's shape"
+    is a compile-time failure, not a production runtime error.
+  - cursor_position + its index were designed into object_events from day
+    one — pagination was never something to retrofit onto a table that
+    wasn't built for it.
+  - idempotency_key with a unique constraint means SQS's at-least-once
+    redelivery can't produce duplicate object_events rows — structurally,
+    not by a "remember to check" convention.
+
+------------------------------------------------------------------------
+
+10. DESIGN IT TWICE (ch. 10)
+
+  Two full comparisons were done before committing to anything, not just
+  the first idea that came to mind:
+    - Java vs Go vs Hybrid, with a real evidence table (SQS proof, Pub/Sub
+      proof, WIF proof, precedent match) for each
+    - Strategy vs Factory Method vs Chain of Responsibility vs Template
+      Method vs Plugin/Registry for delivery dispatch, with honest pros/cons
+      for each, not just for the one that won
+
+------------------------------------------------------------------------
+
+11-14. COMMENTS AND NAMING (ch. 11-14)
+
+  Every scaffolded file carries WHY-comments, not WHAT-comments — e.g.
+  WebhookDeliveryChannel's HMAC method has a comment explaining why it isn't
+  its own class (would be a shallow module), DeliveryDispatcher's class
+  comment explains why fan-out and dispatch are kept separate,
+  CallbackDeliveryWorker's comment states plainly that the SQS-native-retry
+  design is an open question, not a settled fact — so a future reader hits
+  the uncertainty in the code itself, not just in a design doc.
+
+------------------------------------------------------------------------
+
+15. CHESTERTON'S FENCE / MODIFYING EXISTING CODE (ch. 15)
+
+  Applied correctly, repeatedly: read pegleg's actual BillingService,
+  BillingMessagePublisherHelper, and AWSSQSConfiguration before reusing their
+  patterns; verified external-api-server's real @GrpcClient usage (six call
+  sites) before concluding zabra-grpc-client wasn't needed, rather than
+  assuming.
+
+  Applied in reverse — a real miss, caught and corrected on the record: an
+  early claim that cronos needed a new SNS publish path was repeated from an
+  older design doc without checking cronos's actual source. It doesn't own
+  Flow/FlowRun at all — it's a Quartz scheduler. Corrected transparently in
+  a dedicated doc rather than left standing.
+
+------------------------------------------------------------------------
+
+16. CONSISTENCY (ch. 16)
+
+  - Java + gRPC + plain versioned SQL matches the existing Java fleet
+    (pegleg, cronos), rather than importing Go's Liquibase convention by
+    default.
+  - external-api-server will call orinix via @GrpcClient("orinix") exactly
+    like it calls pegleg/forebitt/picanmix today — no new pattern invented.
+  - The proto uses one outer class (Orinix, via java_outer_classname),
+    matching the org's existing Cleanroomrunstats-style nested Request/
+    Response convention, not a different style.
+
+------------------------------------------------------------------------
+
+17. CODE SHOULD BE OBVIOUS (ch. 17)
+
+  No hidden reactions: ingestion doesn't secretly trigger a network call
+  (no RecordObjectEvent RPC where a plain method call suffices), no shallow
+  one-line wrapper classes (HMAC signing stays inline), one class per real
+  responsibility (ingest / db / delivery / registration packages, not one
+  do-everything service class).
+
+------------------------------------------------------------------------
+
+18. SOFTWARE TRENDS (ch. 18) — ask "does this solve MY problem," don't
+    follow trends by default
+
+  gRPC wasn't chosen because "microservices should use gRPC" — it was
+  chosen after comparing it against REST and a plain shared-library call for
+  THIS specific caller (external-api-server, already Spring Boot, already
+  wired for @GrpcClient). Multi-module Maven structure wasn't chosen because
+  "that's how Java projects should look" — it mirrors pegleg's actual
+  existing shape, for the same reason pegleg has it (proto/backend/server
+  as separable concerns).
+
+------------------------------------------------------------------------
+
+19. DESIGNING FOR PERFORMANCE (ch. 19) — measure before optimizing
+
+  gRPC's wire-efficiency benefit was explicitly ranked LAST among the
+  reasons to choose it, with a note that it isn't the decisive factor for
+  M1's actual traffic shape. Compile-time safety and reused infrastructure
+  were named as the real reasons — performance wasn't oversold as the
+  headline justification when it wasn't actually driving the decision.
+
+------------------------------------------------------------------------
+
+20. DECIDE WHAT MATTERS (ch. 20) — rank importance, don't treat everything equally
+
+  - Every comparison in this project was presented ranked, not as a flat
+    list (gRPC benefits ranked 1-5; Java/Go/Hybrid evidence weighted by
+    which capabilities actually matter for orinix's job).
+  - orinix.proto was kept to one file for M1 rather than pre-splitting into
+    multiple proto files "for organization" — that structure isn't needed
+    yet at this size.
+
+------------------------------------------------------------------------
+
+21. COMPLEXITY IS INCREMENTAL (ch. 21) — fix the same way it built up: small,
+    every time
+
+  The whole Q1-through-Q6 process, plus the LIDAC prep and the file
+  manifest, was one decision at a time, each one documented with its
+  reasoning before moving to the next, rather than a single big design
+  session with undocumented reasoning that would be unrecoverable later.
+  This retrospective itself is possible only because each step was written
+  down as it happened.

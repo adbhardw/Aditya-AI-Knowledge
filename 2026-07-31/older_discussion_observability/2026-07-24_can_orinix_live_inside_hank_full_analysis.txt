@@ -1,0 +1,353 @@
+CAN THE ORINIX EVENT-DELIVERY JOB LIVE INSIDE HANK (OR A HANK SUBSIDIARY)
+INSTEAD OF A NEW SERVICE? — FULL ANALYSIS
+Prompted by CTO / principal architect asking "why not just do this in Hank?"
+Verified against real code: hank library, orinix scaffold, audit.go hooks.
+Date: 2026-07-24
+
+
+===========================================================
+PART 0 — THE QQ FIRST: how does orinix know which delivery mechanism an
+org (e.g. XMI) registered, and where is that stored?
+===========================================================
+
+It is stored in ORINIX'S OWN Postgres, not in Hank and not in XMI.
+Confirmed: orinix-backend/.../db/CallbackRegistrationEntity.java ->
+table `callback_registrations`. One row per consumer per
+cleanroom + object_type. Key columns:
+
+  cleanroom_id, org_id, object_type,
+  delivery_type   (ENUM: WEBHOOK | PUBSUB)      <- the discriminator
+  delivery_config (jsonb)  WEBHOOK: {callback_url}; PUBSUB: {gcp_project_id, gcp_topic_id}
+  signing_secret  (HMAC-SHA256, WEBHOOK only)
+  monitored_fields, status, created_by, created_at
+
+Flow, end to end (verified in the scaffold):
+  1. Source mutation happens in a Habu service (e.g. data import job created).
+  2. An event lands on SNS `habu-observability-events` -> fanned to SQS
+     `sqs-habu-observability-internal`.
+  3. orinix's SqsEventConsumer (@SqsListener on that queue) receives the
+     CloudEvent.
+  4. DeliveryDispatcher queries
+     `findByCleanroomIdAndObjectTypeAndStatus(cleanroom_id, object_type,
+     ACTIVE)` — i.e. "who registered interest in THIS object type in THIS
+     cleanroom, and is still active."
+  5. For each matching registration, it fans out (via SQS
+     `sqs-habu-delivery-xmi`) to CallbackDeliveryWorker, which reads
+     registration.getDeliveryType(), picks the matching DeliveryChannel
+     from its Map<String,DeliveryChannel> (WEBHOOK->Webhook..., PUBSUB->
+     PubSub...), and delivers.
+
+So "who gets what, how" is pure orinix-owned state + an orinix-owned
+runtime loop. XMI registered itself into that table; orinix reads it. Hold
+this picture — it's exactly what makes the "put it in Hank" question
+non-trivial: the REGISTRATION STORE + the DISPATCH LOOP + the PER-CONSUMER
+DELIVERY STATE are the parts that don't fit a library. See Part 3.
+
+
+===========================================================
+PART 1 — WHAT HANK ACTUALLY IS (this decides everything)
+===========================================================
+
+Verified: Hank has NO `package main` anywhere. Confirmed by
+`grep -rl "^package main"` returning nothing across the whole repo. Hank is
+a PURE LIBRARY — a collection of Go packages (db, events, grpc, http,
+server, logging, aws/sns, kafka, token, ...) that ~15 services (unhygienix,
+picanmix, etc.) IMPORT and run INSIDE THEIR OWN PROCESSES.
+
+Critical consequence: a library has NO runtime of its own. It never "runs."
+It has no deployment, no pods, no lifecycle, no CPU, no memory, no network
+listener, no scaling policy — until some HOST service imports it and calls
+into it, at which point Hank's code executes INSIDE THAT HOST'S PROCESS,
+using THAT HOST'S runtime.
+
+What Hank already provides, and it's directly relevant:
+  - server/service.go: `NewGrpcServer(config, interceptors...)` — a FACTORY
+    that returns a *grpc.Server for the HOST to run. Hank builds it; the
+    host owns and runs it.
+  - http + http/middleware: request-logging, requestId injection, response
+    logging — handlers the HOST mounts.
+  - db/audit.go: the GORM create/update/delete hooks (already traced) —
+    run IN-PROCESS inside every host that embeds hdb.Audit.
+  - events/service.go: `Event.Publish(ctx, EventStruct) -> SNS topic` with
+    object/action/service attributes. THIS ALREADY EXISTS. Hank already has
+    a first-class "publish an event to SNS" helper.
+
+KEY FINDING: db/audit.go's AfterCreate/AfterUpdate/AfterDelete currently
+ONLY LOG (to Datadog). They do NOT call events.Publish. Confirmed by grep:
+audit.go references no SNS/events. So the two capabilities exist side by
+side in Hank but are NOT wired together today: the audit hook logs; the
+events helper publishes; nothing connects hook -> publish.
+
+
+===========================================================
+PART 2 — SPLIT ORINIX INTO ITS TWO HALVES; THEY HAVE OPPOSITE ANSWERS
+===========================================================
+
+Orinix does two fundamentally different jobs. Conflating them is why the
+"put it in Hank" question feels murky. Separated, each has a clear answer.
+
+HALF A — EMISSION (turn a DB mutation into a published event)
+  "A data import job was created -> emit an object_event onto SNS."
+  This is INHERENTLY in-process, at the exact moment of the DB write, and
+  Hank ALREADY sits there (the audit hook) AND already has the publisher
+  (events.Publish). This half is a NATURAL, STRONG fit for Hank.
+  Ousterhout: this is a DEEP MODULE done right — the host calls
+  db.Create(...) and, as a side effect, an event is emitted, with the
+  entire mechanism (claims extraction, object/action/service tagging,
+  SNS publish) hidden behind the interface the host already uses. Wiring
+  audit's AfterCreate -> events.Publish is arguably a ~50-line change to
+  Hank, not a new service.
+
+HALF B — DELIVERY (get that event to each registered consumer, reliably)
+  This is everything in Part 0's flow AFTER the event is on SNS:
+    - the callback_registrations store + CRUD API (register/update/disable)
+    - the dispatch loop (subscribe to the queue, fan out per registration)
+    - per-consumer delivery: webhook POST w/ HMAC signing + retries + DLQ,
+      or Pub/Sub publish w/ GCP creds
+    - a cursor-based PULL endpoint (long-lived HTTP surface + cursor state)
+    - replay (ReplayService: replay one event / all-since-cursor)
+    - per-registration status, backoff, dead-letter, idempotency
+  EVERY item here needs a LONG-LIVED, INDEPENDENTLY-SCALED, STATEFUL,
+  OWNED RUNTIME. This half is a POOR fit for a library. See Part 3 for
+  exactly why, mechanically.
+
+
+===========================================================
+PART 3 — THE THREE QUESTIONS THEY'LL ASK: can a library have an endpoint,
+spin up compute, own a callback loop?
+===========================================================
+
+Answered precisely, because the honest answer is "sort of, but you inherit
+a worse problem." A library cannot BE a runtime, but it can provide code a
+HOST runs. So each item below is technically expressible as Hank code — the
+question is WHICH HOST runs it, and that's where it breaks.
+
+Q: "Can a library expose an endpoint?"
+  Technically yes — Hank already ships HTTP handlers/middleware and a gRPC
+  server factory. But an endpoint doesn't EXIST until a host process mounts
+  it and serves it. Hank does not own a port, a URL, a load balancer, or a
+  DNS name. So "the pull-cursor endpoint" as Hank code would only be live
+  in whatever host imported and mounted it — and there are ~15 such hosts.
+  Which one is `orinix.habu.com/events`? None; there's no such host unless
+  you create one — at which point you've built a service, just named it
+  "the host that runs Hank's delivery code."
+
+Q: "Can a library spin up compute / a background worker?"
+  It can start a goroutine when a host calls its init function — but that
+  goroutine lives and dies with the HOST process, shares the host's CPU/mem
+  quota, scales only when the host scales, and restarts when the host
+  deploys. A delivery worker doing webhook retries with backoff over
+  minutes cannot safely be "a goroutine inside picanmix" — picanmix
+  redeploys, and in-flight retries vanish. Durable delivery needs a runtime
+  whose lifecycle is DECOUPLED from any business service's deploy cadence.
+  A library's compute is BY DEFINITION coupled to its host's lifecycle.
+
+Q: "Can a library own a callback loop (subscribe + deliver)?"
+  Same problem, worse: a subscriber that must run 24/7, exactly-once-ish,
+  with a DLQ and cursor state, is the textbook definition of an owned
+  service. Expressing it as library code doesn't remove the need for a
+  process to run it continuously; it just hides that need. And if the
+  answer is "we'll make ONE host run it" — congratulations, that host IS
+  orinix with a different name.
+
+THE LOAD-BEARING INSIGHT: a library can provide the CODE for emission,
+delivery, endpoints, and workers. What it cannot provide is an OWNED,
+SINGLE, INDEPENDENTLY-DEPLOYED RUNTIME to run the delivery/stateful parts.
+Emission doesn't need one (it piggybacks on the host that's already doing
+the DB write — the host that legitimately SHOULD emit). Delivery does need
+one, structurally. That asymmetry is the whole answer.
+
+
+===========================================================
+PART 4 — WHY "JUST RUN THE LIBRARY IN EVERY SERVICE" ACTIVELY BACKFIRES
+FOR HALF B
+===========================================================
+
+If delivery lived as Hank code that each of the ~15 services runs in-process:
+
+  - N conflicting owners of one shared table. 15 services would each need
+    to read/write callback_registrations, run the dispatch loop, and hold
+    delivery state. Who owns retries for a webhook if the event came from
+    picanmix but the registration is cleanroom-wide? Ambiguous by
+    construction. Ousterhout: INFORMATION LEAKAGE — delivery concerns
+    (retries, DLQ, HMAC secrets, GCP creds) smeared across every business
+    service instead of hidden behind one module boundary.
+  - Fan-out duplication / double-delivery. Multiple hosts observing the
+    same logical event would each try to deliver unless you add cross-host
+    coordination — which is itself a distributed-systems service you'd be
+    building inside a library.
+  - Blast radius inversion. A bug in delivery retry logic now can crash or
+    slow picanmix, unhygienix, billing — every host. A dedicated service
+    contains that blast radius to itself (this is the SAME argument as the
+    auth sidecar blast-radius reasoning from the auth docs — isolate the
+    risky, stateful thing).
+  - Coupled deploy cadence. Shipping a delivery bugfix means bumping the
+    Hank version in, and redeploying, all 15 services. Orinix as a service:
+    one deploy.
+  - Secret sprawl. HMAC signing secrets + GCP publisher creds would have to
+    be mounted into every host, not one. Larger attack surface, same
+    anti-pattern the auth analysis already flagged.
+
+These are not incidental — they are the generic reasons stateful,
+long-lived, fan-out delivery is modeled as a service and not a library,
+anywhere in the industry.
+
+
+===========================================================
+PART 5 — THE HYBRID THAT'S ACTUALLY RIGHT (and probably what the architects
+are half-sensing)
+===========================================================
+
+The strongest answer is NOT "all Hank" or "all new service" — it's split
+along the Part 2 seam, which happens to be the seam that already exists in
+the code:
+
+  EMISSION (Half A) -> put it in HANK. Wire db/audit.go's
+    AfterCreate/Update/Delete to call the existing events.Publish (or a
+    thin new hook), so every service embedding hdb.Audit emits an
+    object_event to SNS as a zero-effort side effect of the DB write it
+    already does. This is the part the CTO is RIGHT about: it does NOT need
+    a new service, Hank already sits exactly there, and the publisher
+    already exists. Big win, small change, no new deployment.
+
+  DELIVERY (Half B) -> keep it in an OWNED SERVICE (orinix, or an existing
+    service that adopts the role). This is the part that structurally
+    cannot be "just a library," for every reason in Parts 3-4.
+
+This hybrid also matches the delivery-model doc's own layering: emission is
+the "foundational event platform" (V1), delivery/webhooks/pull/pubsub is
+the consumer-facing layer on top (V2/V3). Hank owning emission and a
+service owning delivery is the same boundary, drawn in the right place.
+
+Honest caveat on Half A: even emission-in-Hank has real edges to sort —
+  - Transactionality: emitting on AfterCreate fires even if the outer
+    business transaction later rolls back (the audit hook runs mid-txn).
+    Naive wiring => phantom events for writes that never committed. Needs
+    either transactional-outbox semantics or after-commit emission, which
+    Hank's current GORM-callback position does NOT give you for free. This
+    is the one genuinely hard technical problem in the "just do it in Hank"
+    proposal, and it's worth raising explicitly rather than hand-waving.
+  - Every host that embeds hdb.Audit would start emitting the moment the
+    hook is wired — need a per-model/per-service opt-in flag, or you flood
+    SNS with events nobody registered for.
+
+
+===========================================================
+PART 6 — VERDICT (what to actually tell the council)
+===========================================================
+
+"Can we do it in Hank?" splits cleanly:
+
+  - The EMISSION half: YES, and we SHOULD. Hank already owns the injection
+    point (the audit hook) and already has the SNS publisher — they're just
+    not wired together. This is a library change, not a new service, and
+    the CTO's instinct is correct here. Caveat: the transactional-outbox /
+    after-commit problem is real and must be designed for, not ignored.
+
+  - The DELIVERY half: NO — not because of effort, but because it
+    structurally requires an owned, long-lived, independently-scaled,
+    stateful runtime (registration store + CRUD, 24/7 dispatch loop,
+    per-consumer retries/DLQ/backoff, cursor-pull endpoint, replay). A
+    library can only supply that code; it cannot BE the runtime that runs
+    it, and forcing 15 host services to each run it creates ownership
+    ambiguity, double-delivery, blast-radius inversion, coupled deploys,
+    and secret sprawl. The moment you designate a single host to run it,
+    you've rebuilt orinix under another name.
+
+RECOMMENDATION: adopt the hybrid. Move emission INTO Hank (small, correct,
+kills the "why a whole service just to publish" objection). Keep delivery
+in a dedicated owned runtime. If the goal is to avoid a NET-NEW service
+specifically, the fallback is to host the delivery runtime inside an
+EXISTING owned service that already has a durable deployment (rather than
+Hank) — but it still must be ONE owned service, not the library, and not
+all of them.
+
+
+===========================================================
+ADDENDUM 2026-07-24 — FOCUSED Q&A: THE THREE QUESTIONS
+===========================================================
+
+Q1: Can Hank be leveraged to CALL XMI (make the callback-URL request) or
+    PUBLISH events to XMI — i.e. do the operation orinix does?
+
+A1: PARTIALLY — and only the "publish" half, not the "call XMI and manage
+    it" half.
+    - Hank ALREADY has the raw ability to publish: events/service.go's
+      Event.Publish() pushes to an SNS topic today. So "emit an event onto
+      a topic when a CUD happens" is squarely within what Hank can do — the
+      hook (db/audit.go) and the publisher (events.Publish) both already
+      exist in Hank; they're just not wired together (audit currently only
+      logs, confirmed — it never calls Publish).
+    - But "leverage Hank to CALL XMI's callback URL" is a different thing.
+      That is an OUTBOUND, per-consumer, retried, signed HTTP request whose
+      target (which URL, which HMAC secret, is it still active) is looked up
+      from the callback_registrations table at delivery time. Hank has no
+      such state and no runtime to drive retries. Hank can hold the PUBLISH
+      primitive; it cannot BE the thing that decides "XMI registered a
+      webhook at URL X, sign with secret Y, retry 3x, DLQ on failure."
+    - So: Hank can be the EMITTER (fire an event to a topic in-process on
+      CUD). It cannot be the DELIVERER/CALLER (the stateful loop that
+      targets XMI specifically). This is the same Half-A / Half-B split as
+      Part 2 — restated against the literal question.
+
+Q2: Today Hank's methods fire as a callback on create/update/delete. For
+    XMI we need BOTH the initial and the final state (from -> to /
+    changedFields). Can Hank capture both?
+
+A2: NOT as it stands — this is a real technical gap, not just wiring.
+    Verified against the code:
+    - The current AuditLog struct (db/audit.go:43-56) carries NO before/
+      after fields at all — only ObjectID, ObjectType, Action, ActionBy,
+      timestamps. There is zero from/to today.
+    - More fundamentally, the GORM v1 update hook only has access to the
+      NEW values being written (`gorm:update_attrs` /
+      updatedAttrsWithValues = what's being SET). It does NOT automatically
+      have the OLD/persisted row. GORM does not compute a from->to diff for
+      you.
+    - To produce changedFields{from,to} you must EXPLICITLY read the
+      pre-image: in a BeforeUpdate hook, SELECT the current row, stash it,
+      then diff against the new values in AfterUpdate. That is real added
+      work with real pitfalls:
+        * correctness: the read + write must be in the same transaction (or
+          the row locked) or you race another writer and capture a wrong
+          "from".
+        * cost: an extra SELECT on every update of every audited model.
+        * partial updates: GORM update-by-map only sets some columns, so
+          "final state" for un-set columns must be reconstructed from the
+          pre-image, not assumed.
+    - CONCLUSION: Hank CAN be extended to capture from->to (add a
+      pre-image read + diff in the hook, add changedFields to the emitted
+      payload) — but it is NOT free, NOT current behavior, and the
+      transactional-correctness of the pre-image read is the hard part.
+      This is the single biggest "it's not just a 50-line change" caveat
+      for doing emission in Hank.
+
+Q3: There should be a SERVICE that makes the callback-URL call to XMI or
+    publishes events to them. Can THAT service be Hank?
+
+A3: NO — because that thing is, by definition, a service, and Hank is by
+    definition not one (no package main, no runtime, no deployment — it
+    only runs inside a host process). Restating the precise mechanics:
+    - "A service that makes the callback call / publishes to XMI" needs to
+      run 24/7, own the callback_registrations state, drive retries/DLQ/
+      backoff over minutes, expose a pull endpoint + cursor, and scale
+      independently. None of that can be OWNED by a library — a library can
+      only supply code that some HOST process runs, tied to that host's
+      lifecycle, quota, and deploy cadence.
+    - If you make "the service" = one designated host that runs Hank's
+      delivery code, you have simply rebuilt orinix and renamed it. If you
+      make it = ALL 15 hosts running it, you get N owners of one table,
+      double-delivery, blast-radius inversion, coupled deploys, and secret
+      sprawl (Part 4).
+    - So the answer that's both honest and useful: the EMISSION primitive
+      belongs in Hank (Q1 + the events.Publish wiring). The DELIVERING
+      SERVICE does not and cannot be Hank — it must be an owned runtime
+      (orinix, or an existing owned service adopting the role). Hank feeds
+      that service; it cannot be it.
+
+ONE-LINE SUMMARY OF ALL THREE:
+  Hank can EMIT (on CUD, into a topic) — yes, wire audit->Publish.
+  Hank can capture FROM->TO — only if extended with a transactional
+    pre-image read; not free, not current.
+  Hank can BE the delivering service that calls XMI — no; that is
+    structurally a service, which a library cannot be.

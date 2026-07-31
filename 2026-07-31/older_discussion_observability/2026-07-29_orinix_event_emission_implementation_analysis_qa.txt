@@ -1,0 +1,451 @@
+================================================================================
+orinix — WHAT IT ACTUALLY TAKES TO EMIT THE EVENT OURSELVES
+Implementation analysis for CREATE / UPDATE / DELETE on DATA_CONNECTION
+================================================================================
+Prepared by: Aditya Bhardwaj
+Date:        2026-07-29
+For:         Anil (Architect) — and as backing detail for the 30 July Q&A
+Purpose:     Show concretely what work is required for the service-layer
+             approach, so the comparison against Hank hooks is an engineering
+             comparison and not an opinion.
+
+Companion documents:
+  2026-07-30_aditya-josh-anil-q-and-a-30-july.txt   — the meeting Q&A
+  2026-07-28_dataconnection_create_event_emission_service_layer_vs_hank_hooks.txt
+  2026-07-27_loki-datadog-hank-event-comparision.txt
+
+[VERIFIED] = read in source 2026-07-28/29.  [UNVERIFIED] = to be confirmed.
+
+================================================================================
+Q0. First, the doubt: why did you call it a "dual write" problem? We are fine
+    with the current approach.
+================================================================================
+Fair challenge, and the decision to stay as-is is fine — I am recording the
+term's meaning, not re-arguing the choice.
+
+"Dual write" is the standard name for: ONE logical operation writes to TWO
+independent systems with no shared transaction, so either can succeed while the
+other fails, and nothing reconciles them afterwards.
+
+Here the two systems are Postgres and SNS:
+
+  [VERIFIED] forebitt/db/job_v2.go:19-31 — InsertJobV2 opens a transaction,
+             writes, and COMMITS.
+  [VERIFIED] the publish happens AFTER that commit returns, in the handler, and
+             the error is logged and swallowed (job_service.go:1602-1605):
+                 eventErr := events.PublishEvent(...)
+                 if eventErr != nil { hlog...Errorln(...) }   // RPC still returns success
+
+So the failure mode is: DB row committed, SNS publish failed, event never
+existed, and no retry or reconciliation exists. That is at-most-once.
+
+Two things worth being precise about, both of which support "we are fine":
+
+  1. IT IS LOSS-ONLY, NOT PHANTOM. Because the publish is strictly AFTER the
+     commit, we can never emit an event for a row that does not exist. We can
+     only fail to emit one for a row that does. Loss is much easier to live with
+     than phantom events, and it is recoverable by other means (a backfill from
+     the source table).
+
+  2. THE ONE PLACE A PHANTOM COULD APPEAR IS PLACEMENT, NOT TRANSPORT.
+     [VERIFIED] dataConnections_v2.go:364-371 — the Snowflake setup block can
+     return an error AFTER InsertJobV2 has already committed. If we emit the
+     event before that block, we would announce a data connection the caller was
+     told failed. Fix is free: emit at the END of the handler. Covered in Q2.
+
+DECISION RECORDED: staying with fire-and-forget publish for M1. Consequence to
+state honestly in the XMI contract: delivery is at-least-once ONCE THE EVENT IS
+PUBLISHED, but publication itself is best-effort. UNIQUE(idempotency_key)
+protects against duplicates, not against loss. If we later need to close it, the
+answer is a transactional outbox, and the code changes here do not block that —
+the publish call site is the same place an outbox write would go.
+
+================================================================================
+Q1. For CREATE — what do we need to add to CreateDataConnectionV2?
+================================================================================
+ANSWER: a publish call. No new queries. Everything is already in scope.
+
+  [VERIFIED] forebitt/api/server/dataConnections_v2.go:309-381 — at the end of
+  the handler these are all live variables:
+
+    authUser        *hauth.UserDetails   // :313  — ID, Name, Email, Type
+                                         //   [VERIFIED] hank/token/authorization.go:25
+    dataType        models.ImportDataType    // :323
+    dataSource      models.ImportDataSource  // :328
+    jobModel        models.DataImportJob     // :333, ID populated by InsertJobV2
+    dbParameters  []*models.OrganizationJobParameter  // :343-354
+    protoDataConnection  *dataconnections.DataConnection // :372, with
+                                         //   JobParameters attached at :378
+
+So the AFTER state is complete and already assembled — it was built for the
+response payload. The BEFORE state is null by definition (changeType = CREATED).
+
+WHAT TO ADD — one block, immediately before the return at :379:
+
+    evt := observability.NewDataConnectionEvent(
+        observability.CREATED,
+        jobModel, dbParameters, dataSource, dataType,
+        authUser,                 // performedBy = authUser.Email
+        nil,                      // before = nil
+    )
+    if err := s.publishObservabilityEvent(ctx, evt); err != nil {
+        hlog.LogEntryCtx(ctx).Errorf("orinix publish failed for %s: %v", jobModel.ID, err)
+    }
+
+PLACEMENT: after the Snowflake block (:364-371), not after InsertJobV2 (:356).
+Per Q0(2), emitting earlier risks announcing a connection the caller was told
+failed. Emitting at the end costs nothing and is always true.
+
+RESULTING PAYLOAD:
+
+    {
+      "specversion": "1.0",
+      "id": "<uuid minted here — becomes object_events.idempotency_key>",
+      "source": "urn:habu:org:<organizationId>",        // see OPEN-1
+      "type": "com.habu.cleanroom.data_connection.created",
+      "time": "2026-07-29T09:31:07Z",
+      "data": {
+        "objectType": "DATA_CONNECTION",
+        "objectId":   "<jobModel.ID>",
+        "objectName": "<jobModel.Name>",
+        "changeType": "CREATED",
+        "changedFields": {
+          "name":        { "from": null, "to": "Adidas EMEA Customer File" },
+          "category":    { "from": null, "to": "..." },
+          "status":      { "from": null, "to": "ACTIVE" },
+          "stage":       { "from": null, "to": "MAPPING_REQUIRED" },
+          "dataSource":  { "from": null, "to": "S3" },
+          "datasetType": { "from": null, "to": "GENERIC" },
+          "credentialId":{ "from": null, "to": "<uuid or null>" },
+          "parameters":  { "from": null, "to": {
+              "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers/",
+              "SampleFilePath": "s3://adidas-emea-cleanroom/crm/schema/sample_2026_06.csv",
+              "FileFormat":     "CSV",
+              "FieldDelimiter": ",",
+              "FileHeader":     "true" } }
+        },
+        "performedBy":   "<authUser.Email>",
+        "schemaVersion": 1
+      }
+    }
+
+DEPENDENCY WORTH ONE LINE: jobModel.Stage is set at :337-341 by code whose
+notFound fallback is immediately overwritten, so Stage can land empty. Not our
+bug to fix here, but the event inherits whatever that produces — flagging so
+nobody is surprised when stage arrives as "" or STAGE_UNKNOWN.
+
+NET NEW WORK FOR CREATE: one publish block. Zero new DB reads.
+
+================================================================================
+Q2. For UPDATE — what do we need so that `from` and `to` are populated properly?
+================================================================================
+This is the only place with real work. Three concrete gaps, all solvable.
+
+--------------------------------------------------------------------------------
+GAP 1 — THE OLD PARAMETERS ARE NEVER FETCHED
+--------------------------------------------------------------------------------
+[VERIFIED] UpdateDataConnectionV2 (dataConnections_v2.go:383-455):
+    dbJob, notFound := db.FetchJobByID(s.DB, in.DataConnection.ID)   // :393
+        ^-- the JOB's before-state IS available
+    dbParameters := make([...], len(in.DataConnection.JobParameters)) // :420
+        ^-- built ENTIRELY from the request — these are the NEW values
+    err = db.UpdateJobV2(ctx, s.DB, &jobModel, dbParameters)          // :432
+
+Nowhere are the EXISTING parameter rows read. And UpdateJobV2 ->
+SetOrganizationJobParametersInTransaction -> ClearOrganizationJobParameters only
+fetches parameter IDs (job_parameters.go:72), never the rows' values.
+
+FIX: one added read before the write. The function already exists —
+    [VERIFIED] forebitt/db/job_parameters.go:20
+      func FetchOrganizationJobParameters(db *gorm.DB, queryKey *OrganizationJobParameterKey)
+                ([]*models.OrganizationJobParameter, error)
+
+    // add before line :432
+    beforeParams, err := db.FetchOrganizationJobParameters(s.DB,
+        &db.OrganizationJobParameterKey{
+            OrganizationID:  in.DataConnection.OrganizationID,
+            DataImportJobID: in.DataConnection.ID,
+        })
+
+THIS IS THE ONLY NEW QUERY IN THE ENTIRE DESIGN. One indexed read, on an update
+path that already performs several.
+
+--------------------------------------------------------------------------------
+GAP 2 — jobModel IS A PATCH, NOT THE AFTER-STATE
+--------------------------------------------------------------------------------
+[VERIFIED] forebitt/models/data_import_job.go:76-85 — NewImportJobFromProtoV2
+maps SIX fields only:
+    Name, Category, OrganizationID, ImportDataTypeID, ImportDataSourceID, CredentialID
+
+It does NOT map Status or Stage. And [VERIFIED] UpdateJobV2 (job_v2.go:45) uses
+    tx.Model(&models.DataImportJob{}).Updates(*job)
+which in GORM v1 converts the struct to a map of NON-ZERO fields — blank values
+are dropped entirely.
+
+So the row after the update = dbJob, overlaid with the non-zero subset of those
+six fields. If we naively diff dbJob against jobModel we would emit false
+changes like status: {from:"ACTIVE", to:""} for every single update.
+
+FIX — build the after-state explicitly rather than assuming jobModel is it:
+
+    after := dbJob                       // start from the true current row
+    applyNonZero(&after, jobModel)       // overlay only the fields this
+                                         // endpoint can actually change
+    changed := BuildChangedFields(dbJob, after)   // emit only real differences
+
+ALTERNATIVE, for guaranteed truth: re-fetch the row after UpdateJobV2 returns and
+diff dbJob against the re-fetched row. Costs one more read but removes all
+reasoning about GORM's zero-value semantics from our code.
+RECOMMENDATION: overlay for M1 (no extra read, and the six-field surface is small
+and explicit); re-fetch if we later extend to endpoints with a wider patch
+surface. Worth Anil's opinion — this is a correctness-vs-cost call, not a
+preference.
+
+--------------------------------------------------------------------------------
+GAP 3 — PARAMETERS MUST BE DIFFED BY BUSINESS KEY, NOT ROW ID
+--------------------------------------------------------------------------------
+[VERIFIED] job_parameters.go:150 — inParamObj.ID = uuid.New().String() on EVERY
+save. Combined with the condition-scoped DELETE at :81, editing one parameter
+destroys and recreates every parameter row with fresh primary keys.
+
+So a diff keyed on the row's primary key reports "all parameters replaced" on
+every update, forever.
+
+FIX: key the diff on (ImportDataSourceParameterID, Name) — the stable business
+identity — and emit:
+
+    "parameters": {
+      "from": { "DataLocation": "s3://adidas-emea-cleanroom/crm/customers/" },
+      "to":   { "DataLocation": "s3://adidas-emea-cleanroom/crm/customers_v2/" }
+    }
+
+i.e. only the parameters that actually changed value, keyed by parameter name.
+Also implies: we should NOT expose the parameter row id in the event at all, as
+it is unstable by construction.
+
+--------------------------------------------------------------------------------
+RESULT FOR UPDATE
+--------------------------------------------------------------------------------
+    "type": "com.habu.cleanroom.data_connection.updated",
+    "changeType": "UPDATED",
+    "changedFields": {
+      "parameters": {
+        "from": { "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers/",
+                  "FieldDelimiter": "," },
+        "to":   { "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers_v2/",
+                  "FieldDelimiter": "|" }
+      }
+    }
+
+NET NEW WORK FOR UPDATE: one added read, one overlay helper, one diff function,
+one publish block.
+
+================================================================================
+Q3. For DELETE — what is needed?
+================================================================================
+[VERIFIED] DeleteImportJob (job_service.go:1846) already has the full
+before-state: dbJob fetched at :1858, still in scope at the existing publish at
+:1932.
+
+  - `to` is null for every field (changeType = DELETED).
+  - `from` = dbJob. If we want parameters in `from`, add the same
+    FetchOrganizationJobParameters call from Gap 1. Recommend yes — a delete
+    event that cannot tell you what the connection was configured as is much
+    less useful for the "what did we lose" question.
+  - Emission point: beside the existing thin publish at :1932, not replacing it
+    (pegleg/janus depend on the thin one).
+  - Note it is a SOFT delete (db.SoftDeleteJob -> job.go:185), so DELETED here
+    means "removed from the user's view", not "row gone". Worth stating in the
+    contract so XMI does not assume the data is unrecoverable.
+
+NET NEW WORK FOR DELETE: one optional read, one publish block.
+
+================================================================================
+Q4. Full work breakdown — everything, not just the handler code
+================================================================================
+
+A. CONTRACT / PAYLOAD  (new code, forebitt)
+  A1. New package forebitt/services/observability/ holding the CloudEvents
+      envelope struct + the DATA_CONNECTION data struct.
+  A2. BuildChangedFields(before, after) — reflective or explicit field diff,
+      returning map[string]{from,to}. Explicit is better here: it doubles as the
+      field allow-list, so nothing new leaks into the event just because someone
+      added a column.
+  A3. diffParameters(before, after []*OrganizationJobParameter) keyed on
+      (ImportDataSourceParameterID, Name)  — per Gap 3.
+  A4. applyNonZero(dst *DataImportJob, patch DataImportJob) — per Gap 2.
+  A5. Idempotency key: uuid v4 minted ONCE at the publish site, carried as the
+      CloudEvents `id`, reused unchanged across any in-call retry. This becomes
+      object_events.idempotency_key and the X-Habu-Event-Id delivery header.
+
+B. TRANSPORT WIRING  (forebitt)
+  B1. [VERIFIED] forebitt/api/server/server.go:72 currently has
+          Events *hevent.Config
+      Add a sibling:
+          ObservabilityEvents *hevent.Config
+  B2. [VERIFIED] forebitt/cmd/forebitt/commands/server.go:86 currently calls
+          events.AddEvents(startServerCommand.Flags(), "events")
+      Add:
+          events.AddEvents(startServerCommand.Flags(), "observability-events")
+  B3. Publish helper. NOTE: hevent.Publish is typed to EventStruct, but the
+      layer underneath is not —
+        [VERIFIED] hank/aws/sns/service.go:34
+          func (s SNS) Publish(ctx, message any, topicARN string, attrs ...) (string, error)
+      so we call hank/aws/sns directly with our own struct. No hank change
+      required, and we still inherit the shared session, assume-role and the
+      automatic requestId attribute (:40).
+  B4. Hold ONE SNS client on the Server rather than copying hevent.New-per-call
+      (hank/events/service.go:18 builds a client on every publish).
+  B5. Message attributes for filtering: set object="dataConnection",
+      action=created|updated|deleted, service="forebitt", schema="cloudevents".
+
+C. CONFIG / INFRASTRUCTURE
+  C1. orinjade Terraform: new STANDARD SNS topic habu-observability-events
+      (module alongside aws/modules/habu-events), plus SQS ingest queue,
+      subscription, queue policy, DLQ + redrive.
+  C2. IAM: forebitt's task role needs sns:Publish on the new topic ARN.
+  C3. dyogram/charts/forebitt/values.yaml — new topicArn key (mirrors the
+      existing one at :188).
+  C4. fiddley control-plane forebitt overrides, prod + stage — the real ARNs
+      (mirrors prod-overrides.yaml:78).
+  C5. SHIP DARK: if the topic ARN is empty, skip publishing. Lets the code merge
+      and deploy before the infra exists, and gives an instant kill switch.
+
+D. ORINIX SIDE
+  D1. SQS listener on the new queue.
+  D2. Parse CloudEvents -> insert into object_events with idempotency_key
+      (ON CONFLICT DO NOTHING) and the cursor sequence.
+  D3. Nothing else changes — GetCleanroomEvents, delivery, replay all already
+      read from object_events.
+
+E. TESTS
+  E1. Diff-function unit tests. This is where the real value is: create-with-N-
+      params, update-one-field, update-one-parameter, parameter added, parameter
+      removed, no-op update (must emit nothing or an empty diff — decide which).
+  E2. Handler tests: existing pattern to copy —
+      [VERIFIED] forebitt/api/server/linked_data_import_job_test.go:838
+          patches.ApplyFuncReturn(events.PublishEvent, nil)
+  E3. One end-to-end through localstack if cheap (hank already has a localstack
+      SNS test at hank/events/service_test.go:17).
+
+F. ROLLOUT
+  F1. Merge behind the empty-ARN guard (C5).
+  F2. Enable in stage, verify object_events rows appear with correct diffs.
+  F3. Enable in prod.
+
+================================================================================
+Q5. Why can Hank hooks not do this? Spell out the "5-6 hook combination" problem.
+================================================================================
+For Anil, the cleanest way to put it: describe the ASSEMBLER you would have to
+build, and let the list speak.
+
+One CreateDataConnectionV2 with 3 parameters produces FIVE hook firings
+  [VERIFIED trace: dataConnections_v2.go:356 -> job_v2.go:13 -> job_parameters.go:109]
+
+  1  INSERT data_import_jobs                          -> AfterCreate
+  1  DELETE organization_job_parameters (matches ZERO -> AfterDelete  (phantom)
+       rows on a create; condition-scoped, job_parameters.go:81)
+  3  INSERT organization_job_parameters               -> AfterCreate x3
+
+To turn those five back into the ONE event from Q1, something must:
+
+  1. CORRELATE them. Only key available is RequestID. Works only if it is
+     populated on every path [UNVERIFIED], and one request is not always one
+     business event — CreateImportJobV2 (job_service.go:1293) performs a
+     create-or-update PLUS a parameter replacement under a single request id.
+
+  2. IDENTIFY THE AGGREGATE ROOT. Records 1 and 3-5 are structurally identical.
+     Nothing in the record says DataImportJob is the root and
+     OrganizationJobParameter is a child — that mapping exists only in the proto
+     layer (models.NewImportJobFromProtoV2). The assembler needs a hand-
+     maintained table->aggregate map living outside the producer that owns it.
+
+  3. KNOW WHEN IT IS DONE. This is the one with no good answer. There is no
+     count, no transaction id, no end-of-transaction marker in the record. The
+     assembler cannot distinguish "3 parameters, all arrived" from "5
+     parameters, 2 still in flight". The only implementable answer is a timer
+     plus a heuristic — i.e. every event is delayed by the timeout, and a slow
+     message silently produces a WRONG event rather than a late one.
+
+  4. DISCARD THE PHANTOM DELETE (record 2), which is an artifact of the
+     delete-then-reinsert implementation and means nothing to a consumer.
+
+  5. RECONSTRUCT THE VALUES. Impossible today — [VERIFIED] hank/db/audit.go's
+     AuditLog carries no field values at all, only
+     ObjectID/ObjectName/ObjectType/Action/actor/Method/OrgID/RequestID.
+
+  6. HANDLE THE MISSING IDENTITY. [VERIFIED] SoftDeleteJob (job.go:185) passes
+     an empty struct with the id in the WHERE clause, so the delete record has
+     ObjectID "". The assembler cannot even tell which connection was deleted.
+
+  7. TOLERATE OUT-OF-ORDER ARRIVAL, since neither logs nor SNS Standard preserve
+     order across records.
+
+  8. BE MAINTAINED PER OBJECT TYPE, forever, in orinix — every new aggregate
+     needs its own root map and completeness rule.
+
+And even if all eight were solved, item 5 requires changing Hank's shared hook
+anyway (~91 models, fleet-wide extra SELECT per update, plus a redaction policy
+because primage.Credential.Value embeds hdb.Audit). At which point we have paid
+the per-path cost of the service-layer approach AND built the assembler.
+
+  THE ONE-LINER FOR ANIL:
+    The hook fires per ROW. The contract is per RESOURCE. The mapping between
+    them — which rows form one business action, which one is the root, and when
+    the set is complete — exists only in the service layer. Emitting there uses
+    that knowledge; emitting from the hook throws it away and asks orinix to
+    guess it back, with a timer.
+
+================================================================================
+Q6. Effort comparison
+================================================================================
+
+  WORK ITEM                          SERVICE LAYER (A)      HANK HOOKS (B)
+  ---------------------------------  ---------------------  ----------------------
+  New DB reads                       1 (update path)        1 per UPDATE, fleet-wide
+  Handler changes                    4 sites in forebitt    0
+  Shared-library change              none                   hank (5 consumers)
+  Redaction policy needed            no (explicit allow-    yes, ~91 models
+                                     list by construction)
+  Assembler in orinix                none                   items 1-8 above
+  Completeness guarantee             exact                  heuristic + timer
+  Values available                   yes, already in scope  requires hank change
+  Correct for condition-scoped       yes                    no (no PK to diff)
+    writes (our 2 deletes)
+  Blast radius if wrong              one endpoint           every Hank consumer
+  Coverage of claim-less paths       yes                    no (claims gate)
+
+Where Hank hooks ARE right: Josh's M3 audit firehose — "who touched which row,
+when" — where row-grain is the correct grain and the breadth is the point. That
+is a genuinely valuable product; it is just answering a different question than
+XMI is asking.
+
+================================================================================
+OPEN ITEMS NEEDING A DECISION
+================================================================================
+OPEN-1  CLEANROOM SCOPING. The approved envelope uses
+        "source":"urn:habu:cleanroom:<cleanroom-id>" and object_events is
+        queried by cleanroom_id, but DataImportJob carries OrganizationID and no
+        CleanroomID [VERIFIED forebitt/models/data_import_job.go:20]. A data
+        connection is org-scoped and may serve several cleanrooms. Options:
+        (a) org-scoped source urn:habu:org:<id> with cleanroom_id null,
+        (b) fan out one event per attached cleanroom,
+        (c) emit once, let orinix expand at read time.
+        This determines the primary query key. NEEDS A DECISION.
+
+OPEN-2  AFTER-STATE: overlay vs re-fetch (Gap 2). Correctness-vs-one-read.
+
+OPEN-3  NO-OP UPDATES. If a caller PUTs an identical payload, changedFields is
+        empty. Emit nothing, or emit an event with an empty diff? Recommend emit
+        nothing — but XMI may want the heartbeat.
+
+OPEN-4  TWO CREATE PATHS. CreateDataConnectionV2 vs CreateImportJobV2
+        (job_service.go:1293, a create-or-update orchestrator where the draft
+        flow makes a user "create" arrive as an UPDATE). Are both live in prod?
+        If so, instrument both without double-emitting when one calls the other.
+
+OPEN-5  WHERE THE PAYLOAD TYPE LIVES. Fine in forebitt for one producer. When
+        unhygienix/picanmix start producing, do we share a Go module, or treat
+        the JSON schema as the contract and let each service own its struct?
+        Recommend the latter — sharing a Go type would recreate exactly the
+        coupling we are avoiding by not widening hevent.EventStruct.

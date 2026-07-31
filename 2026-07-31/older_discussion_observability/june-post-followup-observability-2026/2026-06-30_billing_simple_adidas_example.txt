@@ -1,0 +1,229 @@
+Billing for a Question Run — Simple Explanation
+Date: 2026-06-30
+Example: Adidas running a hybrid clean room query on MEDIUM compute
+
+------------------------------------------------------------------------
+
+FIRST THING TO KNOW — MEDIUM SIZE CLUSTER DOES NOT AFFECT THE BILL
+
+This surprises most people. The t-shirt size (MEDIUM, LARGE etc.) affects how
+FAST the query runs and how much AWS infrastructure Habu pays internally.
+It does NOT change what Adidas gets charged.
+
+Adidas is billed purely on: HOW MANY ROWS DID YOUR DATA CONTRIBUTE TO THE QUERY.
+That's it. That one number. Called "rowAccessCount".
+
+------------------------------------------------------------------------
+
+THE ADIDAS EXAMPLE — STEP BY STEP
+
+Adidas is the clean room OWNER. They have a clean room with a partner, say Nike.
+Adidas wants to run a query: "how many customers overlap between us and Nike?"
+
+Their clean room has two datasets:
+  - Adidas Transactions dataset:  1,200,000 rows
+  - Adidas Customer IDs dataset:    800,000 rows
+
+Nike also has their own datasets in the same clean room, but Nike gets billed
+separately on their side. This event is only about billing Adidas.
+
+------------------------------------------------------------------------
+
+WHAT HAPPENS WHEN THE QUERY RUNS
+
+Step 1 — Airflow kicks off the DAG
+  DAG: hybrid-aws-databricks-tee-crqr-clean-compute
+  Config passed in:
+    clean_room_id:              "cr-9757cd58-..."
+    clean_room_question_id:     "crq-69346a54-..."
+    clean_room_question_run_id: "crqr-a34da295-..."
+    organization_id:            "org-e56bbe84-..."   <- this is Adidas's Habu org ID
+
+Step 2 — Spark job runs on MEDIUM compute (AWS EKS)
+  MEDIUM t-shirt means Spark gets:
+    30 to 60 executors
+    48 GB memory per executor
+    4 CPU cores per executor
+  This is just the engine size. Does not affect Adidas's bill.
+
+Step 3 — Spark finishes and writes a stats file to S3
+  Location:
+    s3://habu-output-bucket/tee-output/
+      cleanroom=cr-9757cd58/
+        question=crq-69346a54/
+          run=crqr-a34da295/
+            stats/run_statistics.txt
+
+  Inside that file (simplified):
+    {
+      "metaDataJson": {
+        "metrics": {
+          "coreHourUsage":    "12.4",
+          "memoryGbHour":     "595.2",
+          "totalInputBytes":  4831838208,
+          "totalOutputBytes": 1048576
+        }
+      },
+      "rowCounts": {
+        "adidas_transactions": { "count": 1200000, "clientExecution": true },
+        "adidas_customer_ids": { "count": 800000,  "clientExecution": true },
+        "nike_customers":      { "count": 950000,  "clientExecution": false }
+      }
+    }
+
+  See "clientExecution": true for Adidas datasets, false for Nike's.
+  Only clientExecution=true rows count toward ADIDAS's bill.
+  Nike's 950,000 rows count toward Nike's separate bill.
+
+Step 4 — Pegleg reads the stats file and calls unhygienix
+  File: pegleg/.../tee/PostRunConfigService.java -> TeeUtil.captureRunStats()
+
+  Pegleg sends to unhygienix:
+    - cpuHour:     "12.4"          <- stored but NOT billed
+    - memoryHour:  "595.2"         <- stored but NOT billed
+    - durationMs:  44700000        <- 44 seconds, stored but NOT billed
+    - inputBytes:  4,831,838,208   <- stored but NOT billed
+    - outputBytes: 1,048,576       <- stored but NOT billed
+    - dataset stats: per-dataset row counts
+
+  ALL of the above go into the clean_room_question_run_statistics table in
+  unhygienix. They are useful for debugging and monitoring but NONE of them
+  are the billing number.
+
+Step 5 — unhygienix calculates rowAccessCount
+  File: unhygienix/.../db/cleanroom_run_stats.go (ListQuestionRunBillingMetrics)
+
+  The SQL does this:
+    For each dataset where clientExecution = true:
+      take the MAX(record_count)     <- handles retries/duplicates safely
+    Then SUM across all datasets:
+      1,200,000 (adidas_transactions)
+    +   800,000 (adidas_customer_ids)
+    = 2,000,000 rows  <- this is rowAccessCount
+
+  Rules:
+    - clientExecution = false rows are EXCLUDED (Nike's data is Nike's problem)
+    - If ANY dataset has a negative record count, the WHOLE RUN is excluded
+      (safety check for bad data)
+    - MAX per dataset is used so retries don't double-count
+
+  unhygienix creates a billing_status record:
+    billing_status_id: "bs-uuid-123"
+    organization_id:   "org-e56bbe84-..."   <- Adidas Habu org ID
+    run_id:            "crqr-a34da295-..."
+    row_access_count:  2000000
+    billable:          true
+    sent_to_billing:   false                <- not sent yet
+
+Step 6 — A separate billing DAG runs (async, not tied to the question run)
+  File: pegleg/.../billing/BillingService.java (submitUnsentMetricsToBilling)
+
+  The billing DAG/command calls:
+    BillingService.submitUnsentMetricsToBilling("org-e56bbe84-...")
+
+  It:
+    1. Asks unhygienix: "give me all unsent billing metrics for this org"
+    2. Gets back the QuestionRunMetric for Adidas's run
+    3. Translates Habu org ID -> LiveRamp org ID
+       (Adidas's Habu org "org-e56bbe84-..." maps to LiveRamp org "LR-ORG-abc123")
+       If this mapping doesn't exist, metric is SILENTLY SKIPPED (just a warning log)
+    4. Builds the BillingEvent JSON payload
+    5. Publishes to GCP Pub/Sub:
+         project: liveramp-events-prod
+         topic:   billing_v2-raw-metrics
+    6. Gets an ACK message ID back from Pub/Sub
+    7. Marks billing_status as sent_to_billing = true in unhygienix
+
+------------------------------------------------------------------------
+
+EXACT JSON PAYLOAD SENT TO GCP PUB/SUB (billing_v2-raw-metrics)
+
+  {
+    "version":     2,
+    "ts":          1751320000000,
+
+    "product":     "clean-room",
+    "system":      "pricing_hub",
+
+    "entity_type": "cac_organization",
+    "entity_id":   "LR-ORG-abc123",        <- LiveRamp org ID (NOT Habu org ID)
+
+    "group_type":  "question_run",
+    "group_id":    "crqr-a34da295-b833-405e-af7c-...",   <- the run ID
+    "group_name":  "Q1 Customer Overlap / Run 2026-06-30",
+
+    "metric_type": "usage",
+    "units":       2000000,                 <- THE ONLY NUMBER THAT MATTERS FOR BILLING
+                                               = 1.2M (adidas transactions)
+                                               + 0.8M (adidas customer IDs)
+
+    "billable":    true,
+
+    "ui_groups": [
+      {
+        "id":   "cr-9757cd58-...",
+        "type": "clean_room",
+        "name": "Adidas x Nike Clean Room"
+      },
+      {
+        "id":   "crq-69346a54-...",
+        "type": "clean_room_question",
+        "name": "Q1 Customer Overlap Analysis"
+      },
+      {
+        "id":   "jane.smith@adidas.com",
+        "type": "user",
+        "name": "Jane Smith"
+      }
+    ],
+
+    "metadata": {
+      "habu_account_id":   "acct-uuid-adidas",
+      "habu_account_name": "Adidas",
+      "created_by":        "jane.smith@adidas.com",
+      "owner":             true,
+      "owner_org_id":      "org-e56bbe84-..."
+    },
+
+    "custom_fields": {}
+  }
+
+------------------------------------------------------------------------
+
+WHAT THE LIVERAMP BILLING SYSTEM DOES WITH THIS
+
+LR pricing hub receives the Pub/Sub message and knows:
+  - WHO:   LR-ORG-abc123 (Adidas in LiveRamp's system)
+  - WHAT:  "usage" of "clean-room" product
+  - HOW MUCH: 2,000,000 units (rows accessed)
+  - BILLABLE: yes
+
+LR pricing hub then applies their rate card:
+  e.g. $X per 1000 rows accessed = Adidas's invoice line item
+
+Habu does NOT know the rate. Habu just sends the row count.
+LR pricing hub owns the actual dollar amount calculation.
+
+------------------------------------------------------------------------
+
+QUICK SUMMARY IN ONE PARAGRAPH
+
+When Adidas runs a query, Spark processes their data, writes a stats file to S3,
+and pegleg reads it. Pegleg passes the per-dataset row counts to unhygienix.
+Unhygienix adds up the MAX row count for each of Adidas's own datasets
+(only clientExecution=true ones) and calls that "rowAccessCount" = 2,000,000.
+Later, a billing DAG picks up this number, wraps it in a BillingEvent JSON,
+and publishes it to GCP Pub/Sub (liveramp-events-prod). LiveRamp's pricing hub
+reads that message and applies a rate to generate the invoice.
+The MEDIUM cluster size, CPU hours, memory hours, query duration — none of that
+appears in the billing message. Adidas pays for rows touched, not compute used.
+
+------------------------------------------------------------------------
+
+NOTE ON CREDENTIALS (relevant to orinix discussion)
+
+The GCP Pub/Sub publish in BillingMessagePublisherHelper uses a STATIC JSON
+service account key fetched from Primage (Habu's secrets manager). This works
+but is fragile — LR rotates the key, Habu must update Primage and redeploy.
+For orinix's XMI delivery, we want Workload Identity Federation instead.
+Same SDK (com.google.cloud.pubsub.v1.Publisher). Different auth approach.

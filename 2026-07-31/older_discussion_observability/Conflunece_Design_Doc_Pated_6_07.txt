@@ -1,0 +1,859 @@
+package aditya_observability_discussion
+DV-13856 — Cleanroom Observability: Event Notification Design
+
+Mirro : Design :  https://miro.com/app/board/uXjVHLcSxuI=/?share_link_id=244206250371
+
+Problem
+Cleanroom consumers—starting with XMI and expanding to future partners—currently have no standardized way to know when objects inside a cleanroom change.
+
+Examples include:
+
+A data connection moves from  CONFIGURATION_COMPLETE to Deleted.
+
+A question's SQL is modified
+
+An export job destination changes
+
+Today, consumers learn about these changes through:
+
+Manual communication
+
+Polling individual resource endpoints
+
+This creates:
+
+Delayed downstream reactions
+
+Broken workflows
+
+Increased support overhead
+
+The goal is to build a first-class event notification layer that captures all cleanroom object mutations and exposes them through a structured, reliable, cloud-agnostic interface.
+
+What We Are Building
+The observability solution consists of three major components.
+
+1. Event Capture
+Every mutation to:
+
+QUESTION
+
+DATA_CONNECTION
+
+EXPORT_JOB
+
+is captured as an immutable event row inside a centralized append-only table:
+
+
+
+object_events
+stored in the Unhygienix/New Service (later discussed) database.
+
+Each event contains a structured diff:
+
+
+
+{
+"field": {
+"from": "<old-value>",
+"to": "<new-value>"
+}
+}
+Schema: CNCF CloudEvents
+The event schema is based on CNCF (Cloud Native Computing Foundation) CloudEvents v1.0, the industry-standard specification for event-driven systems.
+
+CloudEvents is widely adopted across the industry and serves as the foundation for event delivery in platforms such as:
+
+Stripe Events
+
+GitHub Webhooks
+
+Salesforce Platform Events
+
+AWS EventBridge
+
+Google Eventarc
+
+Azure Event Grid
+
+By adopting CloudEvents, We align with a well-known standard that engineering teams already understand. Consumers do not need to learn a proprietary LiveRamp-specific event envelope, and integrations can leverage existing tooling, SDKs, and event-processing frameworks.
+
+CloudEvents Envelope
+
+
+{
+"specversion": "1.0",
+"id": "<event-uuid>",
+"source": "urn:habu:cleanroom:<cleanroom-id>",
+"type": "com.habu.cleanroom.<object-type>.<action>",
+"time": "<RFC3339 UTC timestamp>",
+"data": {
+"objectType": "<QUESTION | DATA_CONNECTION | EXPORT_JOB>",
+"objectId": "<uuid>",
+"objectName": "<name at time of event>",
+"changeType": "<CREATED | UPDATED | DELETED>",
+"changedFields": {
+"<field>": {
+"from": "<old-value>",
+"to": "<new-value>"
+}
+},
+"performedBy": "<user-email or system:service-name>",
+"schemaVersion": 1
+}
+}
+Why CloudEvents
+1. Industry Standard
+CloudEvents has become the de facto standard for event exchange across modern cloud platforms and SaaS ecosystems.
+
+Consumers already understand concepts such as:
+
+id
+
+source
+
+type
+
+	time
+
+which reduces onboarding effort and minimizes custom integration code.
+
+Example event type:
+
+
+
+com.habu.cleanroom.data_connection.updated
+The reverse-DNS naming convention is consistent with patterns already used across the industry.
+
+2. Vendor Neutral
+CloudEvents is supported natively across all major cloud providers:
+
+AWS EventBridge
+
+Google Eventarc
+
+Azure Event Grid
+
+Cloud infrastructure uses the standard CloudEvents metadata fields:
+
+specversion
+
+source
+
+type
+
+for routing, filtering, and subscription management, while LiveRamp’s business payload remains inside the data section.
+
+As a result:
+
+XMI on GCP
+
+Microsoft on Azure
+
+Future consumers on any cloud
+
+all receive the exact same payload without cloud-specific transformations.
+
+3. Delivery Model Independence
+The schema is completely independent of the delivery mechanism.
+
+The same CloudEvents payload can be delivered through:
+
+Pull APIs
+
+Webhooks
+
+Cloud-native queues
+
+Changing delivery models does not require:
+
+Schema changes
+
+Database changes
+
+API contract changes
+
+This allows Habu to introduce additional delivery mechanisms over time without impacting existing consumers.
+
+4. Consistent Change Representation
+Every object type uses the same changedFields structure:
+
+
+
+{
+"field": {
+"from": "<old-value>",
+"to": "<new-value>"
+}
+}
+Examples:
+
+
+
+{
+"changedFields": {
+"stage": {
+"from": "MAPPING_REQUIRED",
+"to": "CONFIGURATION_COMPLETE"
+}
+}
+}
+
+
+{
+"changedFields": {
+"sqlQuery": {
+"from": "SELECT ... WHERE amount > 100",
+"to": "SELECT ... WHERE amount > 50"
+}
+}
+}
+
+
+{
+"changedFields": {
+"destination": {
+"from": "s3://a/a.bcs",
+"to": "s3://b/b.abc"
+}
+}
+}
+Because every change follows the same { from, to } pattern, consumers can process all object types using a single parsing model without branching logic for specific resources.
+
+2. Internal Event Distribution and Storage
+All producing services publish post-commit events to a shared SNS topic.
+
+
+
+unhygienix
+forebitt
+picanmix
+│
+▼
+AWS SNS: habu-object-events
+The architectural decision is where those events are persisted and who owns the event retrieval API.
+
+Option A — Pegleg Consumer, unhygienix Owns Event Store
+Architecture
+
+
+AWS SNS: habu-object-events
+│
+▼
+SQS: sqs-habu-object-events-internal
+│
+▼
+Pegleg (SQS Consumer)
+[1] Read event from SQS
+[2] gRPC: unhygienix.RecordEvent(event)
+│
+▼
+unhygienix.RecordEvent()
+[3] INSERT INTO object_events
+│
+▼
+unhygienix.GetCleanroomEvents()
+│
+▼
+external-api-server
+│
+▼
+REST API
+New gRPC Methods
+
+
+service UnhygienixService {
+rpc RecordEvent(RecordEventRequest)
+returns (RecordEventResponse);
+rpc GetCleanroomEvents(GetCleanroomEventsRequest)
+returns (GetCleanroomEventsResponse);
+}
+message RecordEventRequest {
+string object_id    = 1;
+string object_type  = 2;
+string event_type   = 3;
+string changed_by   = 4;
+string org_id       = 5;
+string cleanroom_id = 6;
+bytes  before_state = 7;
+bytes  after_state  = 8;
+}
+message GetCleanroomEventsRequest {
+string cleanroom_id = 1;
+string org_id       = 2;
+int64  since_cursor = 3;
+string object_type  = 4;
+int32  limit        = 5;
+}
+Why This Works
+Pegleg already communicates with unhygienix through gRPC.
+
+Activity Feed is fundamentally a cleanroom concept.
+
+external-api-server already depends heavily on unhygienix.
+
+No additional service deployment is required.
+
+Trade-offs
+Pros
+
+Lowest implementation cost.
+
+No additional infrastructure.
+
+No new service ownership.
+
+Cons
+
+Pegleg becomes responsible for event routing despite observability being outside its domain.
+
+unhygienix grows observability responsibilities.
+
+Event-store schema changes require migrations inside the largest service in the platform.
+
+Future observability features further increase coupling.
+
+Option B — orinix ( a new Dedicated Observability Service )
+Architecture
+
+
+AWS SNS: habu-object-events
+│
+▼
+SQS: sqs-habu-object-events-internal
+│
+▼
+orinix
+[1] Read event from SQS
+[2] INSERT INTO object_events
+[3] Serve GetCleanroomEvents()
+│
+▼
+external-api-server
+│
+▼
+REST API
+Service Responsibilities
+
+
+orinix/
+├── proto/
+│   └── events.proto
+├── db/
+│   └── object_events
+├── consumer/
+│   └── SqsEventConsumer
+└── server/
+└── EventServiceImpl
+Producer Integration
+Each producer simply publishes to SNS:
+
+
+
+snsClient.publish(PublishRequest.builder()
+.topicArn(HABU_OBJECT_EVENTS_TOPIC)
+.message(objectEvent.toJson())
+.build());
+No additional integrations are required.
+
+Why This Works
+This follows the same architectural pattern as Gangway.
+
+Observability becomes an independent platform service responsible for:
+
+Event ingestion
+
+Event storage
+
+Event retrieval
+
+Delivery tracking
+
+Webhook infrastructure
+
+Callback registrations
+
+Trade-offs
+Pros
+
+Clear domain ownership.
+
+Independent schema evolution.
+
+Future webhook functionality belongs naturally in the same service.
+
+Minimal impact on existing cleanroom services.
+
+Cons
+
+Additional service deployment.
+
+Additional database ownership.
+
+Additional gRPC endpoint.
+
+Higher initial setup cost.
+
+3. Delivery Layer
+Regardless of which storage architecture is selected, all consumers interact through the same event retrieval interface.
+
+
+
+GetCleanroomEvents()
+│
+▼
+external-api-server
+│
+▼
+REST API
+The delivery layer is intentionally decoupled from the event storage implementation.
+
+Whether events are stored in:
+
+unhygienix (Option A)
+
+orinix (Option B)
+
+the external contract remains identical.
+
+This allows delivery mechanisms to evolve independently from storage architecture.
+
+Architectural Recommendation
+MVP Recommendation
+Option A (Pegleg → unhygienix)
+
+Advantages:
+
+Lowest implementation cost
+
+Fastest path to production
+
+Reuses existing infrastructure
+
+Enables Activity Feed immediately
+
+
+Option B (orinix)
+
+Observability is a cross-cutting concern that naturally expands into:
+
+Delivery logs
+
+Webhook registrations
+
+Callback workers
+
+Retry infrastructure
+
+Consumer-specific delivery policies
+
+Keeping those concerns isolated prevents unhygienix from becoming the owner of unrelated platform functionality.
+
+As the observability platform grows, Option B provides cleaner ownership boundaries and lower long-term maintenance cost.
+
+Design :  https://miro.com/app/board/uXjVHLcSxuI=/?share_link_id=843777366530Your team sees richer Miro previewsConnect
+
+Design-Observability-Option-A-MVP-20260602-074641.jpg
+
+
+
+
+Internal Architecture
+
+
+unhygienix (QUESTION/DATA_CONNECTION)
+forebitt   (DATA_CONNECTION)
+picanmix   (EXPORT_JOB)
+│
+▼
+AWS SNS: habu-object-events
+│
+▼
+SQS Consumer (Pegleg)
+│
+▼
+INSERT INTO object_events
+│
+▼
+object_events
+│
+▼
+gRPC: GetCleanroomEvents
+│
+▼
+external-api-server REST API
+object_events Characteristics
+Property
+
+Design
+
+Storage Model
+
+Append-only
+
+Updates Allowed
+
+No
+
+Deletes Allowed
+
+No
+
+Cursor
+
+PostgreSQL Sequence
+
+changed_fields
+
+JSONB
+
+Scope
+
+Organization-scoped
+
+Key Design Decisions
+No Service-to-Service Calls
+Forebitt publishes to SNS only.
+
+Benefits:
+
+No circular dependency
+
+Loose coupling
+
+Independent deployments
+
+Append-Only Storage
+Database-level enforcement:
+
+
+
+REVOKE UPDATE, DELETE
+FROM unhygienix_app;
+Organization Isolation
+Flow:
+
+
+
+JWT
+│
+▼
+external-api-server
+│
+▼
+org_id claim
+│
+▼
+unhygienix
+Filtering:
+
+
+
+WHERE org_id = <jwt_claim>
+No customer-specific configuration required..
+
+Delivery Approaches
+The event schema and storage layer remain identical across all approaches.
+
+Only the delivery mechanism changes.
+
+Approach 1 — Pull API
+Flow
+
+
+XMI
+│
+│ GET /events?since=<cursor>
+▼
+Habu Event API
+│
+▼
+CloudEvents Batch
+Request
+
+
+GET /v1/cleanrooms/cr-abc/events
+?since=<cursor>
+&objectType=DATA_CONNECTION
+Response
+
+
+{
+"events": [],
+"nextCursor": "<cursor>",
+"hasMore": false
+}
+XMI Responsibilities
+Schedule polling job
+
+Store cursor
+
+Process returned events
+
+No inbound infrastructure required.
+
+Habu Responsibilities
+object_events table
+
+gRPC endpoint
+
+REST endpoint
+
+Operational Details
+ETag Support
+
+
+304 Not Modified
+No payload transferred when nothing changed.
+
+Rate Limiting
+Headers:
+
+
+
+X-RateLimit-Remaining
+X-RateLimit-Reset
+Organization Isolation
+JWT-driven filtering.
+
+Trade-Off
+Benefit
+
+Cost
+
+Simplest implementation
+
+Polling latency
+
+Minimal customer setup
+
+Not real-time
+
+Enables Activity Feed
+
+30–60 second delay
+
+Approach 2 — Push Webhooks
+Registration
+
+
+POST /v1/cleanrooms/{id}/callbacks
+
+
+{
+"objectType": "DATA_CONNECTION",
+"objectId": null,
+"callbackUrl": "https://events.xmi.liveramp.com/habu-webhook",
+"monitoredFields": [
+"stage",
+"destination",
+"sqlQuery"
+]
+}
+Response
+
+
+{
+"id": "cb-456",
+"signingSecret": "whsec_xxx"
+}
+Delivery
+
+
+POST https://events.xmi.liveramp.com/habu-webhook
+Authorization: Bearer <token>
+X-Habu-Signature: <hmac>
+X-Habu-Event-Id: <event-id>
+Content-Type: application/cloudevents+json
+XMI Responsibilities
+Host HTTPS endpoint
+
+Verify HMAC signature
+
+Deduplicate events
+
+Habu Responsibilities
+callback_registrations table
+
+Delivery worker
+
+delivery_log table
+
+Operational Details
+Consumer Isolation
+
+
+sqs-habu-delivery-xmi
+sqs-habu-delivery-microsoft
+sqs-habu-delivery-safehaven
+Each consumer has an independent queue.
+
+Retry Policy
+5 attempts
+
+Exponential backoff
+
+Jitter
+
+DLQ on exhaustion
+
+Observability
+HTTP status
+
+Latency
+
+Outcome
+
+Traceparent header
+
+All captured in delivery_log.
+
+Trade-Off
+Benefit
+
+Cost
+
+Near real-time delivery
+
+Customer must expose HTTPS endpoint
+
+Lower latency
+
+More infrastructure
+
+Cloud agnostic
+
+Retry management
+
+Approach 3 — Cloud-Native Queue Delivery (Highest operational cost)
+GCP Example
+
+
+AWS SNS
+│
+▼
+AWS SQS
+│
+▼
+AWS Lambda / ECS Bridge
+│
+▼
+GCP Pub/Sub
+│
+▼
+XMI
+Additional Infrastructure
+For each customer:
+
+Dedicated queue
+
+Bridge service
+
+IAM setup
+
+Secrets management
+
+Key rotation process
+
+Cloud-Specific Complexity
+Cloud
+
+Required Bridge
+
+AWS
+
+Native
+
+GCP
+
+Pub/Sub SDK
+
+Azure
+
+Service Bus SDK
+
+Future Cloud
+
+New implementation
+
+Trade-Off
+Benefit
+
+Cost
+
+Native queue integration
+
+Highest operational complexity
+
+Works for strict enterprise environments
+
+Per-cloud engineering ownership
+
+Same schema
+
+Increased support burden
+
+Recommendation
+V1 — Pull API
+Recommended initial implementation.
+
+Benefits:
+
+Lowest infrastructure cost
+
+Fastest delivery
+
+Enables Activity Feed
+
+Establishes foundational event platform
+
+Deliverables:
+
+object_events
+
+GetCleanroomEvents
+
+External REST API
+
+V2 — Webhook Push
+Build on the V1 foundation.
+
+Benefits:
+
+Near real-time notifications
+
+Reusable delivery worker
+
+No schema changes
+
+V3 — Cloud-Native Queue
+Reserved for special contractual or enterprise requirements. Eg Service Account changes on their end for Pub/Sub can break the flow without any changes from our end.
+
+Not recommended as the default integration model.
+
+Final Recommendation
+Phase
+
+Delivery Model
+
+Recommendation
+
+V1
+
+Pull API
+
+Recommended
+
+V2
+
+Webhooks
+
+Add for real-time use cases
+
+V3
+
+Cloud-Native Queue
+
+Special-case only
+
+The CloudEvents v1.0 schema and the uniform changedFields { from, to } structure remain unchanged across all phases, ensuring long-term compatibility and minimizing integration effort for consumers.

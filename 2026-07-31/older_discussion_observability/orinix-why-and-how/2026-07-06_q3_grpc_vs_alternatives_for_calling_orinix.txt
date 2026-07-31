@@ -1,0 +1,196 @@
+Q3 — How does external-api-server actually call orinix: gRPC+proto, REST, or something else?
+Date: 2026-07-06
+Status: OPEN — recommendation is gRPC+proto (the "JAR" you described), needs sign-off
+
+------------------------------------------------------------------------
+
+CLEARING UP ONE THING FIRST — "gRPC client" and "JAR import" are the SAME
+thing here, not two competing options
+
+What you described — "create proto files, generate a gRPC client, import
+that JAR into external-api-server, external-api-server calls orinix for
+POST/GET" — IS the standard practice already running for every service in
+this fleet. There's no separate "just import a JAR" alternative to gRPC;
+the JAR external-api-server would import literally contains the generated
+gRPC stub code compiled from the .proto file. Traced this precisely rather
+than assuming:
+
+  unhygienix-proto, gangway-proto, moonraker-proto: each service's own repo
+  publishes its own generated-stub jar to GitHub Packages
+  (distributionManagement in unhygienix/pom.xml points at
+  maven.pkg.github.com/deklareddotcom/unhygienix) — external-api-server adds
+  it as a normal <dependency>, then @GrpcClient("<name>") + the matching
+  grpc.client.<name>.address in application.yml wires the network call.
+
+  One interesting wrinkle, found while tracing this: pegleg's
+  HabuIntelligenceServiceGrpc stub that external-api-server imports comes
+  from a DIFFERENT artifact — com.habu.ignoramus:habuintelligence-proto
+  (confirmed in external-api-server/pom.xml). So the proto is owned/
+  published by ignoramus's habuintelligence submodule even though pegleg is
+  the running server that answers those RPCs. That's a one-off in this
+  codebase, not the template — the standard shape (own repo publishes own
+  proto, e.g. unhygienix-proto/gangway-proto/moonraker-proto) is what orinix
+  should follow: orinix's own repo publishes com.habu.orinix:orinix-proto.
+
+So: yes, create the proto files, generate the gRPC client, publish it as
+orinix-proto, import it in external-api-server. That's the "JAR import"
+you were picturing — it's not an alternative to gRPC, it's what gRPC-in-
+this-codebase always looks like from the caller's side.
+
+------------------------------------------------------------------------
+
+WHAT ELSE COULD WE DO INSTEAD OF gRPC+PROTO (the actual alternatives)
+
+  1. REST + OpenAPI-generated client
+     orinix exposes a REST/JSON endpoint, external-api-server calls it via
+     RestTemplate/WebClient or an openapi-generator-produced client jar.
+     - Would be the ONLY internal service-to-service call in the entire
+       fleet not using gRPC (external-api-server's OWN outward face to real
+       customers is REST — that's different: that's the org's public
+       boundary, not an internal hop).
+     - Loses compile-time contract checking (a REST/JSON body mismatch is a
+       runtime 400, a proto field mismatch is a build failure)
+     - Would need its own auth wiring separate from the JwtServiceCallCredentials
+       pattern external-api-server already applies uniformly to every
+       @GrpcClient today
+     - No streaming for free later if we ever want StreamCleanroomEvents
+
+  2. Fold orinix's logic directly into external-api-server (true "JAR
+     import" in the sense of a shared library with no network call at all)
+     - This is NOT what you described, but naming it because "JAR" can mean
+       this too. Rejected outright: it undoes the actual approved decision
+       from the June TLM meeting — orinix exists specifically so it has its
+       own DB, its own deploy, its own gRPC port, same as gangway. Merging
+       it into external-api-server's process erases that boundary entirely.
+
+  3. Async / message-based (external-api-server publishes a request,
+     orinix responds on a queue)
+     - Wrong shape for a synchronous GET or a registration POST that needs
+       an immediate response/error code. Only makes sense for delivery-out
+       (which is already async, via CallbackDeliveryWorker) — not for
+       external-api-server's inbound calls.
+
+------------------------------------------------------------------------
+
+RECOMMENDATION: gRPC + orinix-proto, exactly as you described
+
+  CONSISTENCY (ch. 16) — this is the one and only pattern every other
+  internal call in this fleet uses. Picking anything else makes orinix the
+  one service where a new engineer can't apply what they already know.
+
+  DEEP MODULES (ch. 3) — the .proto file IS the simple interface;
+  everything about how orinix stores events, dispatches delivery, or talks
+  to Postgres stays hidden behind it, same as every other service here.
+
+  Practical win, not just principle: external-api-server already has the
+  entire plumbing this needs — TLS trust config, JwtServiceCallCredentials,
+  the grpc.client.<name>.address pattern in application.yml. Adding orinix
+  means one new entry in that file and one new @GrpcClient, nothing novel
+  to build on the caller's side.
+
+------------------------------------------------------------------------
+
+CURSOR-BASED GET — already in scope, and cheap for a specific reason
+
+You asked to make sure we build this now since it's a small add and XMI (or
+someone else) may ask in 20-30 days. Two things worth saying:
+
+  1. It was already in the M1 component list (item 6,
+     orinix-working-principle/2026-07-06_m1_delivery_scope.txt):
+     "gRPC server: RecordObjectEvent, GetCleanroomEvents." Not new scope —
+     confirming it stays, not adding it.
+
+  2. It's cheap specifically because the object_events schema (from the
+     original June design doc, carried forward unchanged) already has
+     cursor_position BIGINT with idx_events_cleanroom_cursor. The cursor
+     column and its index were designed in from day one for exactly this —
+     DEFINE ERRORS OUT OF EXISTENCE (ch. 9) in a broader sense: instead of
+     retrofitting pagination onto a table that wasn't built for it later
+     (the expensive version of this problem), the schema already makes
+     "give me everything after cursor X" a plain indexed range query.
+
+  GetCleanroomEvents RPC shape (corrected to match the actual approved
+  Confluence doc's field naming, not my own invented names — Consistency,
+  ch. 16: use the name the org already committed to in writing):
+    request:  cleanroom_id, org_id, since_cursor (int64), object_type, limit
+    response: events[], next_cursor, has_more
+  Same RPC serves both external-api-server's REST wrapper today AND any
+  future direct polling consumer — one method, two callers, no branching.
+
+------------------------------------------------------------------------
+
+RANKED gRPC BENEFITS (expanded per your follow-up, ranked not listed flat —
+Decide What Matters, ch. 20)
+
+  1. Compile-time contract safety — DEFINE ERRORS OUT OF EXISTENCE (ch. 9)
+     A field rename/removal in orinix.proto fails external-api-server's
+     BUILD, not a customer's production request. One .proto generates both
+     the client stub and the server skeleton in lockstep — "client and
+     server disagree about the shape of a message" becomes a category of
+     bug that cannot compile, not one that's merely caught by tests.
+
+  2. Cross-cutting concerns already built, proven, and free —
+     PULL COMPLEXITY DOWNWARD (ch. 7)
+     Concrete, not theoretical: IntelligenceService.java already shows
+     JwtServiceCallCredentials, TLS trust config, and GrpcExceptionHandler
+     translating gRPC NOT_FOUND into the right customer-facing HTTP status.
+     gRPC's interceptor chain is why this is uniform across every
+     @GrpcClient today without each service reimplementing it. REST would
+     mean rebuilding all three, or copying gRPC's semantics badly in a
+     different transport.
+
+  3. Structured, shared error model
+     gRPC status codes are a fixed enum every client already knows how to
+     handle. REST means inventing a new JSON error-body convention per
+     service, or badly re-deriving what gRPC already gives for free.
+
+  4. Streaming without a second mechanism
+     StreamCleanroomEvents (named in the original design doc) comes free
+     in the same IDL/toolchain. REST would need Server-Sent Events or
+     WebSockets bolted on as an entirely separate integration later.
+
+  5. Wire efficiency — real but secondary — DESIGNING FOR PERFORMANCE
+     (ch. 19: "measure before you optimize")
+     Protobuf binary + HTTP/2 multiplexing beats JSON/HTTP1.1 at volume,
+     but for M1's actual traffic shape (occasional pull, event-driven push)
+     this isn't the decisive factor — #1 and #2 are. Not overselling raw
+     throughput as the headline reason, because it isn't.
+
+  Underneath all five: CONSISTENCY (ch. 16) — every benefit above is
+  already paid for elsewhere in the fleet. Choosing gRPC for orinix means
+  inheriting infrastructure that exists, not building equivalents in a
+  different transport.
+
+------------------------------------------------------------------------
+
+DOES THE PROTO JAR ALSO GIVE US ZABRA, OR SPRING-BOOT-AUTO-REST?
+(answering the follow-up question directly)
+
+  Zabra and the generated proto jar are NOT the same thing, and the proto
+  jar does not include zabra. Traced precisely: the generated stub jar
+  (e.g. unhygienix-proto) gives you only the raw XxxGrpc.XxxBlockingStub
+  classes compiled from the .proto file — nothing more. zabra-grpc-client
+  is a SEPARATE dependency that wraps those raw stubs with a nicer facade —
+  this is exactly what pegleg's BillingService constructor does:
+  `this.unhygienixClient = UnhygienixClient.newInstance();` — that
+  UnhygienixClient class lives in zabra-grpc-client, built on top of the
+  unhygienix-proto stub, not inside it.
+  If orinix ever needs to CALL another service (not just be called), it
+  would depend on both that service's own -proto jar AND zabra-grpc-client,
+  same as pegleg does today. Confirmed in Q2: nothing in M1 scope currently
+  requires orinix to call out to another service — events arrive
+  pre-enriched via the CloudEvents payload — so this dependency isn't
+  needed yet, only noted for when/if it becomes necessary.
+
+  Spring Boot has no built-in equivalent to Go's grpc-gateway (which reads
+  proto HTTP annotations and auto-generates a REST/JSON reverse proxy in
+  front of a gRPC server — that's how unhygienix/forebitt/picanmix expose
+  REST directly from the same .proto file). There's no first-party,
+  equally-mature Java port of that tool. But this gap doesn't actually
+  matter for orinix's design: external-api-server is ALREADY the REST
+  front door for external/XMI-facing traffic (POST /v1/cleanrooms/{id}/
+  callbacks, GET /v1/cleanrooms/{id}/events both live there, per the
+  approved doc). orinix itself only needs to expose gRPC to
+  external-api-server — exactly the shape pegleg and cronos already have
+  today, and neither of them has ever needed a grpc-gateway equivalent,
+  because external-api-server already does that job for the whole platform.

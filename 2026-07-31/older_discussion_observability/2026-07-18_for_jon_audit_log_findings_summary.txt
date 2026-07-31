@@ -1,0 +1,110 @@
+2026-07-18 — Summary for Jon: what the Hank audit log actually does,
+where Datadog gets it from, and the Dataset/DataConnection/Credential
+question
+
+Context: Josh shared his audit-log design and a real Datadog log line
+from unhygienix as an example. Rather than reason about it in the
+abstract, read the actual Hank library and the actual unhygienix/
+forebitt/primage models (all present locally). Full working notes,
+including everything ruled out along the way, are in
+orinix-why-and-how/2026-07-18_q9_audit_log_expansion_datadog_source_and_chained_relationships.txt.
+This is the condensed version to bring to Jon.
+
+------------------------------------------------------------------------
+
+1. WHERE DATADOG GETS THESE LOGS FROM
+
+Not a database, not a subscription — plain stdout scraping.
+
+hank/db/audit.go defines GORM AfterCreate/AfterUpdate/AfterDelete
+hooks (embedded in 91 unhygienix models via a shared `Audit` struct,
+registered globally in hank/db/service.go). Every hook does exactly
+one thing: log a structured "Audit Log: {...}" line. No DB write, no
+event bus publish — confirmed by reading the whole file.
+
+The Datadog Agent tails that container's stdout and ships each line
+to Datadog's own log index. That's the entire mechanism. Once
+ingested, the line lives in Datadog's storage, with Datadog's own
+retention window (commonly 15-30 days depending on the index) — that
+window is why you can query "last 14 days," not because the log file
+itself survives that long anywhere.
+
+2. DOES HANK SAVE THIS TO A DB SOMEWHERE — NO, AND THAT'S THE KEY POINT
+
+Hank's audit hooks and the SNS-based event-publishing mechanism that
+would feed a table like orinix's object_events are two separate
+systems in the same shared library that never call each other. The
+event publisher (hank/events.EventClient) is invoked by hand-written
+call sites elsewhere in unhygienix (e.g. api/server/events.go), not
+by the audit hooks.
+
+So getting Hank's audit trail into a queryable store means picking
+one of two real options, not "just point it at object_events":
+  a) Add an explicit publish call at each of the ~91 audit-hook
+     mutation points individually.
+  b) Modify Hank's shared hooks themselves to also publish — smaller
+     code change, but every service using Hank inherits the new
+     behavior immediately, a much bigger blast radius.
+This is a real decision, not a given either way.
+
+3. THE "METHOD" FIELD
+
+It's the literal gRPC route (info.FullMethod), set by unhygienix's
+own request interceptor (api/server/security.go) as a log-context
+field before the handler runs — not something Hank derives, and not
+present in every service automatically (each service that wants it
+needs the same kind of interceptor). It sits alongside, not instead
+of, a resource-centric model — can be carried as one extra field
+without displacing object/action-based event design.
+
+4. ONE CAVEAT ON THE SPECIFIC LOG LINE JOSH SHARED
+
+Its OrgID/ActionByID/ActionByEmail were all empty. Traced the cause:
+those come from the same parsed JWT, and the call was authenticated
+via a service credential (clientName: zabra) — plausibly no bound
+user or org by the nature of that credential type, not a bug. BUT:
+the full log payload's tags show env:stage — this was a stage row,
+not production. Don't generalize "org attribution is unreliable" from
+it without checking production traffic first.
+
+5. DATASET / DATACONNECTION / CREDENTIAL — VERIFIED, NOT GUESSED
+
+Read the actual models:
+  Dataset (unhygienix)   --[DataImportJobID]-->  DataImportJob (forebitt)
+  DataImportJob (forebitt) --[CredentialID]-->   Credential (primage)
+
+- "DataConnection" in the observability docs IS forebitt's
+  DataImportJob — confirmed directly (there's a literal
+  NewImportJobFromProtoV2(p *dataconnections.DataConnection)
+  DataImportJob mapping function).
+- Credential lives in a THIRD, separate service (primage) — not
+  forebitt, not unhygienix. So "does a credential change need to also
+  surface as a DataConnection event" spans three independently-owned
+  services, not one table you could join.
+- Both FKs are plain nullable columns with no cascade behavior — a
+  change to Credential does not automatically touch DataImportJob's
+  row, and a change to DataImportJob does not automatically touch
+  Dataset's row. Whether an event should fire on the "related"
+  resource is an application decision, not something the schema
+  forces.
+- Recommended rule: only publish an event on a row that actually got
+  written. If a related resource needs to know "this affects you" but
+  its own row didn't change, carry a reference (e.g.
+  affectedDataConnectionIds) inside the event that DID fire, rather
+  than fabricating a second event with an empty diff.
+- Still open: whether primage's credential rotation creates a new
+  Credential row (which WOULD force a real DataImportJob.CredentialID
+  write — a real cascading event) or mutates the existing row's Value
+  in place (no DataImportJob write at all). Not traced to the actual
+  call site yet — flagged as open, not assumed.
+
+------------------------------------------------------------------------
+
+Bottom line for the conversation with Jon: Hank's audit logging is
+real, exhaustive, and log-only — it was never wired to persist or
+publish anywhere. Anything durable/queryable built on top of it is
+new work, with a real choice between per-call-site instrumentation
+and a shared-hook change. The Dataset/DataConnection/Credential chain
+is now a verified three-service relationship, not a guess, which
+changes the shape of the "chained event" problem from a modeling
+question into a cross-service integration question.

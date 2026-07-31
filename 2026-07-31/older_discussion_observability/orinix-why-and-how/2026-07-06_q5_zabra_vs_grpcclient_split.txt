@@ -1,0 +1,81 @@
+Q5 — Why doesn't external-api-server use zabra-grpc-client? What will orinix-proto look like when imported there?
+Date: 2026-07-06
+Status: ANSWERED — verified against actual code, not inferred
+
+------------------------------------------------------------------------
+
+THE ANSWER: zabra-grpc-client and Spring's @GrpcClient solve the SAME
+problem in two DIFFERENT runtime contexts. Which one a caller uses depends
+on whether it's running inside a Spring container, not on preference.
+
+Verified directly:
+
+  BillingService.java has NO Spring annotation at all — not @Service, not
+  @Component. Just @Slf4j on a plain class. It's instantiated with a bare
+  `new BillingService()`:
+    pegleg-commands/.../billing/SendUnsentMetricsToBillingCommand.java:32
+    pegleg-commands/.../billing/ResendMetricsToBillingCommand.java:56
+  Both are pegleg-commands classes — the CLI jars Airflow invokes directly
+  (`java -cp pegleg-latest-jar-with-dependencies.jar
+  com.habu.pegleg.commands...`). Plain main()-driven programs. There is no
+  Spring ApplicationContext in that process at all, so @GrpcClient — which
+  only works via Spring's bean post-processing — literally cannot be used
+  there. That's the entire reason zabra-grpc-client's
+  `UnhygienixClient.newInstance()` style static factory exists: it builds a
+  gRPC channel + stub by hand, framework-agnostic, usable in ANY Java
+  process, Spring or not.
+
+  external-api-server, by contrast, IS a genuine Spring Boot web app
+  (spring-boot-starter-web + grpc-spring-boot-starter + a full grpc.client.*
+  block in application.yml). Confirmed it uses @GrpcClient directly on raw
+  generated stubs for EVERY downstream call, zero zabra involved:
+    IntelligenceService.java:21   @GrpcClient("pegleg")
+    CleanroomExportsService.java:32,35,38   @GrpcClient("picanmix") x3
+    DataConnectionService.java:25,28,31,34,37,40   @GrpcClient("forebitt") x6
+  Six confirmed sites, zero zabra imports in any of them.
+
+So the split isn't "which service is more important" or a language
+preference — it's purely: are you inside a Spring container right now?
+  Inside Spring (external-api-server, pegleg-server) -> @GrpcClient
+  Outside Spring (pegleg-commands, any Airflow-invoked CLI jar) -> zabra-grpc-client
+
+------------------------------------------------------------------------
+
+WHAT THIS MEANS FOR orinix
+
+orinix-server is a Spring Boot app (per Q2's module plan). external-api-
+server is a Spring Boot app. Both sides of this call are inside Spring
+containers. So:
+
+  external-api-server imports orinix-proto as a plain Maven dependency,
+  adds one entry to the grpc.client.* block:
+    orinix:
+      address: "dns:///${ORINIX_URL:localhost:PORT}"
+  and injects the stub directly:
+    @GrpcClient("orinix")
+    private OrinixServiceGrpc.OrinixServiceBlockingStub orinixStub;
+
+  Zero zabra-grpc-client involvement. Exactly the same shape as the six
+  confirmed call sites above — not a new pattern, the SAME pattern.
+
+zabra-grpc-client only becomes relevant if orinix itself ever needs a
+plain-CLI/batch code path outside orinix-server's Spring context that calls
+another service directly (there's no such path in M1 — nothing in scope
+requires orinix to call out to unhygienix/moonraker/etc., events arrive
+pre-enriched via the CloudEvents payload, confirmed already in Q2/Q3).
+
+------------------------------------------------------------------------
+
+WHY THIS MATTERS BEYOND JUST ANSWERING THE QUESTION
+
+INFORMATION HIDING (ch. 4) in the org's own tooling, one level up from
+orinix's design: zabra-grpc-client hides "how do I get a gRPC channel
+without a DI container" from every CLI command that needs it, so
+pegleg-commands doesn't hand-roll channel construction itself. Same
+principle we're applying inside orinix's own DeliveryChannel design, just
+already solved a layer up in the platform's shared libraries.
+
+CONSISTENCY (ch. 16) — orinix gets to just follow the existing rule
+("Spring context -> @GrpcClient") rather than inventing a new one. No
+design decision needed here beyond recognizing which bucket orinix-server
+falls into.

@@ -1,0 +1,279 @@
+2026-07-22 — Idempotency at our end, DLQ table decision, and Miro
+diagram prompts (ER + UML) for the Design Review
+
+Purpose: answer two design questions (exactly-once at XMI; a Habu-owned
+DLQ table) and provide two ready-to-paste diagram prompts (entity/table
+relationship + UML class) for an impactful presentation.
+
+================================================================================
+Q1 — If we add idempotency at OUR end too, is delivery_log enough to
+guarantee XMI receives each event exactly once?
+================================================================================
+
+Short answer: No — and it's important to say this correctly in the
+review, because "exactly-once delivery" is a known-impossible thing to
+promise over a network. What you CAN promise is "at-least-once
+delivery + no duplicate PROCESSING," and delivery_log helps with the
+second half, not the first.
+
+Why exactly-once is impossible no matter how many tables we add:
+
+  The unavoidable race is the lost ACK.
+  1. orinix POSTs evt-789 to XMI.
+  2. XMI receives it, processes it, starts sending 200 OK back.
+  3. The 200 OK is lost in the network (timeout, blip, XMI restart
+     mid-response).
+  4. From orinix's side this looks identical to "XMI never got it."
+     We MUST retry (that's what at-least-once means), so we resend.
+  5. XMI now has evt-789 twice.
+
+No table on our side can tell step 3 (delivered, ack lost) apart from
+"never delivered." So the duplicate is fundamentally unpreventable
+from the sender side. This is exactly why Stripe, GitHub, and every
+webhook platform put the final dedup responsibility on the CONSUMER,
+and ship a stable event id for them to dedup on.
+
+What delivery_log DOES do (and it's worth having):
+
+  - Before sending, orinix can check delivery_log for an existing
+    SUCCESS row for (event_id, registration_id) and skip re-sending in
+    the common case. This REDUCES duplicates — it does not eliminate
+    the lost-ACK race above.
+  - It's the audit trail / SLA evidence: "did XMI get evt-789, when,
+    how many attempts, what was the latency." That's real value
+    independent of dedup.
+
+Where the actual idempotency guarantees live (three layers, name them
+in the review):
+
+  Layer 1 — producer mints one stable id (the CloudEvents `id`) and
+    reuses it across its own publish retries. Without this, nothing
+    downstream can dedup.
+  Layer 2 — object_events.idempotency_key UNIQUE constraint: our OWN
+    store never double-inserts the same event even if SNS/SQS delivers
+    it to us twice. This is our-end idempotency, and it already exists.
+  Layer 3 — XMI dedups on the id (X-Habu-Event-Id header / Pub/Sub
+    attribute) before processing. This is the only layer that makes it
+    "exactly-once PROCESSED" from XMI's perspective.
+
+So the honest one-liner for the slide: "We guarantee at-least-once
+delivery with a stable idempotency key at every hop. delivery_log
+minimizes duplicate sends and proves delivery; exactly-once is
+achieved by XMI deduping on that key — the same contract Stripe and
+GitHub use." That's a stronger, more credible statement than claiming
+exactly-once, which a sharp reviewer would immediately challenge.
+
+================================================================================
+Q2 — Can we still have our OWN DLQ table instead of relying on SQS
+native redrive?
+================================================================================
+
+Yes — this is a legitimate option, and I'll walk back the earlier flat
+"don't do it," because your instinct here has real merit depending on
+what you want out of it. It's a genuine design-it-twice choice, not a
+wrong idea. Here's the honest tradeoff so you can defend either
+direction in the review.
+
+Reasons a Habu-owned DLQ TABLE is actually attractive:
+
+  - Queryable with SQL. An SQS DLQ is just another queue — to see
+    "what's stuck and why" you poll messages. A Postgres dlq table you
+    can query, join to callback_registrations, group by failure
+    reason, build a dashboard on. Much better operability.
+  - Not cloud-locked. SQS redrive is an AWS mechanism. If delivery
+    ever moves off SQS, a Postgres DLQ table survives unchanged. (Ties
+    to the doc's own "delivery model independence" theme.)
+  - Custom replay logic. Your ReplayService already reads from
+    Postgres; a dlq table lives in the same store, so "replay
+    everything that dead-lettered for registration X since T" is one
+    query, no cross-system glue.
+  - Richer failure context. You control the columns — store the last
+    HTTP status, the response body, the attempt count, the next
+    retry time, whatever helps debugging. An SQS DLQ message carries
+    only what you put in the payload.
+
+The honest cost (so you're not blindsided):
+
+  - You now own retry scheduling. SQS's visibility-timeout + redrive
+    gives you "retry after N seconds, N times, then park" for free.
+    With a table, YOU write the retry loop (a worker that polls the
+    dlq table for due rows). More code, more to get right (backoff,
+    jitter, thundering herd).
+  - Two mechanisms if you keep SQS too. If SQS still fronts delivery,
+    a dlq table is a SECOND failure mechanism layered on the first —
+    you must be clear which one owns what, or you'll double-retry.
+
+Recommended framing for the review (not a flat yes/no):
+
+  "SQS native redrive is the M1 default — least code, proven. We are
+  deliberately reserving a Habu-owned dlq table as a fast-follow if we
+  need SQL-queryable failure visibility or want delivery to be
+  cloud-portable. It's an additive column set, not a rearchitecture,
+  so deferring it costs us nothing." That way the dlq table appears on
+  your ER diagram as a clearly-labeled "Phase 2 / optional" entity —
+  which actually makes the diagram richer AND shows you've thought
+  past M1, without over-committing.
+
+  For the diagram: show dlq_log as a dotted-outline box connected to
+  delivery_log and callback_registrations, labeled "optional /
+  phase 2." A reviewer reads that as maturity, not scope creep.
+
+================================================================================
+Q3a — MIRO PROMPT: ENTITY / TABLE RELATIONSHIP DIAGRAM
+================================================================================
+
+Paste this into Miro's AI diagram generator (or any text-to-diagram
+tool). It's written to produce the curvy-connector ER look you want.
+
+----------------------------- PROMPT START -----------------------------
+
+Create a polished entity-relationship diagram for a Postgres schema,
+in a clean modern style with rounded rectangle tables, a colored
+header bar per table, PK/FK badges, and smooth CURVED connector lines
+(not straight/orthogonal) between related tables. Use a soft
+professional palette: deep blue headers for core tables, teal for
+delivery tables, muted grey dashed outline for the optional table.
+Label each connector with its cardinality (1, many) using crow's-foot
+notation.
+
+Tables and columns:
+
+TABLE object_events  [core / deep blue header]  "source of truth, append-only"
+  PK  event_id            UUID
+      cursor_position     BIGINT   (unique, monotonic)
+      org_id              UUID
+      cleanroom_id        UUID
+      object_type         VARCHAR   "QUESTION | DATA_CONNECTION | EXPORT_JOB | FLOW | DATASET"
+      object_id           UUID
+      object_name         VARCHAR
+      event_type          VARCHAR
+      change_type         VARCHAR   "CREATED | UPDATED | DELETED"
+      changed_fields      JSONB
+      context_fields      JSONB
+      performed_by        VARCHAR
+      idempotency_key     VARCHAR   (UNIQUE — enforces our-end idempotency)
+      event_time          TIMESTAMPTZ
+
+TABLE callback_registrations  [core / deep blue header]  "subscriber registry"
+  PK  id                  UUID
+      org_id              UUID
+      cleanroom_id        UUID
+      object_type         VARCHAR
+      delivery_type       VARCHAR   "WEBHOOK | PUBSUB"
+      delivery_config     JSONB
+      signing_secret      VARCHAR   (HMAC-SHA256, webhook only)
+      status              VARCHAR   "ACTIVE | PAUSED | SUSPENDED"
+      failure_count       INTEGER
+
+TABLE delivery_log  [delivery / teal header]  "per-attempt audit trail"
+  PK  id                  UUID
+  FK  event_id            UUID  -> object_events.event_id
+  FK  registration_id     UUID  -> callback_registrations.id
+      attempt_number      INTEGER
+      http_status         INTEGER
+      latency_ms          INTEGER
+      outcome             VARCHAR   "SUCCESS | FAILURE_RETRYABLE | FAILURE_TERMINAL | TIMEOUT"
+      delivered_at        TIMESTAMPTZ
+
+TABLE dlq_log  [optional / grey DASHED outline]  "Phase 2 / optional — Habu-owned dead-letter, only if we want SQL-queryable failure visibility"
+  PK  id                  UUID
+  FK  event_id            UUID  -> object_events.event_id
+  FK  registration_id     UUID  -> callback_registrations.id
+      last_http_status    INTEGER
+      last_error_body     TEXT
+      attempt_count       INTEGER
+      next_retry_at       TIMESTAMPTZ
+      dead_lettered_at    TIMESTAMPTZ
+
+Relationships (draw as smooth curved crow's-foot connectors):
+  - object_events (1) ---< delivery_log (many)          label: "one event, many delivery attempts"
+  - callback_registrations (1) ---< delivery_log (many) label: "one subscriber, many attempts"
+  - object_events (1) ---< dlq_log (many)               DASHED line   label: "optional"
+  - callback_registrations (1) ---< dlq_log (many)      DASHED line   label: "optional"
+
+Add a small legend box: solid deep-blue = core M1 tables; teal =
+delivery tracking; grey dashed = optional Phase 2. Title the diagram
+"orinix — Observability Data Model (M1 + optional Phase 2)".
+
+------------------------------ PROMPT END ------------------------------
+
+Note if the tool won't render dashed/optional styling: just include
+dlq_log as a normal box but keep the word "(optional / Phase 2)" in
+its title — the label does the work.
+
+================================================================================
+Q3b — MIRO PROMPT: UML CLASS DIAGRAM (delivery Strategy pattern)
+================================================================================
+
+----------------------------- PROMPT START -----------------------------
+
+Create a clean UML class diagram illustrating a Strategy design
+pattern for a pluggable event-delivery mechanism, modern flat style,
+rounded boxes, a distinct color for the interface, curved connector
+lines where possible, and correct UML arrow types (hollow triangle for
+"implements", plain arrow for "uses/depends", open diamond for
+"aggregates"). Palette: purple for the interface, blue for concrete
+implementations, green for orchestration classes.
+
+Interface (purple):
+  <<interface>> DeliveryChannel
+    + deliver(registration: CallbackRegistration, event: ObjectEvent): DeliveryResult
+
+Concrete implementations (blue) — both realize DeliveryChannel
+(hollow-triangle "implements" arrows pointing UP to the interface):
+  WebhookDeliveryChannel
+    - signs payload with HMAC-SHA256
+    + deliver(...)
+  PubSubDeliveryChannel
+    - authenticates via Workload Identity Federation / static key
+    + deliver(...)
+
+Orchestration classes (green):
+  DeliveryDispatcher
+    - channels: Map<String, DeliveryChannel>   (Spring auto-collects
+                                                  each @Component by name —
+                                                  no factory class needed)
+    + dispatch(event: ObjectEvent): void   "fans out one message per
+                                             matching registration onto SQS"
+  CallbackDeliveryWorker
+    - consumes SQS dispatch messages (one per registration)
+    + deliverToRegistration(reg, event): void   "shared method"
+  ReplayService
+    + replayEvent(eventId, registrationId)
+    + replayAllSince(cleanroomId, registrationId, sinceCursor)
+  ObjectEventMapper
+    + toCloudEvent(entity: ObjectEventEntity): CloudEvent   "the ONE
+      shared mapping used by BOTH the pull API and webhook delivery —
+      single source of truth for the event shape"
+
+Relationships:
+  - WebhookDeliveryChannel  ..|>  DeliveryChannel   (implements, hollow triangle)
+  - PubSubDeliveryChannel   ..|>  DeliveryChannel   (implements, hollow triangle)
+  - DeliveryDispatcher      o-->  DeliveryChannel   (aggregates many, open diamond)
+  - CallbackDeliveryWorker  -->   DeliveryChannel   (uses, to actually deliver)
+  - CallbackDeliveryWorker  -->   ObjectEventMapper (uses, to build the payload)
+  - ReplayService           -->   CallbackDeliveryWorker (reuses deliverToRegistration)
+
+Add a caption under the diagram: "Adding a new delivery mechanism
+(e.g. Azure Event Grid) = one new class implementing DeliveryChannel.
+No change to the dispatcher, worker, or any existing channel — open/
+closed principle in practice." Title: "orinix — Delivery Strategy
+Pattern".
+
+------------------------------ PROMPT END ------------------------------
+
+================================================================================
+HOW TO PRESENT THE TWO DIAGRAMS TOGETHER (30 seconds of framing)
+================================================================================
+
+  - Lead with the ER diagram: "This is the data model — one source-of-
+    truth table, a subscriber registry, and a delivery audit trail
+    that resolves the many-to-many between them. The dashed box is a
+    deliberate Phase-2 option we've scoped but not committed."
+  - Then the UML: "And this is why adding a delivery mechanism is
+    cheap — the Strategy pattern means a new channel is one class, not
+    a rewrite."
+  - The two together answer the two questions a reviewer always asks:
+    "how is the data structured" and "how does this evolve without
+    rework." Having a clean answer to both, visually, is what makes
+    the presentation land.

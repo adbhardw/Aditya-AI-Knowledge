@@ -1,0 +1,140 @@
+Q4 — Design pattern for delivery dispatch: alternatives to Strategy, pros/cons, why Strategy won
+Date: 2026-07-06
+Status: OPEN — Strategy + Spring qualifier-map recommended, needs sign-off
+
+------------------------------------------------------------------------
+
+WHAT WE'RE ACTUALLY CHOOSING BETWEEN
+
+The problem: one object_events row needs to reach N registered consumers,
+and each registration says HOW it wants delivery (WEBHOOK or PUBSUB, per
+the approved doc's Approach 2/3 split). Two separate axes are hiding inside
+that one sentence — worth naming both before comparing patterns:
+
+  Axis 1 — FAN-OUT: one event, many registrations (CallbackDeliveryWorker
+  iterating over every registration interested in this event)
+  Axis 2 — DISPATCH: for one registration, which mechanism actually sends it
+
+Strategy solves axis 2. It was never meant to solve axis 1 — the worker's
+iteration loop over registrations already handles the fan-out, informally
+in the OBSERVER / PUBLISH-SUBSCRIBE pattern's shape (one subject — the
+event — notifying many observers — the registrations). Naming this
+explicitly now so the two concerns don't get conflated into one
+over-complicated interface later.
+
+------------------------------------------------------------------------
+
+ALTERNATIVES CONSIDERED FOR AXIS 2 (dispatch)
+
+  1. STRATEGY (chosen) — one interface, interchangeable implementations,
+     selected at runtime by a key (delivery_type).
+
+     Pros:
+       - Adding a new mechanism (e.g. Azure Service Bus later) = one new
+         class, zero changes to existing code (Open/Closed in practice)
+       - With Spring's DI, "selection" isn't even code — Spring auto-
+         collects every DeliveryChannel bean into a Map<String,
+         DeliveryChannel> keyed by @Component name. No factory class to
+         hand-maintain.
+       - Each implementation is independently testable in isolation
+         (compose a WebhookDeliveryChannel with a mock HTTP client; no
+         shared base-class state to fight)
+
+     Cons:
+       - Requires every implementation to fit the same interface shape
+         (deliver(registration, event) -> DeliveryResult) — if a future
+         mechanism genuinely needs a different call shape, the interface
+         itself needs to grow, not just gain an implementation
+
+  2. FACTORY METHOD / ABSTRACT FACTORY
+     A dedicated OrinixDeliveryChannelFactory.create(deliveryType) that
+     switches/if-chains to the right constructor.
+
+     Pros:
+       - Explicit, easy to trace in a debugger — one file shows every type
+         → implementation mapping
+       - Useful when constructing a channel needs non-trivial conditional
+         logic (e.g. different credentials per environment) that doesn't
+         belong in a Spring @Component's constructor
+
+     Cons:
+       - Adding a new mechanism means EDITING the factory (a switch
+         statement grows forever) — worse for Open/Closed than the
+         Spring-map version, which needs zero edits to existing files
+       - It's solving a problem Spring's DI container already solves for
+         free; writing it by hand here is manufacturing complexity where
+         none was needed — GENERAL-PURPOSE MODULES (ch. 5) cuts both ways:
+         don't under-generalize, but don't hand-roll what the framework
+         already gives you either
+
+  3. CHAIN OF RESPONSIBILITY
+     Each channel gets asked "can you handle this?" in sequence; first one
+     that says yes handles it.
+
+     Pros:
+       - Good fit when handlers can't be cleanly discriminated up front —
+         each one inspects the request and decides for itself
+
+     Cons:
+       - Wrong fit here specifically: we ALREADY have a clean, explicit
+         discriminator (delivery_type column). Chain of Responsibility adds
+         ambiguity (multiple handlers COULD claim the same event) and
+         O(n) sequential checks where a map lookup is O(1). Using this
+         pattern here would be solving a problem — "which handler applies"
+         — that the schema already answered directly.
+
+  4. TEMPLATE METHOD
+     An abstract DeliveryChannelBase defines the skeleton (fetch event,
+     format payload, send, record ack); each mechanism overrides just the
+     "send" step via inheritance.
+
+     Pros:
+       - Enforces a consistent lifecycle order across all implementations
+
+     Cons:
+       - Inheritance-based, not composition-based — harder to unit test a
+         single implementation without dragging in base-class state
+       - The "common skeleton" is thinner than it looks: webhook's payload
+         is a JSON HTTP body, Pub/Sub's is a binary protobuf-ish message
+         via a completely different SDK. If "format" and "send" differ
+         entirely by mechanism, the base class winds up hiding almost
+         nothing — a SHALLOW MODULE (ch. 3) wearing a deep-looking
+         inheritance hierarchy. Rejected mainly for this reason.
+
+  5. ADAPTER — not a competing choice, already present UNDER Strategy
+     Each concrete DeliveryChannel is also, by construction, an Adapter:
+     WebhookDeliveryChannel adapts a plain HTTP client to the DeliveryChannel
+     contract; PubSubDeliveryChannel adapts com.google.cloud.pubsub.v1.
+     Publisher to the same contract. This is INFORMATION HIDING (ch. 4) in
+     practice — the worker never sees AmazonSQS-style HTTP calls or Google's
+     Publisher API, only deliver(). Worth naming so it's clear Strategy and
+     Adapter aren't rivals here — one implementation is doing both jobs at
+     once, and that's expected, not a code smell.
+
+  6. PLUGIN / REGISTRY (dynamic, config-driven class loading)
+     Already dismissed in Q2 and repeating why: this solves "add a delivery
+     mechanism without a redeploy," which isn't a real M1 requirement.
+     Reaching for it now would be over-generalizing past the actual
+     problem — the same GENERAL-PURPOSE MODULES (ch. 5) caution that argues
+     against Factory Method above, at the opposite extreme.
+
+------------------------------------------------------------------------
+
+WHY STRATEGY (+ SPRING'S QUALIFIER MAP) WINS
+
+  INFORMATION HIDING (ch. 4) — delivery_type + delivery_config already hide
+  "how do we push" from ingest and registration; Strategy is the
+  code-level mechanism that makes that hiding real instead of aspirational.
+
+  PULL COMPLEXITY DOWNWARD (ch. 7) — CallbackDeliveryWorker is the only
+  thing that knows dispatch happens via a string-keyed map lookup. Nothing
+  above it needs to know that detail exists.
+
+  GENERAL-PURPOSE MODULES (ch. 5) — general enough for "N mechanisms,
+  chosen per row" without reaching for machinery (Plugin/Registry) that
+  solves a problem we don't have.
+
+  Composition over inheritance rules out Template Method here specifically
+  because the "shared skeleton" would be shallow — each mechanism's
+  fetch/format/send steps differ too much for a common base class to hide
+  anything real.

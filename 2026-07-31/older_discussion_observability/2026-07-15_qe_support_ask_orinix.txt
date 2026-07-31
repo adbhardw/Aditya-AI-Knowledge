@@ -1,0 +1,120 @@
+QE support ask — orinix observability (DV-15496)
+Date: 2026-07-15
+Meeting: today, with Kaitlyn and Annet
+Context tickets: DV-15496 (mine — "API pub/sub & audit log", the epic this
+falls under), DV-15456 ("Enforced Partition Parameter Values M2", Shubham's,
+Data Connections), DV-15621 ("Rate Limiting w/ Agents", Dhruva's) — all
+three reported by Jon Chua, all requesting QE support in parallel. Only
+DV-15496 is what this ask covers; flagging the other two exist so QE's
+day isn't a surprise if capacity is being split three ways.
+
+Note: DV-15621 (rate limiting) explicitly calls out that programmatic
+usage "should be helped by enabling pub/sub for status instead of
+polling" — worth mentioning in the meeting, since it's a direct
+downstream beneficiary of orinix existing at all, not just a competing
+priority.
+
+------------------------------------------------------------------------
+
+ONE-LINE CONTEXT FOR THE ROOM
+
+orinix is the new cleanroom observability service: ingests cleanroom
+object-mutation events (Data Connections, Questions, Flows, Exports) and
+delivers them three ways — cursor-based pull, webhook push, and GCP
+Pub/Sub push. M1 scaffold is built and in an open PR
+(LiveRamp/orinix#1). Need QE to validate all three delivery paths.
+
+------------------------------------------------------------------------
+
+ASK 1 — Test the cursor-based pull endpoint
+
+What it is: GetCleanroomEvents — a paginated read of every event for a
+cleanroom, using a cursor (since_cursor) so a poller only ever sees new
+events.
+
+What to verify:
+  - since_cursor correctly returns only events newer than the given cursor
+  - next_cursor / has_more behave correctly across pages (empty result,
+    partial page, full page)
+  - object_type filter works (e.g. only DATA_CONNECTION events)
+  - org/cleanroom isolation — a query for one cleanroom never returns
+    another cleanroom's events
+
+DEPENDENCY TO FLAG: the REST wrapper (GET /v1/cleanrooms/{id}/events via
+external-api-server) is NOT wired up yet (DV-16052, not started). For
+today, QE testing likely has to happen at the gRPC level directly against
+orinix-server's GetCleanroomEvents RPC, not through the REST endpoint —
+worth surfacing this now rather than promising a REST endpoint that isn't
+there yet.
+
+------------------------------------------------------------------------
+
+ASK 2 — Set up a GCP Pub/Sub topic to receive events
+
+What QE needs to do: create a GCP project + Pub/Sub topic they control,
+then register it with orinix (RegisterCallback, delivery_type=PUBSUB,
+gcp_project_id + gcp_topic_id), granting orinix's publishing identity IAM
+permission to publish to that topic.
+
+What to verify:
+  - Published messages match the CloudEvents envelope shape (spec_version,
+    id, source, type, time, plus a nested data object with objectType/
+    objectId/changeType/changedFields/performedBy/schemaVersion) — this
+    shape was just fixed today (2026-07-15) to actually include
+    changed_fields correctly; worth confirming QE tests against the
+    latest commit (62338d1) on PR #1, not the original scaffold commit
+  - changedFields arrives as a real nested object, not a stringified blob
+
+DEPENDENCIES TO FLAG:
+  - Which auth mechanism orinix uses to publish (Workload Identity
+    Federation vs a static GCP service-account key) is still an open
+    decision (DV-16048) — the exact IAM grant steps QE needs to do on
+    their topic differ depending on which one we land on. Recommend
+    confirming this before QE spends time on IAM setup, not after.
+  - Known gap, not yet fixed: the event id is not currently attached as a
+    Pub/Sub message attribute (tracked under DV-16049). If QE tests
+    duplicate-delivery/idempotency behavior on the Pub/Sub path
+    specifically, this will show up as a real finding — it's already a
+    tracked, known gap, not a new bug to write up from scratch.
+
+------------------------------------------------------------------------
+
+ASK 3 — Create a callback URL (webhook receiver)
+
+What QE needs to do: stand up a reachable HTTPS endpoint they control
+(a simple Cloud Run / Lambda / request-bin-style receiver is enough),
+then register it with orinix (RegisterCallback, delivery_type=WEBHOOK).
+Registration returns a signing_secret once — QE needs to store it to
+verify signatures.
+
+What to verify:
+  - X-Habu-Signature header is a valid HMAC-SHA256 of the payload, using
+    the signing_secret from registration (symmetric — QE recomputes the
+    same hash and compares)
+  - X-Habu-Event-Id is present and STABLE across any retried delivery of
+    the same event (this is what dedup depends on)
+  - Payload shape matches the fixed CloudEvents envelope (same fix as
+    Ask 2 — test against PR #1's latest commit)
+  - Retry/backoff behavior if their endpoint returns 5xx or times out —
+    should see multiple attempts with increasing spacing before giving up
+
+DEPENDENCY TO FLAG: the actual AWS infra (SNS topic, per-consumer SQS
+delivery queue, DLQ) is not provisioned yet (DV-16051, not started) — the
+retry/DLQ behavior can be verified against the code logic today, but the
+full production infra path isn't live yet, so "test in prod-like infra"
+and "test the code's retry logic" are two different asks right now.
+
+------------------------------------------------------------------------
+
+SUMMARY OF OPEN DEPENDENCIES WORTH STATING PLAINLY IN THE MEETING
+
+  1. external-api-server REST wiring — not started (DV-16052)
+  2. WIF vs static-key decision for Pub/Sub auth — not decided (DV-16048)
+  3. Event id as a Pub/Sub message attribute — known gap, not fixed (DV-16049)
+  4. AWS infra (SNS/SQS/DLQ) — not provisioned (DV-16051)
+
+None of these block QE from STARTING (gRPC-level pull testing, and
+registering test webhook/Pub/Sub endpoints against the current code, are
+both possible today) — but worth being upfront that "test the finished
+production path end-to-end" isn't fully possible yet, only "test the
+current implementation directly."

@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>DV-13856 — Architecture Diagram</title>
+<style>
+  body { background: #f0f4f8; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; display: flex; justify-content: center; }
+  .page { background: white; padding: 28px 32px; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,.12); max-width: 780px; width: 100%; }
+  .page-title { font-size: 17px; font-weight: 800; color: #1e293b; margin-bottom: 4px; }
+  .page-sub { font-size: 12px; color: #64748b; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="page-title">DV-13856 — Clean Room Observability &amp; Webhook Backbone</div>
+  <div class="page-sub">Platform-grade audit trail + push-based webhook delivery for Habu Clean Rooms</div>
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 1340" width="100%" style="display:block;">
+  <defs>
+    <!-- Arrow markers -->
+    <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#475569"/>
+    </marker>
+    <marker id="arr-red" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#dc2626"/>
+    </marker>
+    <marker id="arr-green" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#16a34a"/>
+    </marker>
+    <marker id="arr-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0,8 3,0 6" fill="#1d4ed8"/>
+    </marker>
+    <!-- Drop shadow filter -->
+    <filter id="sh" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="1" stdDeviation="2" flood-color="#00000018"/>
+    </filter>
+  </defs>
+
+  <!-- ═══════════════ HABU PLATFORM CONTAINER ═══════════════ -->
+  <rect x="16" y="12" width="688" height="1150" rx="12" ry="12"
+    fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="6 3"/>
+  <text x="30" y="30" font-size="10" font-weight="700" fill="#94a3b8"
+    letter-spacing="1" font-family="monospace">HABU PLATFORM</text>
+
+  <!-- ═══════════════ ROW 1: SOURCE SERVICES ═══════════════ -->
+  <!-- unhygienix -->
+  <rect x="44" y="44" width="176" height="56" rx="8" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="132" y="65" font-size="11" font-weight="700" fill="#1e40af" text-anchor="middle">unhygienix</text>
+  <text x="132" y="81" font-size="10" fill="#3b82f6" text-anchor="middle">Questions · Flows</text>
+  <text x="132" y="93" font-size="10" fill="#3b82f6" text-anchor="middle">Data Connections</text>
+
+  <!-- forebitt -->
+  <rect x="272" y="44" width="176" height="56" rx="8" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="360" y="65" font-size="11" font-weight="700" fill="#1e40af" text-anchor="middle">forebitt</text>
+  <text x="360" y="81" font-size="10" fill="#3b82f6" text-anchor="middle">Scheduled Triggers</text>
+  <text x="360" y="93" font-size="10" fill="#3b82f6" text-anchor="middle">Flow Run Events</text>
+
+  <!-- picanmix -->
+  <rect x="500" y="44" width="176" height="56" rx="8" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="588" y="65" font-size="11" font-weight="700" fill="#1e40af" text-anchor="middle">picanmix</text>
+  <text x="588" y="81" font-size="10" fill="#3b82f6" text-anchor="middle">Export Jobs</text>
+  <text x="588" y="93" font-size="10" fill="#3b82f6" text-anchor="middle">Job Runs · Completions</text>
+
+  <!-- merge lines from 3 sources down to interceptor -->
+  <line x1="132" y1="100" x2="132" y2="120" stroke="#475569" stroke-width="1.5"/>
+  <line x1="360" y1="100" x2="360" y2="120" stroke="#475569" stroke-width="1.5"/>
+  <line x1="588" y1="100" x2="588" y2="120" stroke="#475569" stroke-width="1.5"/>
+  <line x1="132" y1="120" x2="588" y2="120" stroke="#475569" stroke-width="1.5"/>
+  <line x1="360" y1="120" x2="360" y2="142" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="370" y="136" font-size="9" fill="#64748b" font-style="italic">mutation event</text>
+
+  <!-- ═══════════════ ROW 2: INTERCEPTOR ═══════════════ -->
+  <rect x="100" y="142" width="520" height="86" rx="8" fill="#f3e8ff" stroke="#9333ea" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="360" y="160" font-size="11" font-weight="800" fill="#7e22ce" text-anchor="middle">CRUD Interceptor — unhygienix / picanmix / forebitt</text>
+  <text x="136" y="177" font-size="10" fill="#6b21a8">① Snapshot state BEFORE mutation</text>
+  <text x="136" y="191" font-size="10" fill="#6b21a8">② Execute mutation</text>
+  <text x="136" y="205" font-size="10" fill="#6b21a8">③ Diff before → after  ·  build ObjectEvent { objectType, changedFields, performedBy, timestamp }</text>
+
+  <!-- ═══════════════ SPLIT FROM INTERCEPTOR ═══════════════ -->
+  <!-- vertical down from interceptor centre -->
+  <line x1="360" y1="228" x2="360" y2="248" stroke="#475569" stroke-width="1.5"/>
+  <!-- horizontal split line -->
+  <line x1="178" y1="248" x2="542" y2="248" stroke="#475569" stroke-width="1.5"/>
+
+  <!-- LEFT branch to object_events -->
+  <line x1="178" y1="248" x2="178" y2="268" stroke="#1d4ed8" stroke-width="1.5" marker-end="url(#arr-blue)"/>
+  <!-- label -->
+  <rect x="36" y="251" width="134" height="16" rx="3" fill="#dbeafe"/>
+  <text x="103" y="262" font-size="9" fill="#1d4ed8" text-anchor="middle" font-weight="600">IN TRANSACTION — atomic</text>
+
+  <!-- RIGHT branch to SNS -->
+  <line x1="542" y1="248" x2="542" y2="268" stroke="#ea580c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <!-- label -->
+  <rect x="548" y="251" width="138" height="16" rx="3" fill="#ffedd5"/>
+  <text x="617" y="262" font-size="9" fill="#c2410c" text-anchor="middle" font-weight="600">POST COMMIT · async ~1ms</text>
+
+  <!-- ═══════════════ object_events TABLE ═══════════════ -->
+  <rect x="44" y="268" width="268" height="96" rx="8" fill="#eff6ff" stroke="#1d4ed8" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="178" y="285" font-size="11" font-weight="700" fill="#1e40af" text-anchor="middle" font-family="monospace">object_events</text>
+  <text x="178" y="299" font-size="10" fill="#1e40af" text-anchor="middle">Append-only audit log · PostgreSQL</text>
+  <text x="60" y="315" font-size="9" fill="#3b82f6" font-family="monospace">event_id  |  object_type  |  object_id</text>
+  <text x="60" y="329" font-size="9" fill="#3b82f6" font-family="monospace">changed_fields (JSONB)  |  performed_by</text>
+  <text x="60" y="343" font-size="9" fill="#3b82f6" font-family="monospace">cleanroom_id  |  event_time  |  org_id</text>
+  <!-- V1 badge -->
+  <rect x="48" y="352" width="188" height="16" rx="8" fill="#16a34a"/>
+  <text x="142" y="363" font-size="9" fill="white" font-weight="700" text-anchor="middle">◀ V1 · Activity Feed UI reads here</text>
+
+  <!-- ═══════════════ SNS TOPIC ═══════════════ -->
+  <rect x="408" y="268" width="268" height="96" rx="8" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="542" y="285" font-size="11" font-weight="700" fill="#c2410c" text-anchor="middle" font-family="monospace">SNS Topic: habu-object-events</text>
+  <text x="542" y="300" font-size="10" fill="#c2410c" text-anchor="middle">One publish → N independent consumers</text>
+  <text x="542" y="315" font-size="10" fill="#ea580c" text-anchor="middle">Add consumer = new SQS queue</text>
+  <text x="542" y="329" font-size="10" fill="#ea580c" text-anchor="middle">zero code change in source services</text>
+  <!-- badge -->
+  <rect x="428" y="352" width="228" height="16" rx="8" fill="#ea580c"/>
+  <text x="542" y="363" font-size="9" fill="white" font-weight="700" text-anchor="middle">V2 · Webhook Delivery starts here</text>
+
+  <!-- ═══════════════ SNS FAN-OUT LINES ═══════════════ -->
+  <line x1="542" y1="364" x2="542" y2="380" stroke="#ea580c" stroke-width="1.5"/>
+  <line x1="432" y1="380" x2="652" y2="380" stroke="#ea580c" stroke-width="1.5"/>
+  <line x1="432" y1="380" x2="432" y2="398" stroke="#ea580c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="542" y1="380" x2="542" y2="398" stroke="#ea580c" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="652" y1="380" x2="652" y2="398" stroke="#ea580c" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ═══════════════ SQS QUEUES ═══════════════ -->
+  <!-- E1 -->
+  <rect x="358" y="398" width="148" height="44" rx="7" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="432" y="415" font-size="10" font-weight="700" fill="#1e40af" text-anchor="middle" font-family="monospace">SQS-XMI-Delivery</text>
+  <text x="432" y="430" font-size="9" fill="#3b82f6" text-anchor="middle">visibility timeout 30s</text>
+  <!-- E2 -->
+  <rect x="468" y="398" width="148" height="44" rx="7" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="542" y="415" font-size="10" font-weight="700" fill="#1e40af" text-anchor="middle" font-family="monospace">SQS-SafeHaven</text>
+  <text x="542" y="430" font-size="9" fill="#3b82f6" text-anchor="middle">independent queue</text>
+  <!-- E3 dashed -->
+  <rect x="578" y="398" width="148" height="44" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 3" filter="url(#sh)"/>
+  <text x="652" y="415" font-size="10" font-weight="700" fill="#64748b" text-anchor="middle" font-family="monospace">SQS-Future</text>
+  <text x="652" y="430" font-size="9" fill="#94a3b8" text-anchor="middle">new consumer = new queue</text>
+
+  <!-- lines from SQS to delivery workers merge line -->
+  <line x1="432" y1="442" x2="432" y2="462" stroke="#475569" stroke-width="1.5"/>
+  <line x1="542" y1="442" x2="542" y2="462" stroke="#475569" stroke-width="1.5"/>
+  <line x1="652" y1="442" x2="652" y2="462" stroke="#475569" stroke-width="1.5"/>
+  <line x1="432" y1="462" x2="652" y2="462" stroke="#475569" stroke-width="1.5"/>
+  <line x1="542" y1="462" x2="542" y2="480" stroke="#475569" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="552" y="476" font-size="9" fill="#64748b" font-style="italic">consume messages</text>
+
+  <!-- ═══════════════ DELIVERY WORKERS ═══════════════ -->
+  <rect x="44" y="480" width="632" height="164" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5" filter="url(#sh)"/>
+  <!-- header bar -->
+  <rect x="44" y="480" width="632" height="24" rx="8" fill="#2563eb"/>
+  <rect x="44" y="492" width="632" height="12" fill="#2563eb"/>
+  <text x="360" y="496" font-size="11" font-weight="800" fill="white" text-anchor="middle">pegleg — Callback Delivery Workers</text>
+  <text x="614" y="496" font-size="9" fill="#bfdbfe" text-anchor="end">(horizontally scalable — N instances)</text>
+
+  <!-- step list -->
+  <text x="70" y="520" font-size="10" fill="#1e40af" font-family="monospace">① receiveMessage → visibility timeout 30s starts</text>
+  <text x="70" y="535" font-size="10" fill="#1e40af" font-family="monospace">② lookup callback_registrations → find callback URL + auth config</text>
+  <text x="70" y="550" font-size="10" fill="#1e40af" font-family="monospace">③ build JSON payload  { eventType, objectType, objectName, changedBy, eventTime }</text>
+  <text x="70" y="565" font-size="10" fill="#1e40af" font-family="monospace">④ sign:  HMAC-SHA256 → X-Habu-Signature header</text>
+  <text x="70" y="580" font-size="10" fill="#1e40af" font-family="monospace">⑤ circuit breaker check  CLOSED / OPEN / HALF-OPEN</text>
+  <text x="70" y="595" font-size="10" fill="#1e40af" font-family="monospace">⑥ HTTP POST to registered callback URL</text>
+  <text x="70" y="610" font-size="10" fill="#1e40af" font-family="monospace">⑦ write to delivery_log table  ( before ACK )</text>
+  <text x="70" y="625" font-size="10" fill="#1e40af" font-family="monospace">⑧ deleteMessage → ACK SQS</text>
+  <!-- V3 badges -->
+  <rect x="476" y="557" width="24" height="13" rx="3" fill="#7c3aed"/>
+  <text x="488" y="567" font-size="8" fill="white" font-weight="700" text-anchor="middle">V3</text>
+  <rect x="476" y="572" width="24" height="13" rx="3" fill="#7c3aed"/>
+  <text x="488" y="582" font-size="8" fill="white" font-weight="700" text-anchor="middle">V3</text>
+
+  <!-- side boxes: callback_registrations + delivery_log -->
+  <rect x="560" y="505" width="108" height="36" rx="5" fill="white" stroke="#94a3b8" stroke-width="1"/>
+  <text x="614" y="519" font-size="8.5" fill="#475569" text-anchor="middle" font-family="monospace">callback_registrations</text>
+  <text x="614" y="531" font-size="8" fill="#64748b" text-anchor="middle">cb-456 | cr-abc | QUESTION</text>
+  <line x1="536" y1="523" x2="558" y2="523" stroke="#94a3b8" stroke-width="1" stroke-dasharray="3 2"/>
+
+  <rect x="560" y="600" width="108" height="36" rx="5" fill="white" stroke="#94a3b8" stroke-width="1"/>
+  <text x="614" y="614" font-size="8.5" fill="#475569" text-anchor="middle" font-family="monospace">delivery_log</text>
+  <text x="614" y="626" font-size="8" fill="#64748b" text-anchor="middle">evt-789 | attempt=1 | 200</text>
+  <line x1="536" y1="610" x2="558" y2="610" stroke="#94a3b8" stroke-width="1" stroke-dasharray="3 2"/>
+
+  <!-- ═══════════════ FAILURE PATH ═══════════════ -->
+  <!-- arrow down from worker to failure label -->
+  <line x1="200" y1="644" x2="200" y2="668" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-red)"/>
+  <!-- failure label -->
+  <rect x="44" y="648" width="312" height="16" rx="4" fill="#fee2e2"/>
+  <text x="200" y="659" font-size="9" fill="#dc2626" text-anchor="middle" font-weight="600">on failure: retry 1s → 5s → 30s → maxReceiveCount=3 exceeded</text>
+
+  <!-- DLQ box -->
+  <rect x="44" y="668" width="312" height="52" rx="8" fill="#fee2e2" stroke="#dc2626" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="200" y="686" font-size="11" font-weight="700" fill="#991b1b" text-anchor="middle">Dead Letter Queue</text>
+  <text x="200" y="700" font-size="10" fill="#dc2626" text-anchor="middle" font-family="monospace">SQS-XMI-Delivery-DLQ</text>
+  <text x="200" y="712" font-size="9" fill="#b91c1c" text-anchor="middle">AWS moves message automatically after 3 failures</text>
+
+  <!-- DLQ fan-out -->
+  <line x1="200" y1="720" x2="200" y2="740" stroke="#dc2626" stroke-width="1.5"/>
+  <line x1="100" y1="740" x2="300" y2="740" stroke="#dc2626" stroke-width="1.5"/>
+  <line x1="100" y1="740" x2="100" y2="758" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-red)"/>
+  <line x1="300" y1="740" x2="300" y2="758" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arr-red)"/>
+
+  <!-- CloudWatch alarm box -->
+  <rect x="36" y="758" width="128" height="52" rx="7" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="100" y="775" font-size="10" font-weight="700" fill="#c2410c" text-anchor="middle">CloudWatch Alarm</text>
+  <text x="100" y="789" font-size="9" fill="#ea580c" text-anchor="middle">DLQ depth &gt; 0</text>
+  <text x="100" y="801" font-size="9" fill="#ea580c" text-anchor="middle">→ PagerDuty / Slack</text>
+
+  <!-- DLQ Admin UI box -->
+  <rect x="172" y="758" width="160" height="52" rx="7" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="252" y="775" font-size="10" font-weight="700" fill="#15803d" text-anchor="middle">DLQ Admin UI</text>
+  <text x="252" y="789" font-size="9" fill="#16a34a" text-anchor="middle">Inspect failed deliveries</text>
+  <text x="252" y="801" font-size="9" fill="#16a34a" text-anchor="middle">One-click Replay  [V3]</text>
+
+  <!-- ═══════════════ SUCCESS PATH (down from worker to consumers) ═══════════════ -->
+  <line x1="360" y1="644" x2="360" y2="840" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="369" y="660" font-size="9" fill="#16a34a" font-style="italic">HTTP POST · success</text>
+  <!-- horizontal to fan to 3 consumers -->
+  <line x1="200" y1="840" x2="520" y2="840" stroke="#16a34a" stroke-width="1.5"/>
+  <line x1="200" y1="840" x2="200" y2="858" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arr-green)"/>
+  <line x1="360" y1="840" x2="360" y2="858" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arr-green)"/>
+  <line x1="520" y1="840" x2="520" y2="858" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arr-green)"/>
+
+  <!-- ─── closes Habu Platform container ─── -->
+  <!-- visible closing label at bottom-right of container -->
+  <text x="686" y="1158" font-size="10" fill="#cbd5e1" text-anchor="end">— end of Habu Platform boundary —</text>
+
+  <!-- ═══════════════ EXTERNAL CONSUMERS (outside platform) ═══════════════ -->
+  <!-- XMI -->
+  <rect x="92" y="858" width="216" height="80" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5" filter="url(#sh)"/>
+  <rect x="92" y="858" width="216" height="22" rx="8" fill="#16a34a"/>
+  <rect x="92" y="868" width="216" height="12" fill="#16a34a"/>
+  <text x="200" y="872" font-size="10" font-weight="800" fill="white" text-anchor="middle">XMI UI  /habu-events</text>
+  <text x="200" y="891" font-size="9.5" fill="#15803d" text-anchor="middle">verifies HMAC-SHA256 signature</text>
+  <text x="200" y="905" font-size="9.5" fill="#15803d" text-anchor="middle">updates UI / cache / workflow state</text>
+  <text x="200" y="919" font-size="9" fill="#4ade80" text-anchor="middle">independent from SafeHaven delivery</text>
+  <text x="200" y="930" font-size="9" fill="#166534" text-anchor="middle" font-style="italic">POST /habu-events { eventType, objectName, changedBy… }</text>
+
+  <!-- SafeHaven -->
+  <rect x="252" y="858" width="216" height="80" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5" filter="url(#sh)"/>
+  <rect x="252" y="858" width="216" height="22" rx="8" fill="#16a34a"/>
+  <rect x="252" y="868" width="216" height="12" fill="#16a34a"/>
+  <text x="360" y="872" font-size="10" font-weight="800" fill="white" text-anchor="middle">SafeHaven endpoint</text>
+  <text x="360" y="891" font-size="9.5" fill="#15803d" text-anchor="middle">own SQS queue</text>
+  <text x="360" y="905" font-size="9.5" fill="#15803d" text-anchor="middle">XMI failures do NOT affect this</text>
+  <text x="360" y="919" font-size="9" fill="#166534" text-anchor="middle">registered via POST /cleanrooms/{id}/callbacks</text>
+
+  <!-- Future Customer (dashed) -->
+  <rect x="412" y="858" width="216" height="80" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 3" filter="url(#sh)"/>
+  <rect x="412" y="858" width="216" height="22" rx="8" fill="#94a3b8"/>
+  <rect x="412" y="868" width="216" height="12" fill="#94a3b8"/>
+  <text x="520" y="872" font-size="10" font-weight="800" fill="white" text-anchor="middle">Future Customer endpoint</text>
+  <text x="520" y="891" font-size="9.5" fill="#64748b" text-anchor="middle">any HTTPS endpoint</text>
+  <text x="520" y="905" font-size="9.5" fill="#64748b" text-anchor="middle">self-serve callback registration</text>
+  <text x="520" y="919" font-size="9" fill="#94a3b8" text-anchor="middle">Bearer / API Key / Basic auth</text>
+
+  <!-- ═══════════════ PHASE BADGES (right margin) ═══════════════ -->
+  <!-- Phase markers on the right side -->
+  <rect x="660" y="44" width="36" height="100" rx="6" fill="#dbeafe" stroke="#3b82f6" stroke-width="1"/>
+  <text x="678" y="99" font-size="9" font-weight="700" fill="#1d4ed8" text-anchor="middle" transform="rotate(-90,678,99)">Phase 1 — Sources</text>
+
+  <rect x="660" y="142" width="36" height="86" rx="6" fill="#f3e8ff" stroke="#9333ea" stroke-width="1"/>
+  <text x="678" y="185" font-size="9" font-weight="700" fill="#7e22ce" text-anchor="middle" transform="rotate(-90,678,185)">Interceptor</text>
+
+  <rect x="660" y="268" width="36" height="96" rx="6" fill="#eff6ff" stroke="#1d4ed8" stroke-width="1"/>
+  <text x="678" y="316" font-size="9" font-weight="700" fill="#1e40af" text-anchor="middle" transform="rotate(-90,678,316)">V1 — Table</text>
+
+  <rect x="660" y="364" width="36" height="116" rx="6" fill="#fff7ed" stroke="#ea580c" stroke-width="1"/>
+  <text x="678" y="422" font-size="9" font-weight="700" fill="#c2410c" text-anchor="middle" transform="rotate(-90,678,422)">V2 — Fan-out</text>
+
+  <rect x="660" y="480" width="36" height="164" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1"/>
+  <text x="678" y="562" font-size="9" font-weight="700" fill="#1e40af" text-anchor="middle" transform="rotate(-90,678,562)">V2 — Delivery Worker</text>
+
+  <rect x="660" y="644" width="36" height="168" rx="6" fill="#fee2e2" stroke="#dc2626" stroke-width="1"/>
+  <text x="678" y="728" font-size="9" font-weight="700" fill="#991b1b" text-anchor="middle" transform="rotate(-90,678,728)">Failure Path</text>
+
+  <!-- ═══════════════ LEGEND ═══════════════ -->
+  <rect x="44" y="980" width="632" height="48" rx="8" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+  <text x="60" y="999" font-size="9" font-weight="700" fill="#475569">LEGEND:</text>
+
+  <rect x="116" y="988" width="12" height="12" rx="2" fill="#dbeafe" stroke="#3b82f6" stroke-width="1"/>
+  <text x="132" y="999" font-size="9" fill="#475569">Platform internals</text>
+
+  <rect x="224" y="988" width="12" height="12" rx="2" fill="#f3e8ff" stroke="#9333ea" stroke-width="1"/>
+  <text x="240" y="999" font-size="9" fill="#475569">Interceptor</text>
+
+  <rect x="310" y="988" width="12" height="12" rx="2" fill="#fff7ed" stroke="#ea580c" stroke-width="1"/>
+  <text x="326" y="999" font-size="9" fill="#475569">SNS fan-out</text>
+
+  <rect x="398" y="988" width="12" height="12" rx="2" fill="#fee2e2" stroke="#dc2626" stroke-width="1"/>
+  <text x="414" y="999" font-size="9" fill="#475569">Failure path</text>
+
+  <rect x="476" y="988" width="12" height="12" rx="2" fill="#dcfce7" stroke="#16a34a" stroke-width="1"/>
+  <text x="492" y="999" font-size="9" fill="#475569">V1 / External consumers</text>
+
+  <text x="60" y="1020" font-size="9" fill="#94a3b8">V2 = Phase 2 components (webhook delivery) · V3 = Phase 3 hardening (HMAC, circuit breaker, DLQ Admin UI, replay)</text>
+
+  <!-- ═══════════════ BOTTOM LABELS ═══════════════ -->
+  <text x="360" y="1080" font-size="10" fill="#94a3b8" text-anchor="middle">DV-13856 · CFI-1388 · FY27Q1 · Aditya Bhardwaj · LiveRamp</text>
+  <text x="360" y="1095" font-size="9" fill="#cbd5e1" text-anchor="middle">Related: DV-13789 (Ingestion Observability) · DV-13837 (Export Non-Report Files) · DV-12958 (Exports Config API)</text>
+
+</svg>
+</div>
+</body>
+</html>

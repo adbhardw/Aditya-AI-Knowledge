@@ -1,0 +1,103 @@
+RESOLVED: NEXUS AND CAC ARE NOT TWO SEPARATE SYSTEMS — CAC IS AN APP INSIDE NEXUS
+Follow-up to 2026-07-22_keys_service_accounts_why_nexus_still_needed.txt.
+This corrects sloppy phrasing from my previous answer that caused confusion.
+Date: 2026-07-22
+
+DIRECT EVIDENCE: LiveRamp/nexus is a MONOREPO. Its `apps/` directory
+contains, side by side:
+
+    access-control        <- THIS IS CAC. Confirmed directly:
+                              apps/access-control/emulator/README.md literally
+                              opens with "# Central Access Control (CAC) API
+                              Emulator"
+    service-account        <- issues tokens, holds/rotates signing keys,
+                               serves JWKS (the diagram from the previous doc)
+    org-api
+    idp-snapshots
+    internal-okta-to-cac-syncer
+    liveramp-token-fetcher
+    self-signup-service
+    third-party-app-sso-gateway
+    thirdshield (+ thirdshield-cli, thirdshield-hackui)
+    v2sa-mapping-backfill
+    ...and a few more
+
+So: CAC is not a separate company system that Nexus happens to depend on.
+CAC (access-control) is literally one app living inside Nexus, as a sibling
+to the service-account app. Nexus is the umbrella platform/monorepo for
+ALL of LiveRamp's identity and access management — authentication AND
+authorization both live under it, as two of its several apps.
+
+
+===========================================================
+Q&A — YOUR EXACT QUESTIONS
+===========================================================
+
+Q1: Is Nexus the authn service for the sidecar-based approach, or the
+    CAC-based approach too, or am I completely wrong?
+
+A1: Not wrong — just resolved now. There is only ONE authn system,
+    Nexus's service-account app, used by BOTH approaches identically. Every
+    token, in either approach, is issued and signed by the same place
+    (Nexus). The "sidecar vs CAC-based" difference was never about who
+    ISSUES the token — it's only about who VERIFIES the signature on the
+    way in: the receiving service's own local authn-proxy sidecar (sidecar
+    approach), or CAC itself as part of its permission check (CAC-only
+    approach, e.g. MCS). Both verification paths ultimately check the
+    signature against the same Nexus-issued signing key — one does it
+    locally with a cached public key, the other does it as part of a call
+    to CAC, which is itself a Nexus app.
+
+Q3: Is a service account created for both MCS and VMA, and is the
+    credentials.json stored in Vault used to authenticate to Nexus or to
+    CAC?
+
+A3: Yes — MCS and VMA each have their own separate service account (each
+    needs its own identity, so CAC can grant/scope permissions to one
+    without touching the other). The credentials.json is used to
+    authenticate to NEXUS specifically (the service-account app's
+    "Obtain Access Token" endpoint) — not to CAC directly. Sequence: app's
+    access-token-getter sidecar reads credentials.json -> presents it to
+    Nexus's service-account/Authenticator -> gets back a short-lived signed
+    access token -> THAT token (not the credentials file) is what later gets
+    sent to CAC, or to any other LiveRamp API, as the Authorization header.
+    CAC never sees the credentials.json at all.
+
+Q4: Is CAC separate from Nexus, or does CAC use Nexus (or is it the
+    reverse)?
+
+A4: Resolved above — neither "separate" nor "uses" is quite right. CAC IS
+    Nexus, in the sense that it's one of Nexus's own apps, not an external
+    dependency. They're not two systems calling each other across a company
+    boundary; they're two apps in the same platform/team's monorepo.
+
+Q5 (auth flow for orinix): "my understanding for orinix is it will have a
+    service account and this SA is authenticated by CAC using credential.json,
+    and then CAC will verify the JWT using the private/public key in Google
+    Secret Manager" — is this right?
+
+A5: Close, but one hop is misplaced — worth correcting precisely:
+    credentials.json authenticates orinix's SA to NEXUS's service-account
+    app (not to CAC) to OBTAIN a token in the first place. That token —
+    already signed, already representing "this is orinix" — is what then
+    gets sent onward to CAC (or to XMI's endpoint, which itself may call
+    CAC) for the PERMISSION check. CAC checking the permission likely does
+    involve validating that token's signature too (same signing key, since
+    CAC is a sibling Nexus app and can reuse the same verification
+    machinery) — but the credentials.json itself never goes anywhere near
+    CAC. It's: credentials.json -> Nexus (get token) -> token -> CAC
+    (check permission, which also implicitly validates the token) -- not
+    credentials.json -> CAC directly.
+
+Q5 (second question, "does this mean Nexus sits for authz too, since CAC
+    comes under it?"):
+
+A5b: Yes — exactly right, and this is the actual resolution to the whole
+    confusion. Nexus is not just the authn (identity/token) system — it's
+    the umbrella platform that owns BOTH authn (service-account app) AND
+    authz (access-control/CAC app) as sibling components of the same
+    platform. "Nexus" and "CAC" aren't two different systems in a
+    relationship with each other — CAC is one specific app that lives
+    inside Nexus. Saying "CAC" is really just naming the authz-specific
+    piece of the broader Nexus platform, the same way you'd say "MCS's
+    Celery worker" while still meaning it's part of MCS overall.

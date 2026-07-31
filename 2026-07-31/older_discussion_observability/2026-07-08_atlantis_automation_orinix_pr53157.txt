@@ -1,0 +1,73 @@
+2026-07-08 — Atlantis automation behind the orinix repo creation (LiveRamp/infrastructure PR #53157)
+
+CONTEXT
+After Andrew Yurisich pointed at InfraForge (self-serve app) instead of hand-editing github-iac,
+the actual orinix repo under LiveRamp/orinix was created via LiveRamp/infrastructure PR #53157,
+not by a manual PR like the deklareddotcom one. This note captures what each name/term means and
+what happened automatically vs. what needed a human.
+
+TERMINOLOGY
+
+- cleanroom-github
+  The Atlantis "project" name (as defined in the repo's atlantis.yaml) for the Terraform dir
+  `cleanroom/github` inside LiveRamp/infrastructure. This is the project that owns
+  cleanroom/github/repository.tf, which is where GitHub repos for the cleanroom/habu-dev org
+  (including orinix) are declared as Terraform resources.
+
+- atlantis apply -p cleanroom-github
+  The literal PR-comment command a human types to tell Atlantis "apply the plan you already ran
+  for the cleanroom-github project." The `-p` flag scopes the apply to that one project so it
+  doesn't touch other Terraform projects that might also have pending plans in the same repo.
+  Andrew (ayuris-liveramp) posted this comment at 2026-07-07 21:27:53 UTC.
+
+- atlantis-github-baKohsh5
+  The GitHub *machine user* that Atlantis authenticates as when it needs to push commits or call
+  the GitHub API on behalf of a Terraform run (distinct from the bot that comments on PRs). It
+  shows up in this PR's apply log as the actor who pushed the auto-generated catalog-info.yaml
+  and snyk-import.yaml files to the new orinix repo's base branch, and who approved the
+  "compliance/required-labels" status check on those pushes. Basically: the identity Terraform's
+  github_repository_file / null_resource.push_to_base_branch steps use to write into repos it
+  just created.
+
+- atlantis-liveramp-prod
+  The name of the actual Atlantis server deployment — found in LiveRamp/kubernetes-deployments
+  at helm/gke/eng-ops-hub-services-prod/eng-ops-hub-dmz/devops/atlantis-liveramp-prod/. This is
+  the production Atlantis instance running at atlantis.hub.liveramp.com. It's also the GitHub
+  account name that posts the "Ran Plan for project..." / "Ran Apply for project..." comments on
+  PRs, and the one that performed the final merge of PR #53157 (automerge-after-apply).
+
+WHAT HAPPENED AUTOMATICALLY, IN ORDER (all times UTC, 2026-07-07)
+
+18:08:18  infraforge-agent-prod pushes the commit that opens PR #53157 (triggered by Andrew's
+          "@infraforge" request / DV-15090 ticket) — adds the orinix block to
+          cleanroom/github/repository.tf.
+18:09:10  infraforge-agent-prod applies the "change/standard" label (needed for the
+          compliance/required-labels check to pass).
+18:10:46  atlantis-liveramp-prod auto-runs the first Plan for project cleanroom-github, since
+          the PR touches a dir Atlantis watches. Plan: 11 to add, 0 to change, 0 to destroy.
+21:22:46  Alan Zhang (AlanZhang2002) approves the PR.
+21:22:52  A "Merge branch 'master' into infraforge-add-orinix-github-repo" commit lands
+          (branch brought up to date with master before merge — same "must be up to date"
+          style requirement we saw on github-iac).
+21:23:54  New commit invalidates the old plan, so atlantis-liveramp-prod auto-re-runs Plan.
+          Same result: 11 to add.
+21:27:53  Andrew comments `atlantis apply -p cleanroom-github` — this part is NOT automatic;
+          apply requires an explicit human trigger even after an approved, passing plan.
+21:28:38  atlantis-liveramp-prod runs Apply. "Apply complete! Resources: 11 added, 0 changed,
+          0 destroyed." This is where the actual GitHub repo, its branch protection, its
+          Backstage catalog-info.yaml, and its Snyk import config all get created — the repo
+          you can now see at github.com/LiveRamp/orinix is a byproduct of this Terraform apply,
+          not a separate manual "create repo" click by anyone.
+21:28:30  As part of the apply, atlantis-github-baKohsh5 pushes catalog-info.yaml and
+          snyk-import.yaml directly to orinix's default branch and self-approves the
+          compliance/required-labels status check on those pushes (visible in the apply log's
+          local-exec output).
+21:28:43  atlantis-liveramp-prod auto-merges PR #53157 into LiveRamp/infrastructure master.
+
+SUMMARY
+Only two things in the whole chain were human actions: Andrew filing the InfraForge request in
+the first place, Alan's review approval, and Andrew's `atlantis apply` comment. Everything else —
+opening the PR, labeling it, planning/re-planning, creating the repo + branch protection +
+Backstage/Snyk bootstrap files inside it, and merging the infra PR — was automated by InfraForge
+and Atlantis (server: atlantis-liveramp-prod, machine user for repo writes:
+atlantis-github-baKohsh5, Terraform project: cleanroom-github).

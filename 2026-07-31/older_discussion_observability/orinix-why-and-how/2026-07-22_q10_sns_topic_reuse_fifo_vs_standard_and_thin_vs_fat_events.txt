@@ -1,0 +1,242 @@
+Q10 — Should orinix reuse the existing SNS topic? FIFO vs Standard,
+and the thin-vs-fat event problem that decides it
+Date: 2026-07-22
+Status: Grounded in the actual infra repo (orinjade) and forebitt
+source. Contains a self-correction of a claim made mid-discussion
+("reuse the topic, zero producer change") that turned out wrong once
+the message payload was actually read.
+
+Follows the one-question-at-a-time format of Q1-Q9. See
+[[project_orinix_observability]] and [[project_orinix_audit_log_expansion]].
+
+------------------------------------------------------------------------
+WHAT THE INFRA ACTUALLY HAS (orinjade/aws/modules/habu-events)
+------------------------------------------------------------------------
+
+ONE SNS topic:
+  habu_events_topic.fifo   -- FIFO, content_based_deduplication = true
+
+TWO SQS queues subscribed via SNS fan-out, each with its own filter
+policy on the "object" message attribute:
+  habu_events_pegleg_queue  -- filter: cleanroom, cleanRoomQuestion,
+                               dataImportJob, dataset, alert,
+                               identityResolution, measurementRun, ...
+                               (broad operational set)
+  habu_events_janus_queue   -- filter: cleanRoomQuestionRun only
+
+orinix is NOT in this repo yet. Adding a consumer here is the
+janus/pegleg pattern repeated: new SQS queue + new
+aws_sns_topic_subscription with a filter_policy. SNS fan-out means a
+new subscription is fully ISOLATED from existing consumers — separate
+queue, separate filter, separate delivery. So "don't touch pegleg/
+janus" is satisfied BY fan-out, not by needing a separate topic.
+
+------------------------------------------------------------------------
+THE CORRECTION — why "reuse the topic, zero producer change" is WRONG
+------------------------------------------------------------------------
+
+Mid-discussion I claimed orinix could just subscribe to the existing
+topic with a filter and get everything it needs, zero producer change.
+That was wrong, and reading the actual message payload is what caught
+it. Recording the correction rather than quietly fixing it, because
+the reasoning is the useful part.
+
+The message model on habu_events_topic.fifo is hank/events.EventStruct:
+
+  type EventStruct struct {
+      Service    string
+      Action     string
+      Object     string             // "cleanroom", "dataImportJob", ...
+      ObjectID   string
+      Attributes map[string]string  // OrganizationID, CleanRoomID, IDs
+  }
+
+That is a THIN notification: object + action + id + a few ID
+attributes. There is NO changedFields, NO before/after diff. Confirmed
+across every publish site in unhygienix/api/server/events.go — they
+all set Service/Action/Object/ObjectID + an Attributes map of IDs and
+enums only.
+
+orinix's whole object_events schema is built on the FAT CloudEvents
+payload: changedFields { field: { from, to } }. The existing topic
+does not carry that, and orinix cannot reconstruct the "from" after
+the fact — the before-state is gone by the time any consumer sees the
+event. So reusing the existing topic as-is would give orinix thin
+events missing the exact data its design depends on.
+
+CONSEQUENCE: producers must emit a NEW fat event REGARDLESS of which
+topic is used. The "reuse topic = free" argument collapses, because
+the producer change is required either way. This actually STRENGTHENS
+the separate-stream instinct in the original design doc, it doesn't
+weaken it.
+
+------------------------------------------------------------------------
+IS THE FAT EVENT EVEN FEASIBLE TO EMIT? — verified in one real path
+------------------------------------------------------------------------
+
+Checked forebitt UpdateImportJob (job_service.go:1538), the data-
+connection update path:
+
+  GOOD (feasibility confirmed): the before-state IS in hand at publish
+  time. Line 1552 fetches dbJob = FetchJobByID(...) (the "before")
+  before the write at line 1579. The code at line 1584 already
+  compares old-vs-new explicitly (dbJob.Name != in.Job.Name). So
+  building changedFields { from: dbJob.X, to: in.Job.X } is a genuine
+  small change — both sides are already in scope. Not assumed, read
+  directly.
+
+  CAVEAT (don't oversell "3 lines"): the EXISTING thin-event publish
+  in that function fires ONLY when Name or ImportDataType changes — it
+  does NOT publish on a stage change at all. So orinix's canonical
+  "stage: CONFIGURATION_COMPLETE -> MAPPING_REQUIRED" event has NO
+  existing emit point here. The producer work is a NEW publish call
+  per mutation path orinix cares about, not an enrichment of an
+  existing one, and not every path is guaranteed to fetch the old
+  state first (this one does; others need per-path checking). "~3
+  lines per path" is right on feasibility, wrong if it implies "modify
+  one existing publish and you're done."
+
+------------------------------------------------------------------------
+FIFO vs STANDARD — the topic-TYPE decision, and how to defend it
+------------------------------------------------------------------------
+
+The existing topic is FIFO. If orinix gets its OWN topic (recommended,
+per the thin/fat split above), the type is a fresh decision. Argue
+STANDARD — but the two FIFO guarantees need DIFFERENT arguments, and
+one of them (ordering) I initially overstated. Corrected below.
+
+  DEDUP — FIFO is genuinely redundant here, and weaker than what we
+  have. FIFO dedup is a 5-MINUTE content-hash window. orinix has
+  UNIQUE(idempotency_key) + ON CONFLICT DO NOTHING, which is PERMANENT.
+  So we already provide a strictly stronger, longer-lived dedup one
+  layer down. This claim holds up fully.
+
+  ORDERING — more nuanced than I first wrote. My earlier claim
+  "cursor_position makes FIFO ordering redundant" was TOO GLIB and is
+  corrected here:
+
+    cursor_position is assigned at INSERT time, so it reflects the
+    order orinix RECEIVED/inserted events (= arrival order on a
+    Standard topic), NOT the order the real mutations HAPPENED. So the
+    cursor gives gapless, resumable PAGINATION order (a real,
+    necessary job — no consumer misses or double-reads), but it does
+    NOT give causal/event order. Those are two different guarantees; I
+    conflated them.
+
+    What ACTUALLY provides ordering without FIFO, three composing
+    pieces:
+      1. Producer-side order is already correct. All of one object's
+         mutations go through the SAME service (e.g. all data-
+         connection stage changes through forebitt), each a post-
+         commit publish after a serialized DB transaction. So events
+         for ONE object are emitted in-order at the source.
+         Reordering is purely a TRANSPORT artifact (SNS->SQS Standard
+         is best-effort order) — we're recovering transit-scrambled
+         order, not order lost at the source.
+      2. event_time (producer-stamped mutation time) is the source of
+         truth for "when it really happened." Consumers that care sort
+         by event_time, not arrival. Reliable within one object's
+         lineage (one service, usually one instance, serialized by the
+         DB); cross-producer clock skew only matters ACROSS different
+         objects, where order is meaningless anyway.
+      3. A per-object version / monotonic field (updated_at or a
+         counter) for strict last-writer-wins: a consumer ignores an
+         event whose version is older than one it's already seen. Makes
+         out-of-order arrival provably safe with no FIFO.
+
+  FIFO costs: 300 msg/s per topic (3000 batched), forces FIFO SQS
+  subscribers, requires MessageGroupId on every publish.
+
+THE REFRAME THAT ACTUALLY WINS IT: does orinix's consumer need to
+replay every intermediate transition IN ORDER, or the latest state?
+XMI's use cases (flow run completed -> trigger next; stage changed ->
+pause) are LAST-STATE-WINS reactions, not ordered-transition-replay.
+For last-state-wins, event_time + version is not just sufficient, it's
+MORE robust than FIFO — it also survives producer republish, backfill,
+and replay, all of which present events out of order REGARDLESS of
+topic type (FIFO wouldn't help there). So the honest framing is not
+"FIFO ordering is redundant" but "we don't need transport ordering,
+and what we do carry (event_time + version) recovers correct order
+more generally than FIFO could."
+
+WHEN FIFO WOULD ACTUALLY BE RIGHT (say this, don't dismiss FIFO
+dogmatically): if a consumer requirement emerges that must apply every
+intermediate state transition in exact order and genuinely cannot use
+timestamps/versions to reconstruct it, then FIFO with MessageGroupId =
+object_id (per-object order, parallelism across objects) is the
+correct tool. Nothing in XMI's stated use cases requires this today —
+naming what WOULD change the decision is the point.
+
+So: paying FIFO's 300/s ceiling to get dedup we already provide MORE
+strongly, plus transport-ordering our consumers don't need and can
+recover anyway, is backwards. The ceiling is a real risk for a fan-
+out/firehose role that worsens as audit-logging volume grows
+(2.84M/day audit-scale ~ 33/s average, bursts well past that).
+
+DEFENSE LINE (say it first, before a reviewer does):
+  "The new observability topic should be Standard, not FIFO. Dedup:
+  we already provide a permanent UNIQUE idempotency_key, stronger than
+  FIFO's 5-minute window. Ordering: our consumers are last-state-wins
+  and we carry event_time + a per-object version, which recovers
+  correct order under ANY reordering — including replays and backfills
+  FIFO wouldn't help with. FIFO would prevent transport reordering at
+  a 300/s cost, for a guarantee our schema already provides more
+  generally. FIFO is correct for the OPERATIONAL topic, where pegleg/
+  janus need ordered, exactly-once side-effects; orinix's needs are
+  different."
+
+FALLBACK if forced to reuse the existing FIFO topic:
+  Scope ordering with MessageGroupId = cleanroom_id — strict order
+  within a cleanroom, full parallelism across cleanrooms — and monitor
+  the per-topic throughput ceiling. Works, but inherits a cap and
+  couples orinix to the operational topic's lifecycle. This coupling
+  is itself the sharper reason to keep the topics separate: not just
+  thin-vs-fat SCHEMA, but the topic TYPE genuinely should differ.
+
+------------------------------------------------------------------------
+WHAT THE DESIGN DOC / DIAGRAM MUST CHANGE
+------------------------------------------------------------------------
+
+The current block presents "AWS SNS: habu-object-events" as if greenfield.
+A reviewer who knows the infra will ask "why a second topic when
+habu_events_topic.fifo exists?" Pre-empt it:
+
+  1. Name the existing topic explicitly and mark the new one as NEW +
+     SEPARATE (recommend name habu-observability-events, matching the
+     earlier design decision).
+  2. State the justification inline: operational topic carries thin
+     notifications (object+action+id); observability needs fat
+     CloudEvents with field-level diffs — different schema, retention,
+     consumers, AND topic type (FIFO vs Standard).
+  3. Keep the per-consumer filtered-SQS-queue pattern (matches pegleg/
+     janus) — that part of the design is already idiomatic.
+  4. Producers ALSO emit the fat event (new publish call per path),
+     not instead of the existing thin one — both streams coexist.
+
+------------------------------------------------------------------------
+OUSTERHOUT TIE-IN
+------------------------------------------------------------------------
+
+  BETTER TOGETHER OR APART (ch. 8) — thin operational events and fat
+  observability events look similar (both "something changed") but
+  differ in schema, retention, consumers, and topic type. That's the
+  signal they belong APART — a separate topic, not a filter on a
+  shared one. Forcing them together would mean one topic carrying two
+  schemas and two ordering/throughput regimes.
+
+  PULL COMPLEXITY DOWNWARD (ch. 8) — orinix providing its own
+  permanent idempotency and its own cursor ordering means the topic
+  layer doesn't have to (Standard is fine). The complexity of
+  correctness lives in one well-understood place (the ingest INSERT),
+  not pushed up into FIFO topic configuration.
+
+  DEFINE ERRORS OUT OF EXISTENCE (ch. 9) — UNIQUE(idempotency_key) +
+  ON CONFLICT DO NOTHING makes a duplicate a structural no-op, not an
+  error path to handle. This is also exactly why FIFO's dedup is
+  redundant: the error was already defined out of existence one layer
+  down.
+
+  DESIGN IT TWICE (ch. 4) — reuse-existing-FIFO-topic vs new-Standard-
+  topic is a genuine two-option decision, sketched both ways here
+  rather than defaulted. The self-correction (thin-vs-fat) is what
+  made the second option clearly win.

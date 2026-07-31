@@ -1,0 +1,226 @@
+Confluence addition — Audit Logging (Future Extension) section for
+DV-13856 Cleanroom Observability design doc
+Date: 2026-07-20
+Purpose: paste-ready content for tomorrow's Design Review — a closing
+section proposing how orinix extends to cover Josh's audit-logging ask,
+without committing current M1 scope to it. Grounded in the actual
+Hank/unhygienix/forebitt/primage source and real industry precedent
+(sources at the bottom), not speculation — full working notes in
+orinix-why-and-how/2026-07-18_q9_audit_log_expansion_datadog_source_and_chained_relationships.txt
+(Q9-Q19).
+
+PLACEMENT (checked against the actual live doc structure, not a
+guess): paste this as a new numbered section "4. Future Extension:
+Audit Logging" AFTER the existing "Final Recommendation" Phase/
+Delivery Model/Recommendation table — i.e. the very last thing on the
+page, after V1/V2/V3. Do not place it earlier; everything before
+Final Recommendation reads as this quarter's committed XMI delivery,
+and this section is explicitly not that. Open with a Confluence Info/
+Note panel — "Proposed extension, not in current V1/V2/V3 scope" —
+before any other content, so it can't be mistaken for committed work
+at a glance. Structure mirrors the doc's own "Why CloudEvents" ->
+"1. Industry Standard" -> "2. Vendor Neutral" pattern (same
+external-precedent rhetorical move, reused deliberately for
+consistency) and closes with a Phase table in the same three columns
+as Final Recommendation, so it visually reads as a continuation of
+that table rather than a different kind of content.
+
+================================================================================
+AUDIT LOGGING — FUTURE EXTENSION (proposed, not in M1 scope)
+================================================================================
+
+GOAL
+
+orinix's object_events table already captures a curated stream of
+cleanroom mutations (QUESTION, DATA_CONNECTION, EXPORT_JOB today; Flow
+and Dataset in the M1 expansion). Separately, Habu already has an
+exhaustive audit trail via Hank's shared library (hank/db/audit.go) —
+a GORM hook embedded in 90+ models across unhygienix, forebitt, and
+primage, logging every CREATE/UPDATE/DELETE. The proposal below is a
+path to bring these together under one repo (orinix) instead of
+building a second, separate audit-logging service later — without
+pretending they're the same problem at the same scale.
+
+--------------------------------------------------------------------------------
+1. CAN object_events JUST BE EXPANDED TO HOLD AUDIT DATA?
+--------------------------------------------------------------------------------
+
+Partially yes, for the part that's already the same shape.
+
+  What extends cleanly, no schema migration:
+  - The gRPC method / RPC route Hank's audit log captures
+    (e.g. /proto.CleanRoomRunStatsService/CreateCleanRoomQuestionRunStatistics)
+    fits inside the existing context_fields JSONB column as one more
+    key, alongside things like partnerAccountId and questionDisplayName
+    that already live there. No migration needed.
+  - Actor detail (ActionByID/ActionByEmail from Hank's AuditLog struct)
+    maps directly onto performed_by, already a first-class column.
+
+  What does NOT extend cleanly — this is the real finding, not a
+  guess: Hank's audit hooks today are 100% log-only. Confirmed by
+  reading hank/db/audit.go directly — every hook (AfterCreate,
+  AfterUpdate, AfterDelete) does exactly one thing, write a structured
+  line via the logger. No DB write, no SNS/SQS publish anywhere in the
+  file. The event-publishing mechanism that feeds object_events
+  (hank/events.EventClient, invoked by hand-written call sites) is a
+  COMPLETELY SEPARATE system in the same shared library — it is never
+  called by the audit hooks. Wiring them together is real, undecided
+  work: either instrument each of the ~90 audit-hook-bearing models
+  individually, or modify Hank's shared hooks to also publish (smaller
+  change, but every Hank-consuming service inherits the new behavior
+  instantly — bigger blast radius). Flag this explicitly as an open
+  decision in the review, not something already half-built.
+
+--------------------------------------------------------------------------------
+2. THE RETENTION CONFLICT (the real blocker, not the schema)
+--------------------------------------------------------------------------------
+
+object_events' current DDL runs a nightly hard delete:
+  DELETE FROM object_events WHERE event_time < NOW() - INTERVAL '90 days'
+
+That's the right policy for "notify a webhook consumer something
+changed." It is the wrong policy for "prove to a customer's compliance
+team what happened in their cleanroom 14 months ago" — the actual job
+of an audit log. Before any expansion, this needs to change from a
+hard delete to an archive-then-delete step (below).
+
+There's a second, harder version of the same problem: Hank's audit
+stream spans 90+ entity types at much higher volume than object_events'
+curated set (2.84M+ events/day at the audit-log layer vs. a much
+smaller curated business-event volume today). Even with correct
+retention, dumping that full firehose into one live Postgres table
+does not scale — this matches the concern already raised: it becomes
+a massive, ever-growing SQL table, and a table optimized for "recent
+event lookup by cleanroom + cursor" is not the right shape for "every
+CRUD op across every service, kept for years."
+
+--------------------------------------------------------------------------------
+3. WHERE DATADOG'S COPY ACTUALLY LIVES, AND WHAT INDUSTRY DOES ABOUT IT
+--------------------------------------------------------------------------------
+
+Datadog does not read the Kubernetes pod's log file when you query —
+the Agent tails container stdout once and ships each line to Datadog's
+own storage. From that point on, the pod's log file is irrelevant;
+you're querying Datadog's copy, with Datadog's own retention window.
+
+Datadog's own architecture for this exact problem is a two-tier model,
+confirmed directly from their docs:
+  - Log Indexes — the hot, full-text-searchable tier. Expensive per GB,
+    short retention, used for live queries and alerting.
+  - Log Archives — logs forwarded to a bucket YOU own (S3, Azure Blob,
+    GCS) as they're ingested, not after expiring out of the index.
+    Retention is entirely up to you (Datadog doesn't cap it). Not
+    searchable directly — you "rehydrate" a time range back into the
+    index on demand when you actually need to investigate it.
+  [Rehydrating from Archives, docs.datadoghq.com]
+  [Log Archives, docs.datadoghq.com]
+
+GitHub does the same thing for its own audit log: GitHub Enterprise
+streams the audit log to a bucket or SIEM you own (S3, Splunk HEC,
+Azure) for any retention beyond their own default window — GitHub
+does not keep unlimited audit history live in one queryable store
+either.
+  [Streaming the audit log for your enterprise, docs.github.com]
+
+Stripe's Events API is explicitly a short live window, not a durable
+archive: full payload + resend for 15 days, full payload only (no
+resend) for 16-30 days, summary-only past 30 days. Anyone needing
+durable history is expected to persist their own copy from Stripe's
+webhook deliveries, not query Stripe's own store indefinitely.
+  [Stripe event retention period, support.stripe.com]
+
+The pattern is consistent across all three: nobody keeps unlimited
+audit history in one hot, queryable table. Hot/live = short
+operational window. Cold/archive = cheap object storage, long
+retention, queried rarely and asynchronously (rehydration /
+Athena-style query-on-demand, not a live index).
+
+--------------------------------------------------------------------------------
+4. PROPOSED ARCHITECTURE FOR ORINIX
+--------------------------------------------------------------------------------
+
+Two tiers, same shape Datadog/GitHub already use, adapted to what
+orinix already has:
+
+  HOT TIER (exists today) — object_events, Postgres
+    - Curated business events (current + M1 expansion: Question, Flow,
+      Data Connection, Dataset)
+    - Extended with method/actor detail in context_fields (see #1)
+    - Short retention (current 90-day window), serves the live use
+      cases: webhook/Pub-Sub push, cursor-based pull API, Activity
+      Feed UI
+    - CHANGE: retention job becomes archive-then-delete, not delete-only
+
+  COLD TIER (new) — object storage archive (S3/GCS), partitioned by
+  date/org/cleanroom, e.g. Parquet or newline-JSON
+    - Receives (a) object_events rows aged out of the hot tier, and
+      (b) — separately, NOT through the same live table — the full
+      Hank/GORM audit firehose across all 90+ entity types, routed
+      here directly via log forwarding (Datadog Log Archives already
+      supports exporting to a bucket we own) or a dedicated consumer
+      reading the same stream
+    - Cheap, append-only, long retention (compliance-driven: months to
+      years, a business decision, not an engineering constraint)
+    - Not directly queryable in real time — queried on demand via a
+      rehydration-style job or a query engine over the archive
+      (Athena/BigQuery-equivalent), same model as Datadog's rehydration
+
+  ONE READ API on top of both, so callers don't need to know which
+  tier answered: recent activity resolves from Postgres directly;
+  older or compliance-driven queries route to the archive path. This
+  mirrors how GitHub's own audit log UI/API works — recent history
+  live, older history via export/stream, one mental model for the
+  caller either way.
+
+--------------------------------------------------------------------------------
+5. PROPOSED PHASING (this is the answer if asked "how would you
+   actually implement this")
+--------------------------------------------------------------------------------
+
+  M1 (current scope) — unchanged. Curated events, current retention,
+  no audit-log work yet.
+
+  M2 — schema-level readiness, no new infra:
+    - Add method/actor fields to context_fields for curated events
+      that want them
+    - Change object_events' nightly job from hard-delete to
+      archive-then-delete (write aged rows to cold storage before
+      removing from Postgres) — this alone fixes the retention
+      conflict for the curated event set, before touching the Hank
+      firehose at all
+
+  M3 — the actual audit-log expansion:
+    - Stand up the cold-storage archive + forwarding path for Hank's
+      full audit stream (evaluate: Datadog Log Archive export vs. a
+      dedicated consumer on the same log source)
+    - Decide and implement the Hank-hooks-to-publish wiring question
+      from #1 (per-call-site vs. shared-hook change)
+    - Build the rehydration/query path and the unified read API
+
+--------------------------------------------------------------------------------
+6. OPEN ITEMS TO STATE OUT LOUD IN THE REVIEW (don't present as solved)
+--------------------------------------------------------------------------------
+
+  - Whether Hank's shared hooks should be modified to publish, or each
+    call site instrumented individually — real tradeoff, not decided
+  - Chained-entity events (Dataset -> DataConnection -> Credential,
+    verified across unhygienix/forebitt/primage): recommendation is
+    "one event per row that actually changed, reference affected
+    resources in context_fields" rather than fabricating synthetic
+    events — forebitt already exposes a reverse-lookup RPC
+    (GetDataConnectionCountByCredential) that a credential-change
+    event's context field could reuse, so this is partially existing
+    capability, not all new work
+    - Whether blank actor/org fields seen in one sampled Datadog log
+    line are stage-only or also occur in production — not yet checked
+  - Whichever compliance/legal retention window applies (months vs.
+    years) is a business decision to get from Legal/Compliance, not
+    something to assume before this design is finalized
+
+================================================================================
+SOURCES (for the retention/architecture claims above)
+================================================================================
+- Datadog Log Archives: https://docs.datadoghq.com/logs/log_configuration/archives/
+- Datadog Rehydration: https://docs.datadoghq.com/logs/log_configuration/rehydrating/
+- GitHub audit log streaming: https://docs.github.com/en/enterprise-cloud@latest/admin/monitoring-activity-in-your-enterprise/reviewing-audit-logs-for-your-enterprise/streaming-the-audit-log-for-your-enterprise
+- Stripe event retention: https://support.stripe.com/questions/stripe-event-retention-period

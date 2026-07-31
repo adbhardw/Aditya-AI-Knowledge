@@ -1,0 +1,476 @@
+================================================================================
+orinix — Q&A FOR JOSH WO / ANIL — 30 JULY 2026
+Event production: SNS publish vs Hank GORM audit hooks
+================================================================================
+Prepared by: Aditya Bhardwaj
+Date:        2026-07-30
+Scope:       DATA_CONNECTION (= DataImportJob) create / update / delete.
+             Where does the orinix event get produced, and on what transport?
+
+Companion documents (deeper detail, not repeated here):
+  2026-07-27_loki-datadog-hank-event-comparision.txt
+      — can a log store (Loki / Datadog) back GetCleanroomEvents? No, and why.
+  2026-07-28_dataconnection_create_event_emission_service_layer_vs_hank_hooks.txt
+      — full code trace of the 2+N problem, head-to-head comparison table.
+
+[VERIFIED] = read in source on 2026-07-28/30.  [UNVERIFIED] = to be confirmed.
+
+--------------------------------------------------------------------------------
+THE THREE THINGS I AM ASKING YOU TO DECIDE
+--------------------------------------------------------------------------------
+  D1. Produce orinix events at the SERVICE LAYER (explicit publish in the gRPC
+      handler), not from Hank's GORM audit hooks.                    -> Q1, Q5, Q6
+  D2. New STANDARD SNS topic + new SQS queue for orinix. Do not reuse
+      habu_events_topic.fifo, and do not modify hevent.EventStruct.  -> Q3, Q4
+  D3. Accept or reject the current at-most-once publish semantics. If rejected,
+      we need an outbox and that is real M1 scope.                   -> Q8
+
+================================================================================
+Q1. Is the SNS publish mechanism different from the Hank GORM callback hook
+    that hank.db provides after each resource change?
+================================================================================
+YES — completely separate systems that happen to live in the same shared
+library and never touch each other.
+
+  [VERIFIED] hank/db/audit.go       -> GORM AfterCreate/AfterUpdate/AfterDelete
+                                       hooks. They do exactly ONE thing:
+                                         hlog.LogEntryCtx(ctx).Infof("Audit Log: %s", ...)
+                                       No DB write. No SNS publish. Anywhere in
+                                       the file.
+
+  [VERIFIED] hank/events/service.go -> SNS publisher (hevent.New / .Publish),
+                                       invoked by hand-written call sites in
+                                       each service.
+
+  [VERIFIED] The audit hooks NEVER call the event publisher. Two pipelines:
+
+     mutation ──┬── GORM hook ──> stdout log line ──> Alloy ──> Loki / Datadog
+                │                 (metadata only, see Q5)
+                │
+                └── hand-written events.PublishEvent(...)  ──> SNS topic
+                                  (only at ~15 chosen call sites in forebitt)
+
+This matters because "Hank already gives us events on every resource change" is
+the most natural assumption in the room, and it is not true. Hank gives us LOG
+LINES on every resource change, and SNS MESSAGES only where a human wrote a
+publish call.
+
+Consequence: wiring the audit trail into an event stream is NOT free. It means
+either instrumenting each mutation point individually, or changing Hank's shared
+hooks so every consuming service inherits the behaviour instantly. That is a
+real decision, not a given.
+
+================================================================================
+Q2. What exactly is events.PublishEvent, and what goes on the wire?
+================================================================================
+A 12-line wrapper over Hank's SNS publisher.
+
+  [VERIFIED] forebitt/services/events/service.go:9
+    func PublishEvent(ctx context.Context, config hevent.Config, message hevent.EventStruct) error {
+        eventInstance, err := hevent.New(config)        // hank/events/service.go:18
+        _, publishErr := eventInstance.Publish(ctx, message)   // :30
+    }
+
+  [VERIFIED] the payload — hank/events/model.go:3
+    type EventStruct struct {
+        Service    string            `json:"service"`     // "forebitt"
+        Action     string            `json:"action"`      // create | update | delete
+        Object     string            `json:"object"`      // "dataImportJob"
+        ObjectID   string            `json:"objectId"`    // the uuid
+        Attributes map[string]string `json:"attributes"`  // a bag of strings
+    }
+
+That is the whole thing: an id and a bag of strings. No field values, no diff.
+This is the "THIN" event. It is exactly why orinix cannot simply subscribe to the
+existing topic and filter — producers must emit a new FAT payload regardless of
+which topic it ends up on.
+
+Four operational details worth knowing:
+
+  a) ROUTING IS BY SNS MESSAGE ATTRIBUTES.
+     [VERIFIED] hank/events/service.go:32-35 sets object / action / service as
+     MessageAttributeValues. Those drive the subscription filter policies that
+     split the topic into the pegleg and janus queues. See Q4(a) — this is what
+     makes topic reuse dangerous.
+
+  b) THE TOPIC IS FIFO.
+     [VERIFIED] fiddley/control-plane/apps/prod/aws/forebitt/prod-overrides.yaml:78
+        topicArn: "arn:aws:sns:us-east-2:903581299666:habu_events_topic.fifo"
+
+  c) THE FIFO MESSAGE GROUP IS THE REQUEST ID — so FIFO buys us almost nothing.
+     [VERIFIED] hank/aws/sns/service.go:48
+        MessageGroupId: aws.String(reqId)
+     SNS FIFO only guarantees ordering WITHIN a message group. Since the group
+     key is the request id, two updates to the SAME DataImportJob from two
+     different requests are in DIFFERENT groups and have NO ordering guarantee
+     relative to each other. So the ordering argument for staying on the FIFO
+     topic does not survive contact with the code. (It also auto-attaches
+     requestId as a message attribute at :40.)
+
+  d) SNS MESSAGE SIZE LIMIT IS 256 KB. Fat events carrying a full before/after
+     parameter set are small in the normal case, but this is the ceiling. If we
+     ever exceed it the standard answer is the claim-check pattern (publish a
+     reference, consumer fetches the body). Not an M1 problem; worth naming.
+
+================================================================================
+Q3. Can we change EventStruct to carry more values? We can always add fields.
+================================================================================
+Yes, technically — and we should NOT. Here is the better lever.
+
+  [VERIFIED — this is the key finding] hank/aws/sns/service.go:34
+    func (s SNS) Publish(ctx context.Context, message any, topicARN string,
+                         messageAttributes map[string]*sns.MessageAttributeValue) (string, error)
+
+  The underlying Hank SNS transport already accepts `message any` and just
+  json.Marshals it (:42). hevent.EventStruct is not a constraint imposed by the
+  transport — it is a typed convenience wrapper sitting on top of a
+  payload-agnostic publisher.
+
+So we do not need to widen EventStruct, and we do not need to write a new
+publisher. We define our own CloudEvents-shaped type and publish it through the
+SAME Hank SNS transport, to a different topic.
+
+    REUSE THE MECHANISM. DO NOT REUSE THE MESSAGE.
+
+Why not widen EventStruct instead:
+  - It is in hank, consumed by unhygienix, forebitt, primage, picanmix, pegleg.
+    Every one of them inherits the change on the next version bump.
+  - Every existing subscriber of habu_events_topic.fifo starts receiving larger
+    messages it did not ask for and does not read.
+  - It couples orinix's schema evolution to hank's release cycle. Every future
+    CloudEvents change becomes a shared-library release plus a coordinated
+    rollout across five services. That is a permanent tax for a one-time saving.
+  - Adding fields is backward-compatible at the JSON level, so it LOOKS free.
+    The cost is not compatibility, it is ownership: the orinix contract would
+    live in a repo we do not own and cannot version independently.
+
+Recommendation: a new type, owned by us. Published via hank/aws/sns directly (or
+a thin new hevent helper that takes `any`), so we still get the shared session,
+assume-role, and requestId plumbing for free.
+
+================================================================================
+Q4. For orinix: new SQS, existing topic with a new queue, or a new topic?
+================================================================================
+RECOMMENDATION: NEW STANDARD TOPIC + NEW QUEUE. Concretely —
+
+    forebitt handler ──> [NEW] habu-observability-events   (SNS, STANDARD)
+                              │
+                              └──> [NEW] sqs-habu-observability-ingest
+                                          │
+                                          └──> orinix ──> object_events
+
+Ruling out the alternatives, with evidence:
+
+  (a) REUSE habu_events_topic.fifo — REJECT. It breaks the "don't touch
+      pegleg/janus" constraint, provably.
+
+      [VERIFIED] orinjade/aws/modules/habu-events/pegleg.tf:14-23 — pegleg's
+      subscription filter policy matches on the `object` attribute and the list
+      INCLUDES "dataImportJob":
+
+          filter_policy = jsonencode(map(local.event_attribute_object_key, [
+            "organization", "cleanroom", "cleanRoomQuestion", "dataImportJob",
+            "dataset", "alert", ... ]))
+
+      [VERIFIED] orinjade/aws/modules/habu-events/janus.tf:14-18 — janus filters
+      on object = ["cleanRoomQuestionRun"].
+
+      So if we publish a fat DataConnection event to that topic with the natural
+      attribute value object="dataImportJob", PEGLEG'S QUEUE RECEIVES IT. To
+      prevent that we would have to either invent a non-obvious object value or
+      add a discriminator attribute AND update pegleg's filter policy — i.e.
+      modify pegleg. A separate topic gives us the isolation by construction.
+
+  (b) FIFO vs STANDARD — STANDARD. Three reasons, one of them new:
+      - Dedup: FIFO's content dedup window is 5 minutes. orinix's
+        UNIQUE(idempotency_key) + ON CONFLICT is permanent. Ours is strictly
+        stronger, so FIFO's dedup is redundant.
+      - Ordering: per Q2(c), the message group is the request id, so FIFO does
+        NOT order two updates to the same object across requests. The guarantee
+        people assume they are keeping does not actually exist here. Real
+        ordering comes from the producer-stamped event_time plus (optionally) a
+        per-object version — and XMI's consumers are last-state-wins
+        (flow-run-complete -> trigger, stage-change -> pause), not
+        ordered-transition-replay.
+      - Throughput: FIFO caps at 300 msg/s (3000 batched). At audit scale that
+        is a real ceiling. Standard has none that matters to us.
+
+  (c) EXISTING QUEUE — REJECT trivially. The existing queues are owned by pegleg
+      and janus and are shaped for the thin schema. A new consumer needs a new
+      queue; that is the whole point of SNS fan-out.
+
+  (d) The user-facing DELIVERY queues (sqs-habu-delivery-xmi, etc.) are a
+      SEPARATE concern, downstream of object_events. Nothing here changes them.
+
+Note this is the ingest side only. Delivery-out to XMI (webhook + GCP Pub/Sub)
+is already decided and unaffected.
+
+================================================================================
+Q5. Instead of all that — could we just add {from, to} to Hank's AuditLog and
+    consume the hooks? It is a drastic change, but is it a good idea?
+================================================================================
+GOOD IDEA FOR THE AUDIT PRODUCT. DOES NOT RESCUE IT AS ORINIX'S SOURCE.
+And the reason is not the payload — it is the GRAIN.
+
+First, what the hook emits today:
+
+  [VERIFIED] hank/db/audit.go — the complete record:
+    type AuditLog struct {
+        ObjectID, ObjectName, ObjectType, Action  string
+        ActionByID, ActionByEmail                 string
+        ActionAt                                  time.Time
+        Method, OrgID, RequestID                  interface{}
+        ImpersonatedByID, ImpersonatedByEmail     string
+    }
+  and getObjectDetails() marshals the model and pulls exactly two keys: "ID",
+  and "Name" (falling back to "DisplayName").
+
+  There are NO field values — not the new ones, not the old ones — and NO parent
+  / aggregate reference.
+
+Now suppose we succeed completely and every record carries full before/after
+values. We would have five well-populated ROW events (see Q6). We would still
+not have one DATA_CONNECTION event. The missing thing is the statement "these
+2+N row writes are one business action, and DataImportJob is the root" — and
+that is domain knowledge which does not exist at the ORM layer. GORM knows
+tables. Nothing at that layer encodes that OrganizationJobParameter is a child
+of the DataConnection aggregate rather than a first-class object.
+
+To teach it we would annotate either the models (an AggregateRoot() interface
+across ~91 models) or the call sites (ctx carries an aggregate tag). EITHER WAY
+WE PAY THE PER-PATH COST OF THE SERVICE-LAYER APPROACH ANYWAY — and then we
+additionally inherit an assembly problem we do not have today: buffer N
+messages, join them, decide when the aggregate is complete, handle partial
+arrival when message 4 of 5 is delayed. Same upfront cost, plus a new
+distributed-assembly failure mode. Strictly worse.
+
+Five things a struct change does not fix:
+  - NO BEFORE-IMAGE FOR CONDITION-SCOPED WRITES. Both of our delete paths write
+    by WHERE clause with an EMPTY struct
+    (ClearOrganizationJobParameters -> job_parameters.go:81;
+     SoftDeleteJob -> job.go:185 with IDScope at scopes.go:16). There is no
+    primary key on the value to fetch a before-image from. GORM-level limit, not
+    a struct limit.
+  - ZERO-VALUE DROP. GORM v1's Updates(struct) discards blank fields, so the
+    AFTER side is partial too unless we re-SELECT after the write.
+  - THE CLAIMS GATE. Every hook opens with
+        tokenClaims, ctx, parsed := claims(scope); if !parsed { return nil }
+    so any mutation without parsed auth claims in context emits NOTHING.
+    Pipeline-driven stage transitions are the likely victims — and stage changes
+    are XMI's #1 use case.
+  - BLAST RADIUS. hank is consumed by unhygienix, forebitt, primage, picanmix,
+    pegleg. Changing the record is a coordinated version bump, and it changes a
+    log format that Datadog monitors may already parse.
+    [UNVERIFIED] who parses "Audit Log:" lines today — worth checking before
+    anyone commits to a format change.
+  - REDACTION. Shipping real values needs a field-level allow/deny policy across
+    all ~91 audited models first. Concretely: primage/models/models.go:219-226 —
+    Credential embeds hdb.Audit and has a `Value string` column. A generic
+    before/after diff writes secrets to stdout, and from there to Loki and
+    Datadog. This is a blocker, not a caveat.
+
+WHERE IT IS GENUINELY A GOOD IDEA: Josh's M3 audit-log expansion. For "who
+changed which column of which row, when," ROW-GRAIN IS THE CORRECT GRAIN, and
+the hook is the right layer. Adding from/to would make that product materially
+better.
+
+  Two products, two grains:
+     "who touched what row, when"        -> Hank hooks. Broad, cheap, exists.
+     "what changed on this resource"     -> service-layer publish. Curated,
+                                            consumable by an external system.
+
+  The hook cannot be lifted from the first to the second without importing
+  domain knowledge it does not have.
+
+AND: if we do modify the hooks for M3, make them PUBLISH, not log better. The
+before/after capture is the same work either way, and publishing routes it to
+object_events with a cursor and an idempotency key instead of into a log index.
+
+================================================================================
+Q6. Why can the hook not produce the event at all? Show the trace.
+================================================================================
+Because one business action is 2+N row writes across two tables.
+
+  [VERIFIED] CreateDataConnectionV2 (forebitt/api/server/dataConnections_v2.go:309)
+    └─ db.InsertJobV2 (forebitt/db/job_v2.go:13)          <- ONE transaction
+         ├─ tx.Create(&job)                                -> 1 INSERT data_import_jobs
+         └─ SetOrganizationJobParametersInTransaction (job_parameters.go:109)
+              ├─ ClearOrganizationJobParameters   (:121)   -> 1 DELETE (matches
+              │                                               ZERO rows on a create)
+              └─ N x tx.Create(inParamObj)        (:154)   -> N INSERTs
+
+What the architects would actually receive for a 3-parameter connection:
+
+  1. { ObjectType:"DataImportJob",            ObjectID:"d56ada74-...",
+       ObjectName:"Adidas EMEA Customer File", Action:"CREATE" }
+  2. { ObjectType:"OrganizationJobParameter", ObjectID:"", ObjectName:"",
+       Action:"DELETE" }                                     <- phantom
+  3. { ObjectType:"OrganizationJobParameter", ObjectID:"<new uuid>",
+       ObjectName:"bucket",     Action:"CREATE" }
+  4. { ... ObjectName:"prefix",     Action:"CREATE" }
+  5. { ... ObjectName:"fileFormat", Action:"CREATE" }
+
+To rebuild one DATA_CONNECTION.CREATED event a consumer must independently know
+that DataImportJob IS a DataConnection (that mapping exists only in the proto
+layer — models.NewImportJobFromProtoV2), that parameters are part of that
+aggregate (no field in the record says so), and to discard record 2. Plus the
+values, which no record contains.
+
+Two more from the same trace:
+
+  - THE DELETE DOES NOT SAY WHICH OBJECT.
+    [VERIFIED] SoftDeleteJob (forebitt/db/job.go:185) passes an EMPTY struct with
+    the id in the WHERE clause (IDScope, scopes.go:16), so
+    getObjectDetails(scope.Value) finds ID = "". Deleting a data connection
+    emits: { ObjectType:"DataImportJob", ObjectID:"", Action:"DELETE" }.
+    "Someone deleted a data import job. We won't say which one."
+    This is a defect in the EXISTING audit log, independent of orinix — worth
+    raising on its own merits.
+
+  - ROW IDENTITY IS DESTROYED ON EVERY EDIT.
+    [VERIFIED] job_parameters.go:150 — inParamObj.ID = uuid.New().String() on
+    every save. So a parameter has a different primary key before and after an
+    edit. Any diff must use the stable business key
+    (ImportDataSourceParameterID, Name), never the row id.
+
+THE STEELMAN, PRE-EMPTED: AuditLog does carry RequestID, and all five records
+share one request id, so a consumer could group by it. Grouping is necessary and
+nowhere near sufficient: it gives the SET of rows touched, not WHAT CHANGED —
+every value is still absent, so {from,to} stays underivable. It also does not
+identify the aggregate root, and one request is not always one business event
+(CreateImportJobV2 does a create-or-update PLUS a parameter replacement under
+one request id).
+[UNVERIFIED] whether requestId is reliably populated on every path — the Datadog
+row we analysed on 2026-07-18 was checked for Method/OrgID/actor, not requestId.
+
+================================================================================
+Q7. You said "the cost is bounded" — what does that actually mean?
+================================================================================
+It means the two expensive things are already paid for at most of the sites we
+need to touch. Precisely, for DATA_CONNECTION:
+
+  SITE                                   BEFORE-STATE TODAY   PUBLISH TODAY   WORK
+  -------------------------------------- -------------------- --------------- ------------------
+  CreateDataConnectionV2                 n/a (it's a create)  NONE            add publish; final
+    dataConnections_v2.go:309                                                 state already built
+                                                                              at :372 for the response
+  UpdateDataConnectionV2                 YES - dbJob at :393  NONE            add publish; both
+    dataConnections_v2.go:383                                                 states in scope
+  UpdateImportJob                        YES - :1552          YES - :1602     widen existing payload
+    job_service.go:1538                  (already diffs :1583)
+  DeleteImportJob                        YES - :1858          YES - :1932     widen existing payload
+    job_service.go:1846
+
+So: two sites already publish, two already hold the before-state, and
+[VERIFIED] dataConnections_v2.go contains ZERO PublishEvent calls today — the V2
+data-connection paths emit nothing at all.
+
+Nobody has to add a new DB read where a before-state is needed, and nobody has
+to wire new infrastructure — s.Options.Events is already plumbed through the
+server (15+ existing call sites across forebitt). What remains is assembling a
+richer payload from variables already in scope. Contrast with the Hank route,
+where the change lands in a shared library consumed by every service on the
+platform.
+
+  (Correcting my own earlier shorthand: I had said "three of them already fetch
+   the before-state and already publish." Two publish; three hold the
+   before-state, one of which is a create and does not need one.)
+
+================================================================================
+Q8. Reliability — is the existing publish safe to copy?
+================================================================================
+NO, and this needs a decision.
+
+  [VERIFIED] every existing call site swallows the error, e.g.
+    job_service.go:1602-1605
+      eventErr := events.PublishEvent(ctx, *s.Options.Events, message)
+      if eventErr != nil {
+          hlog.LogEntryCtx(ctx).Errorln("Error while publishing event: ", eventErr)
+      }
+      // execution continues; the RPC returns success
+
+If SNS is unavailable the event is gone and the DB write stands. That is
+AT-MOST-ONCE on the producer side. Our contract with XMI is AT-LEAST-ONCE. The
+publish is also outside the DB transaction, so we additionally have the classic
+dual-write problem: commit succeeds, publish fails, and nothing ever reconciles.
+
+Options, cheapest first:
+  1. Accept it for M1. Document the gap explicitly, alert on publish failures.
+     Cheap, honest, and probably wrong for an audit-adjacent product.
+  2. Retry with backoff in-process. Narrows the window; does not close it
+     (process restart loses the message).
+  3. TRANSACTIONAL OUTBOX. Write the event row in the same transaction as the
+     mutation; a relay publishes and marks it sent. Closes the gap properly.
+     This is real M1 scope and should be estimated, not assumed away.
+
+Recommendation: option 3 if we want to make durability claims to XMI; option 1
+only if we state the limitation in the contract. Note orinix's own
+UNIQUE(idempotency_key) protects against DUPLICATES, not against LOSS — it
+solves the other half of the problem.
+
+Also minor: hevent.New(config) builds a fresh SNS client on every publish
+(service.go:10 -> hank/events/service.go:18). If we add publishes to hot paths,
+hold one client rather than copying that pattern.
+
+================================================================================
+Q9. Could we skip all of this and serve the read API from Loki or Datadog?
+================================================================================
+No. Summarised here; full argument in the 2026-07-27 companion doc.
+
+  - A TIMESTAMP IS NOT A SEQUENCE. Not unique (page boundaries skip or
+    re-deliver), not globally ordered across streams, and agents ship late after
+    node pressure — a cursor already past that timestamp never sees those events
+    and the consumer cannot detect the gap.
+  - org_id / cleanroom_id ARE NOT INDEXED. They live in the line, so every query
+    is a full scan of the window. Promoting them to Loki labels causes
+    stream-cardinality explosion and Grafana Cloud starts rejecting writes —
+    losing events at ingest to make reads fast.
+  - NO JOINS. Deriving {from,to} needs a self-join across time, and per Q6 there
+    is not even a stable key to join on.
+  - It is a vendor log index with plan-bound retention, which is the same
+    category we already rejected for the audit tier.
+
+Where Loki IS the right tool: offline, human-driven analysis. Two queries worth
+running before this meeting to close an open item —
+    {cluster="eks-admin-prod", namespace="unhygienix"} |= "Audit Log:"
+    sum(count_over_time({cluster="eks-admin-prod", namespace="unhygienix"} |= "Audit Log:" [24h]))
+These size the M3 expansion and settle whether the blank OrgID/actor fields seen
+on 2026-07-18 hold in production traffic or were a stage artifact.
+
+Also worth correcting a shared assumption: the in-cluster Loki in
+dyogram/charts/monitoring is enabled:false everywhere, so its 168h/512Gi values
+are dead config. Real collection is Grafana Alloy -> Grafana Cloud
+(habu.grafana.net), scoped by an explicit namespace allowlist
+(monitoring-k8s/prod-overrides.yaml:22) which does include unhygienix, forebitt
+and picanmix.
+
+================================================================================
+OPEN QUESTIONS I DO NOT HAVE AN ANSWER FOR
+================================================================================
+O1. CLEANROOM SCOPING. The approved envelope uses
+    "source":"urn:habu:cleanroom:<cleanroom-id>" and object_events is queried by
+    cleanroom_id — but DataImportJob has OrganizationID, not CleanroomID
+    (forebitt/models/data_import_job.go:20). A data connection is org-scoped and
+    may serve several cleanrooms. Is DATA_CONNECTION an org-scoped event, or do
+    we fan out one event per attached cleanroom? This determines the primary
+    query key and the v6 doc does not settle it. NEEDS A DECISION IN THIS MEETING.
+
+O2. WHEN IS "CREATED" TRUE? dataConnections_v2.go:364-371 can return an error
+    AFTER the rows are committed (the Snowflake setup block). Emit at :358 and
+    we may announce a connection the user was told failed to create. Emit at the
+    end and the event is late but always true. Recommend the latter.
+
+O3. TWO CREATE PATHS. CreateDataConnectionV2 vs CreateImportJobV2
+    (job_service.go:1293 — actually a create-or-update orchestrator, and on the
+    draft flow a user "create" arrives at the DB as an UPDATE). Are both live in
+    production? If so we must instrument both without double-emitting when one
+    calls the other.
+
+O4. THIN EVENT COEXISTENCE. Do the existing hevent publishes at
+    job_service.go:1602 and :1932 stay exactly as they are (pegleg/janus depend
+    on them), with the fat orinix event published alongside to the new topic?
+    Assumption: yes, both. Stating it so nobody expects a migration.
+
+O5. Does anything parse the "Audit Log:" stdout lines today (Datadog monitors,
+    dashboards, the "existing internal audit log" delivered to Pegleg)? This
+    bounds how freely the hook's output format can change for M3.

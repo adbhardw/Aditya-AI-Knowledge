@@ -1,0 +1,140 @@
+HOW authn-proxy VERIFIES A TOKEN LOCALLY (JWKS) + WHO ACTUALLY USES IT
++ CONFIRMS WHAT "NEXUS" IS
+Follow-up to 2026-07-21_sidecar_vs_centralized_moonraker_comparison.txt.
+Corrects one thing I said wrong last round.
+Date: 2026-07-22
+
+
+===========================================================
+Q1 CONFIRMED: for MCS, CAC really does do both authn AND authz
+===========================================================
+
+Yes — confirmed, plainly. MCS has no authn-proxy sidecar (see previous doc).
+It forwards the raw incoming token straight to CAC and trusts CAC's answer
+completely. So CAC, from MCS's point of view, is a single black box doing
+"is this token real" and "is this identity allowed" together, in one
+network call. That's accurate, not an oversimplification.
+
+
+===========================================================
+Q2: HOW DOES THE SIDECAR VERSION (authn-proxy) VERIFY A TOKEN "LOCALLY",
+    MECHANICALLY, WITHOUT CALLING A CENTRAL SERVICE EVERY REQUEST?
+===========================================================
+
+Found the actual architecture diagram: LiveRamp/nexus,
+apps/service-account/docs/plantuml/overview.plantuml — titled "V2 LiveRamp
+Service Accounts". This nails the mechanism exactly.
+
+The short version: standard public/private key signing (the same idea as
+JWT/JWKS, an industry-standard pattern, not a LiveRamp invention).
+
+  1. When a token is ISSUED (by the "Service Account Authenticator", a
+     component of Nexus — see Q3 below), it's cryptographically SIGNED with
+     a private key that only that central Authenticator holds. The private
+     key itself lives in Google Secret Manager and is never handed out to
+     anyone.
+  2. A separate "Signing Key Rotator" component rotates that signing key
+     every 24 hours (diagram: "note top of signingkeyrotate: (Every 24
+     hours)").
+  3. Any service that wants to VERIFY a token doesn't need the private key
+     at all — it only needs the matching PUBLIC key (verification keys can
+     safely be public; that's the whole point of asymmetric crypto: sign
+     with private, verify with public, and nobody can forge a signature
+     without the private key).
+  4. authn-proxy calls a "Get Verification Keys" endpoint (labeled `getjwks`
+     in the diagram — JWKS = JSON Web Key Set, the standard OAuth format for
+     publishing a rotating set of public verification keys) periodically,
+     caches the current public key(s) locally in memory.
+  5. From then on, verifying any given incoming token is pure LOCAL MATH —
+     take the token, take the cached public key, check the signature
+     matches — no network call needed per request. Only refreshing the
+     cached key set (roughly daily, matching the 24h rotation) needs a
+     network call, and that's a background operation completely decoupled
+     from the request path.
+
+This is why the sidecar pattern avoids a per-request network hop for
+verification specifically: signature verification is fundamentally a LOCAL,
+stateless operation once you have the right public key cached. It's the
+permission CHECK (does this identity hold this specific scope — a fact that
+can change any minute, administered by humans) that genuinely needs a live,
+canonical, centralized answer every time — which is exactly why CAC stays a
+network call even in the fully decentralized pattern, while verification
+doesn't have to be.
+
+Nice mental model: verifying a signature is like checking a passport's
+hologram against a known pattern — you don't need to call the passport
+office for that, you just need to already know what a real hologram looks
+like (the cached public key). But checking whether that specific passport
+holder is allowed into THIS specific building today needs a live lookup
+against a guest list that can change — that's the permission check.
+
+
+===========================================================
+Q3: CONFIRMED — "NEXUS" IS THE REPO/SYSTEM MAX MEANT
+===========================================================
+
+The diagram above lives in `LiveRamp/nexus` at
+`apps/service-account/docs/plantuml/overview.plantuml`. This directly
+confirms what was only an inference before: Nexus is (at least in part) the
+system that implements LiveRamp's V2 Serviceytem Account management —
+Create/Delete/Enable-Disable/List Account, all themselves gated by a CAC
+permission check — and the token issuance/verification backend
+("Service Account Authenticator", with the Obtain-Access-Token and
+Get-Verification-Keys use cases). This lines up exactly with Max's "roles I
+added in Nexus" comment.
+
+
+===========================================================
+Q4 CORRECTION: WHICH SERVICE ACTUALLY USES authn-proxy — retracting my
+"AI agent platform" claim
+===========================================================
+
+Last round I said the decentralized authn-proxy pattern "only earned its
+complexity for LiveRamp's AI agent platform." That's WRONG — found concrete
+counter-evidence and a much better explanation.
+
+Searching the org for `authnProxy` turns up MANY unrelated production
+services using it, not just AI agents:
+  activation-api, notification-api (LiveRamp/notification), data_stewardship
+  (privacy_api), identity-portrait-engine-backend, lr1billing (billing_hub),
+  lsh-collaboration (token-service), pair-backend, df-federated-sql,
+  harness-api, segment_delivery, segment-builder-backend, msb-api,
+  product-incubation-monorepo (byoa-front)
+
+It's defined once in a SHARED, general-purpose Helm chart —
+`LiveRamp/eng-helm-charts:helm-charts/generic-service/templates/deployment.yaml`
+(`{{- if .Values.kongSidecars.authnProxy.enabled }}`) — available as an
+opt-in toggle to ANY LiveRamp service using that standard chart. Not
+AI-specific at all.
+
+THE REAL DECIDING FACTOR, found in an internal tribal-knowledge doc
+(product-knowledge-graph, domains/msb/business/tribal_knowledge.md,
+section 5.4), comparing two services from the SAME team:
+
+  "msb-api Uses authn-proxy; msb-langgraph-server Does Not.
+   msb-api enables the authn-proxy Kong sidecar ... msb-langgraph-server
+   sets authnProxy.enabled: false — it is an internal-only service reached
+   via cluster-internal URL ... and is not externally reachable. Both
+   services enable accessTokenGetter for GCP SA token acquisition."
+
+So the real rule is NOT "fancy AI stuff gets the sidecar, plain backends
+don't" — msb-langgraph-server IS an AI (LangGraph) service and does NOT use
+it, for the opposite reason I guessed. The actual rule:
+
+  - Externally-reachable / public-entry-point services -> need authn-proxy,
+    because traffic hitting them hasn't been vetted by anything else yet.
+  - Internal-only services (reached exclusively via cluster-internal DNS,
+    only ever called by other already-trusted services inside the cluster)
+    -> commonly skip it, because whatever called them already went through
+    auth at the actual entry point, or the internal caller is itself a
+    trusted service identity.
+
+WHAT THIS MEANS FOR OUR CASE: the deciding question for whether
+orinix->XMI's callback path needs this pattern isn't "is this modern/AI
+infra" — it's "is XMI's callback endpoint reachable from outside LiveRamp's
+own trust boundary, or only ever called by other internal services like
+orinix." If it's the latter (which a clean-room-to-XMI internal callback
+almost certainly is), skipping the dedicated verify-sidecar and mirroring
+MCS's simpler "forward the token straight to CAC" pattern is not just
+acceptable — it's the same choice LiveRamp's own internal-only services make
+by default.

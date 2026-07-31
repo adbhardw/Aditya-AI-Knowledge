@@ -1,0 +1,1186 @@
+================================================================================
+DATA CONNECTION EVENTS FOR orinix — TWO WAYS TO DO IT
+Meeting notes for Anil and Josh
+================================================================================
+Aditya Bhardwaj — 29 July 2026
+
+WHAT WE NEED:
+When someone creates, updates or deletes a Data Connection, XMI needs to be told
+what happened and what changed. One message per action, saying "this field went
+from X to Y".
+
+TWO WAYS TO PRODUCE THAT MESSAGE:
+  Approach 1 — add a few lines in the function that handles the request.
+  Approach 2 — use the automatic hooks Hank already runs on every table write.
+
+Approach 2 sounds free because it is already running everywhere. This document
+shows what you actually get from it, with line numbers, so we can decide.
+
+--------------------------------------------------------------------------------
+THE SHORT VERSION
+--------------------------------------------------------------------------------
+Approach 1 gives us exactly 1 message per user action, always, with the old and
+new values in it.
+
+Approach 2 gives us 5 to 10 separate messages per user action, none of which
+contain any values, and we would have to stitch them back together afterwards.
+The number changes depending on which API the user came through, and we can
+never be sure we have received all of them.
+
+Recommendation: Approach 1.
+
+--------------------------------------------------------------------------------
+ONE THING THAT IS THE SAME IN BOTH APPROACHES
+--------------------------------------------------------------------------------
+Whichever way we produce the event, SOMETHING still has to receive it, store it,
+and hand it to XMI. That is either a new service (orinix) or an existing one
+(pegleg). This does not change based on which approach we pick.
+
+    producer  ->  SNS  ->  queue  ->  orinix  ->  object_events table
+                                          |
+                                          +--> pull API (GetCleanroomEvents)
+                                          +--> webhook to XMI
+                                          +--> GCP Pub/Sub to XMI
+
+So the decision in this document is only about WHAT GOES INTO the message. The
+receiving service, the storage table, and the delivery to XMI are needed either
+way. Nobody is proposing we skip that part.
+
+
+================================================================================
+SECTION 1 — WHAT ACTUALLY HAPPENS WHEN SOMEONE CREATES A DATA CONNECTION
+================================================================================
+This is the thing to understand first. Everything else follows from it.
+
+A Data Connection is stored in TWO tables:
+
+    data_import_jobs                 <- the connection itself (name, source, stage)
+    organization_job_parameters      <- its settings, one row per setting
+                                        (DataLocation, SampleFilePath,
+                                         FileFormat, FieldDelimiter, ...)
+
+So "create one data connection with 3 settings" is not one database write. It is
+five:
+
+    1 row  inserted into data_import_jobs
+    1 delete on organization_job_parameters   (clears old settings — on a brand
+                                               new connection this deletes nothing,
+                                               but the code runs it anyway)
+    3 rows inserted into organization_job_parameters
+
+Where this happens in the code:
+    forebitt/api/server/dataConnections_v2.go:356   calls db.InsertJobV2(...)
+    forebitt/db/job_v2.go:20                        inserts the job row
+    forebitt/db/job_v2.go:25                        calls the parameters function
+    forebitt/db/job_parameters.go:121               the delete
+    forebitt/db/job_parameters.go:154               the inserts, one per setting
+
+Hank runs its automatic hook after EVERY ONE of those writes. So one user click
+produces five hook firings.
+
+--------------------------------------------------------------------------------
+AND IT GETS WORSE — WE HAVE THREE DIFFERENT DOORS
+--------------------------------------------------------------------------------
+We do not have one "create data connection" API. We have three, all live:
+
+  DOOR A   POST /v2/organization/{orgId}/data-connection
+           -> CreateDataConnectionV2      dataConnections_v2.go:309
+
+  DOOR B   POST /forebitt/v1/organization/{orgId}/dataConnection
+           -> CreateDataConnection        job_service.go:1396
+
+  DOOR C   the import-job API
+           -> CreateImportJobV2           job_service.go:1293
+
+Door A writes the job once, then the settings once.  = 5 hook firings.
+
+Door B is different. Look at what it does:
+
+    job_service.go:1418    calls CreateImportJobV2 with IsDraft = true
+    job_service.go:1423    sets IsDraft = false
+    job_service.go:1425    calls CreateImportJobV2 AGAIN
+
+It creates the connection as a draft, then immediately saves it again as final.
+Each of those two passes writes the job AND rewrites all the settings. So:
+
+    pass 1:  1 job insert + 1 settings delete + 3 settings inserts   = 5
+    pass 2:  1 job update + 1 settings delete + 3 settings inserts   = 5
+                                                              total = 10
+
+**THIS IS THE POINT TO MAKE TO ANIL:**
+
+Same user, same button, same end result in the database. But Hank fires 5 hooks
+if they came through Door A and 10 if they came through Door B.
+
+With Approach 2, the number of messages XMI receives depends on which internal
+code path ran — not on what the user did. If someone later cleans up Door B so it
+stops saving twice, the message count silently changes and XMI's integration
+changes behaviour with it.
+
+With Approach 1, it is 1 message either way, because we write that line in the
+function that knows what the user asked for.
+
+Also worth saying plainly: in Door B the same 3 settings are created, deleted and
+created again. That is 6 "setting created" records for 3 settings, each with a
+different ID, because job_parameters.go:150 generates a brand new ID every time
+it saves. So the IDs in those records cannot be matched up to anything.
+
+
+================================================================================
+SECTION 2 — CREATE DATA CONNECTION
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1  APPROACH 1 — what we add, and exactly where
+--------------------------------------------------------------------------------
+File: forebitt/api/server/dataConnections_v2.go
+
+By the time we reach line 378, the function is holding everything we need. It
+already gathered all of this to build its own response:
+
+    line 313    authUser        who is doing this (name and email)
+    line 323    dataType        the dataset type
+    line 328    dataSource      the source (S3, Snowflake, ...)
+    line 333    jobModel        the connection itself; its ID is filled in at 356
+    line 343    dbParameters    all the settings
+    line 372    protoDataConnection   the finished object it is about to return
+
+So we add ONE block, between line 378 and line 379:
+
+        protoDataConnection.JobParameters = jobParameters            <- line 378, exists today
+
+    +   s.emitDataConnectionEvent(ctx, DataConnectionChange{
+    +       ChangeType:  "CREATED",
+    +       Actor:       authUser,
+    +       Before:      nil,              // nothing existed before
+    +       After:       &jobModel,
+    +       AfterParams: dbParameters,
+    +       DataSource:  dataSource,
+    +       DataType:    dataType,
+    +   })
+
+        return &dataconnections.CreateDataConnectionV2_Response{...} <- line 379, exists today
+
+NO NEW DATABASE QUERIES. Every value is already sitting in a variable.
+
+Why line 378 and not earlier: lines 362-371 do the Snowflake setup, and that can
+still fail and return an error. If we sent the message before that, we would tell
+XMI the connection was created while telling the user it failed. At line 378
+every failure path has already exited, so the message is always true.
+
+The same block goes in the other two doors:
+    job_service.go:1505     end of CreateDataConnection      (Door B)
+    job_service.go:1388     end of CreateImportJobV2         (Door C)
+
+To stop Door B sending two messages (because it calls Door C twice), the outer
+function marks the request so the inner one stays quiet. About ten lines of
+helper code, written once.
+
+WHAT XMI RECEIVES — one message:
+
+    {
+      "type": "data_connection.created",
+      "objectId": "d56ada74-...",
+      "objectName": "Adidas EMEA CRM Data",
+      "changeType": "CREATED",
+      "object": {
+        "name":        "Adidas EMEA CRM Data",
+        "status":      "ACTIVE",
+        "stage":       "MAPPING_REQUIRED",
+        "dataSource":  "Client AWS S3",
+        "datasetType": "CRM Data",
+        "parameters":  {
+          "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers/",
+          "SampleFilePath": "s3://adidas-emea-cleanroom/crm/schema/sample_2026_06.csv",
+          "FileFormat":     "CSV",
+          "FieldDelimiter": ",",
+          "FileHeader":     "true"
+        }
+      },
+      "previousValues": null,
+      "performedBy": "aditya.bhardwaj@liveramp.com"
+    }
+
+(The parameter names above are the real ones for a CLIENT_AWS connection —
+see forebitt/data/datasource_parameters.csv.)
+
+--------------------------------------------------------------------------------
+2.2  APPROACH 2 — what the hooks give us
+--------------------------------------------------------------------------------
+The hook lives in hank/db/audit.go. Here is the ENTIRE record it produces
+(hank/db/audit.go, the AuditLog struct):
+
+    ObjectID, ObjectName, ObjectType, Action
+    ActionByID, ActionByEmail, ActionAt
+    Method, OrgID, RequestID
+    ImpersonatedByID, ImpersonatedByEmail
+
+Notice what is NOT there: any field value. Not the new value, not the old value.
+The record says "somebody updated a row" and nothing about what changed in it.
+
+For our create with 3 settings, through Door A, we would receive these five:
+
+    1.  DataImportJob             id d56ada74-...   name "Adidas EMEA..."  CREATE
+    2.  OrganizationJobParameter  id ""             name ""                DELETE
+    3.  OrganizationJobParameter  id <new uuid>     name "DataLocation"    CREATE
+    4.  OrganizationJobParameter  id <new uuid>     name "SampleFilePath"  CREATE
+    5.  OrganizationJobParameter  id <new uuid>     name "FieldDelimiter"  CREATE
+
+Through Door B we would receive ten of them instead.
+
+Record 2 has an empty ID because of how the delete is written —
+job_parameters.go:81 passes an empty object and puts the ID in the query
+condition instead, so the hook has nothing to read.
+
+To turn those five records back into the one message above, orinix would have to:
+
+  a) Work out that they belong together. The only thing linking them is the
+     request ID. But one request is not always one action — Door B does two
+     creates under one request ID.
+
+  b) Work out that DataImportJob is the main thing and the parameters belong to
+     it. Nothing in the record says so. That knowledge only exists in forebitt's
+     code, so we would have to copy it into orinix and keep the two in sync.
+
+  c) KNOW WHEN ALL OF THEM HAVE ARRIVED. This is the one with no good answer.
+     There is no count and no "that's the last one" marker. orinix cannot tell
+     the difference between "3 settings, all arrived" and "5 settings, 2 still on
+     the way". The only thing we could build is a timer — wait a few seconds and
+     hope. Which means every message is delayed, and a slow one produces a WRONG
+     message rather than a late one.
+
+  d) Throw away record 2, which is a side effect of how the code saves settings
+     and means nothing to XMI.
+
+  e) Find the actual values somewhere. They are not in any of these records, so
+     this is impossible without changing Hank itself.
+
+--------------------------------------------------------------------------------
+2.3  "CAN WE JUST ADD THE VALUES TO THE HOOK?"
+--------------------------------------------------------------------------------
+Yes, we can add old and new values to Hank's record. It is a real change, and it
+would genuinely improve the audit log. But it does not solve our problem, because
+problems (a) through (d) above are still there. We would have five well-filled
+records and still no way to know they are one action or when they are all in.
+
+And the change is not small:
+  - Hank is shared by unhygienix, forebitt, primage, picanmix and pegleg. All of
+    them get the change the moment they pick up the new version.
+  - To know the OLD value, the hook has to read the row before every update. That
+    is one extra database query on every update across all of those services.
+  - Two of our writes (both deletes) do not even have a row ID to read — they
+    delete by condition. So the old value cannot be captured there at all.
+  - Some tables hold secrets. primage/models/models.go:219 is the Credential
+    table, it has a "Value" column, and it uses the same Hank audit. Printing
+    old and new values would write credentials into our logs. That alone needs a
+    per-field allow-list across roughly 91 tables before we could even try it.
+
+
+================================================================================
+SECTION 3 — UPDATE DATA CONNECTION
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1  APPROACH 1 — two small changes
+--------------------------------------------------------------------------------
+File: forebitt/api/server/dataConnections_v2.go, UpdateDataConnectionV2 (line 384)
+
+Good news first: the function ALREADY reads the connection before changing it.
+
+    line 393    dbJob, notFound := db.FetchJobByID(s.DB, in.DataConnection.ID)
+
+That is our "before" picture of the connection, and it stays untouched for the
+rest of the function. Free.
+
+CHANGE 1 — read the old settings. Add after line 405.
+The function never reads the existing settings; it only builds the new ones from
+the request (lines 420-431). And line 432 deletes the old ones. So if we want to
+say "DataLocation changed from A to B", we have to read them first:
+
+    +   beforeParams, _ := db.FetchOrganizationJobParameters(s.DB,
+    +       &db.OrganizationJobParameterKey{
+    +           OrganizationID:  in.DataConnection.OrganizationID,
+    +           DataImportJobID: in.DataConnection.ID,
+    +       })
+
+The function already exists at forebitt/db/job_parameters.go:20. We just call it.
+THIS IS THE ONLY NEW DATABASE QUERY IN THE WHOLE DESIGN.
+
+CHANGE 2 — send the message. Add between line 453 and line 454, same as create.
+
+ONE THING TO BE CAREFUL ABOUT (worth knowing, not worth explaining in the
+meeting): the variable jobModel at line 417 is NOT the finished connection. It
+only carries six fields — name, category, org, dataset type, data source,
+credential (see models/data_import_job.go:76-85). It does not carry status or
+stage. If we compared dbJob against jobModel directly we would wrongly report
+"status changed from ACTIVE to blank" on every single update. So we start from
+dbJob and copy over only the six fields that were actually sent. Six lines of
+code, and there is a unit test for it.
+
+WHAT XMI RECEIVES — someone repoints the connection at a new S3 location and
+switches the delimiter from comma to pipe:
+
+    {
+      "type": "data_connection.updated",
+      "objectId": "d56ada74-...",
+      "changeType": "UPDATED",
+      "previousValues": {
+        "parameters": {
+          "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers/",
+          "FieldDelimiter": ","
+        }
+      },
+      "performedBy": "aditya.bhardwaj@liveramp.com"
+    }
+
+Only what changed. FileFormat, SampleFilePath and FileHeader did not change, so
+they are not in previousValues. See Section 11.2 for the full message, which also
+carries the complete current state alongside this.
+
+Other doors, same block:
+    job_service.go:1698    end of UpdateDataConnection      (Door B)
+    job_service.go:1672    end of UpdateImportJobV2         (Door C)
+
+--------------------------------------------------------------------------------
+3.2  APPROACH 2 — the same problems, plus one more
+--------------------------------------------------------------------------------
+An update produces:
+
+    1  DataImportJob             UPDATE
+    1  OrganizationJobParameter  DELETE   (id empty, and it deletes ALL settings)
+    N  OrganizationJobParameter  CREATE   (all settings, with brand new IDs)
+
+The extra problem here is the settings. When you change ONE setting, the code
+deletes all of them and writes them all back with new IDs
+(job_parameters.go:81 and :150). So from the hook records it looks like every
+setting was replaced, every time. There is no way to tell from them which single
+setting the user actually edited.
+
+Approach 1 does not have this problem because we hold the old list and the new
+list in memory and compare them by setting NAME, which does not change.
+
+
+================================================================================
+SECTION 4 — DELETE DATA CONNECTION
+================================================================================
+
+--------------------------------------------------------------------------------
+4.1  APPROACH 1 — almost nothing to do
+--------------------------------------------------------------------------------
+File: forebitt/api/server/job_service.go, DeleteImportJob (line 1846)
+
+    line 1858    dbJob, notFound := db.FetchJobByID(s.DB, in.Id)
+                     <- the whole "before" picture, already read
+    line 1932    events.PublishEvent(...)
+                     <- we ALREADY send a small message here today
+
+So we add our fuller message right next to the existing one at line 1932. We keep
+the existing one as it is, because pegleg and janus depend on it.
+
+Optionally add the same settings read as in section 3, so the message can say
+what the connection was configured as before it was removed. Useful for "what did
+we just lose".
+
+One thing to tell XMI: this is a soft delete (forebitt/db/job.go:185). The row is
+marked deleted, not removed. So "DELETED" means "gone from the user's view", not
+"gone forever".
+
+--------------------------------------------------------------------------------
+4.2  APPROACH 2 — the delete record does not say what was deleted
+--------------------------------------------------------------------------------
+DO NOT LEAD WITH THIS ONE. It is easy to show, but it is also easy to fix, so it
+is a weak headline. Keep it as a side finding.
+
+    forebitt/db/job.go:185    tx.Scopes(IDScope(id)).Delete(&models.DataImportJob{})
+
+The ID is in the query condition. The object handed to Delete is empty. The Hank
+hook reads the ID off that object, finds nothing, and produces:
+
+    { ObjectType: "DataImportJob", ObjectID: "", Action: "DELETE",
+      ActionByEmail: "aditya@..." }
+
+"Somebody deleted a data connection. We are not saying which one."
+
+IF ANIL SAYS "SO PASS THE ID IN" — HE IS RIGHT, AND WE SHOULD SAY SO FIRST.
+It is a one-line change and it should be made regardless of what we decide here.
+Conceding it quickly is better than defending it, because it does not change the
+decision. What remains after that fix is still true:
+
+  - the count is still 5 (or 10 via Door B) per user action
+  - there is still no way to know when all of them have arrived
+  - there are still no field values in any of them
+  - nothing still says which of the rows is the data connection and which are its
+    settings
+
+Those four are structural. None of them is fixed by adding a field.
+
+Side note worth raising separately with Josh: this also means our EXISTING audit
+log cannot tell you which data connection was deleted. That is an audit problem on
+its own, nothing to do with orinix.
+
+
+================================================================================
+SECTION 5 — SIDE BY SIDE
+================================================================================
+
+                                  APPROACH 1              APPROACH 2
+                                  (emit from function)    (Hank hooks)
+  ------------------------------  ----------------------  ---------------------
+  Messages per user action        1                       5 (Door A)
+                                                          10 (Door B)
+  Does the count depend on        No                      Yes
+    which API was used?
+  Contains the old and new        Yes                     No — no values at all
+    values?
+  Can we tell which setting       Yes                     No
+    changed?
+  Does delete say which           Yes                     No — ID is empty
+    connection?
+  Do we know when we have         Yes — it is one         No — would need a
+    the full picture?             message                 timer and a guess
+  New database queries            1, on update only       1 per update, across
+                                                          all 5 services
+  Files we change                 forebitt only           hank (shared by 5
+                                                          services)
+  Security review needed          No — we choose the      Yes — credential
+                                  fields                  values would be logged
+  Work in orinix                  Read message, store it  Build and maintain the
+                                                          stitching logic
+
+
+================================================================================
+SECTION 6 — BEING FAIR ABOUT APPROACH 1'S COSTS
+================================================================================
+It is not free, and we should say so before Anil asks.
+
+  1. We touch 3 create paths, 3 update paths, and 1 delete path — 7 places, not
+     1. Because we have three doors into the same tables.
+        Create:  dataConnections_v2.go:378,  job_service.go:1505,  job_service.go:1388
+        Update:  dataConnections_v2.go:453,  job_service.go:1698,  job_service.go:1672
+        Delete:  job_service.go:1932
+
+  2. We need the small "don't send twice" mechanism, because Door B calls Door C
+     twice. Roughly ten lines, written once.
+
+  3. If someone adds a NEW way to change a data connection later and forgets to
+     add the line, that path produces no event. Approach 2 would have covered it
+     automatically. This is the one genuine advantage Approach 2 has, and it is
+     worth stating honestly. Mitigation: the three doors are all in two files,
+     and we add a test that fails if a handler writes without emitting.
+
+  4. Every new object type (Question, Flow, Export) needs its own block. Bounded
+     and repetitive, but real.
+
+
+================================================================================
+SECTION 7 — WHERE THE HANK HOOKS ARE THE RIGHT ANSWER
+================================================================================
+Not a throwaway line — this matters for Josh's audit log work.
+
+The hooks answer "who touched which row and when", across 91 tables, with no
+per-table work. That is exactly the right shape for a compliance audit trail, and
+it is what Josh's expansion needs. Adding old and new values to them would make
+that product genuinely better.
+
+They are the wrong shape for XMI's question, which is "what changed on this data
+connection". Different question, different answer. The two can go ahead
+independently.
+
+
+================================================================================
+SECTION 8 — WHAT IF WE DROP "FROM AND TO" ENTIRELY?
+================================================================================
+This is worth taking seriously. The idea: don't bother with old and new values.
+Just send "a data connection was created" or "a flow run changed", let XMI act on
+it, and keep it simple.
+
+--------------------------------------------------------------------------------
+8.1  FIRST, AN IMPORTANT CLARIFICATION
+--------------------------------------------------------------------------------
+"Just use Hank to emit a simple event" can mean two different things, and they
+are not the same at all:
+
+  (a) Hank's automatic HOOKS — the per-row thing in Sections 2, 3 and 4. This is
+      Approach 2, and the 5-vs-10 problem applies.
+
+  (b) Hank's EVENT PUBLISHER — hevent / events.PublishEvent. This is a normal
+      function we call by hand from our own code. It is already used in 15+
+      places in forebitt alone and in 10+ repos across the platform.
+
+If we mean (b) — and I think we do — then we are ALREADY DOING APPROACH 1. The
+publish call sits in the service function, written by hand, at a line we choose.
+
+So the question is not "hooks or service layer" any more. It is only:
+
+    HOW MUCH DO WE PUT IN THE MESSAGE?
+
+That is a much easier question, and a much safer one. Same code location, same
+mechanism, same 7 places. Just fewer fields.
+
+--------------------------------------------------------------------------------
+8.2  THERE ARE ACTUALLY THREE LEVELS, NOT TWO
+--------------------------------------------------------------------------------
+  LEVEL 0   "data connection X was updated"
+            Action only. No state, no values.
+
+  LEVEL 1   "data connection X is now at stage CONFIGURATION_COMPLETE"
+            Carries the CURRENT state. No history of what it was before.
+
+  LEVEL 2   "data connection X stage went from MAPPING_REQUIRED to
+             CONFIGURATION_COMPLETE"
+            The full before-and-after.
+
+Level 0 is not enough for XMI and we should not propose it. If all we say is
+"something changed", XMI has to call our API after every single message to find
+out what. That turns push back into polling, which is the exact problem
+DV-15621 says pub/sub is supposed to solve. It would also make XMI react to a
+name change the same way it reacts to a stage change, because they cannot tell
+the two apart.
+
+LEVEL 1 IS THE INTERESTING ONE. Here is the finding that matters:
+
+    All four of XMI's confirmed M1 use cases only need the NEW state.
+
+      1. Data connection stage change      -> needs the new stage.        Level 1 is enough.
+      2. Flow run state (STARTED /
+         COMPLETED / FAILED)               -> needs the new state.        Level 1 is enough.
+      3. Flow chaining: flow 1 completes
+         -> trigger flow 2                 -> needs "it completed".       Level 1 is enough.
+      4. Onboarding: all datasets assigned
+         -> trigger a run                  -> needs the new state.        Level 1 is enough.
+
+    None of them ask "what was it before?". They all act on where the object is
+    NOW. So Level 1 satisfies M1.
+
+This is a genuine argument for keeping it simple, and I would rather raise it
+myself than have Anil raise it.
+
+--------------------------------------------------------------------------------
+8.3  WHAT WE GAIN BY STOPPING AT LEVEL 1
+--------------------------------------------------------------------------------
+  1. Roughly a third of the code. No before-state read on update (the one new
+     query in Section 3 disappears), no comparison logic, no six-field overlay,
+     no matching settings by name.
+
+  2. THE SECURITY CONVERSATION GOES AWAY COMPLETELY. We are not sending any
+     field values, so there is no question about whether we might leak a
+     credential or a customer's S3 DataLocation. No field-by-field review needed.
+
+  3. Message size is tiny and fixed. No worrying about big payloads.
+
+  4. Lower risk. This is the pattern already running in production today; pegleg
+     and janus already consume messages shaped like this.
+
+  5. It ships sooner. If what XMI is actually blocked on is "tell me when the
+     run finished", Level 1 gets them that weeks earlier.
+
+  6. WE CAN ADD from/to LATER WITHOUT BREAKING ANYONE. Adding an optional
+     "changedFields" block to an existing message is safe — old consumers ignore
+     it. Going the other way (starting rich, then removing) is not safe. So
+     Level 1 first is a legitimate phase, not a dead end.
+
+--------------------------------------------------------------------------------
+8.4  WHAT WE LOSE
+--------------------------------------------------------------------------------
+  1. THE PRODUCT WE ARE PITCHING IS CALLED OBSERVABILITY. A history table full of
+     rows saying "updated, updated, updated" does not let a customer see what
+     happened to their data connection. If we ever want a screen showing "Aditya
+     changed the DataLocation on 12 June", Level 1 cannot produce it. This is the
+     strongest argument against, and it is about the product, not the code.
+
+  2. Josh's audit log work needs from/to regardless. So the work is not avoided,
+     only postponed. That is fine as phasing, but we should say it out loud
+     rather than let anyone think it disappears.
+
+  3. Consumers who care about ONE specific field still have to guess. Level 1
+     tells XMI the stage is now X, which handles their cases. But a future
+     consumer who only cares about renames would get woken up by everything.
+
+  4. A read-back race. If XMI sees "connection X updated" and calls our API to
+     find out more, the connection may have changed again by then. They see the
+     latest state and silently miss the middle one. Fine for "act on the current
+     state", broken for anyone who needs every step.
+
+--------------------------------------------------------------------------------
+8.5  THE PART OF THE IDEA I WOULD PUSH BACK ON
+--------------------------------------------------------------------------------
+The suggestion also included publishing straight to GCP Pub/Sub from each
+service, for XMI to consume directly. That is a much bigger change than making
+the payload thinner, and I would not do it:
+
+  1. EVERY PRODUCER SERVICE WOULD NEED GOOGLE CLOUD CREDENTIALS. Right now only
+     one service (orinix) needs them. If forebitt, unhygienix and picanmix all
+     publish to Pub/Sub directly, all of them need GCP access set up, rotated and
+     audited. That is 10+ repos instead of 1.
+
+  2. ADDING A SECOND CUSTOMER BECOMES A CODE CHANGE EVERYWHERE. Today, adding
+     Microsoft or SafeHaven as a consumer is a row in a config table inside
+     orinix. If producers publish direct, every producer has to learn about every
+     new destination. Fan-out belongs in one place.
+
+  3. NO REPLAY AND NO HISTORY. If XMI is down for a few hours, or wants to
+     re-process last week, there is nothing to re-read from. Our object_events
+     table is what makes replay possible.
+
+  4. NO PULL API. XMI has asked for push, but the cursor-based pull API is also
+     in M1 scope and other consumers will want it. That needs a stored table.
+
+So: THINNER MESSAGE — yes, defensible, let's discuss it. SKIPPING THE MIDDLE
+SERVICE — no, that costs us replay, history, the pull API, and GCP credentials in
+ten repos.
+
+--------------------------------------------------------------------------------
+8.6  MY RECOMMENDATION ON THIS
+--------------------------------------------------------------------------------
+Level 1 for the state-change events XMI is blocked on (flow run state, data
+connection stage) — because it genuinely satisfies their use cases and ships
+faster.
+
+Level 2 for create / update / delete of the objects themselves — because that is
+where "what changed" is the actual question, it is the same 7 code locations
+either way, and the extra cost is one database read on the update path.
+
+That is not a compromise for its own sake. It matches the level of detail to what
+each consumer actually does with it.
+
+
+================================================================================
+SECTION 9 — OTHER APPROACHES ANIL AND JOSH MAY RAISE
+================================================================================
+
+--------------------------------------------------------------------------------
+9.1  CHANGE DATA CAPTURE (reading the database's own change log)
+--------------------------------------------------------------------------------
+The idea: instead of any application code, read Postgres's write-ahead log with
+something like Debezium, and turn every row change into an event.
+
+BE CAREFUL HERE — THIS IS THE STRONGEST ALTERNATIVE, AND STRONGER THAN THE HANK
+HOOKS. It is worth understanding properly rather than dismissing.
+
+WHAT IT SOLVES THAT THE HOOKS DO NOT:
+
+  1. IT HAS THE OLD AND NEW VALUES FOR FREE. The database's change log physically
+     contains the row before and after. So the "no values at all" problem from
+     Section 2.2 simply does not exist. This is a real advantage.
+
+  2. IT KNOWS WHICH CHANGES WERE IN THE SAME TRANSACTION. The log has transaction
+     boundaries and can emit a marker saying "that transaction is finished, it
+     had 5 changes in it". So the "we can never tell when they have all arrived"
+     problem from Section 2.2(c) is also solved — for our V2 path, which does all
+     five writes in one transaction.
+
+  3. NOBODY CAN FORGET IT. Any new code path is captured automatically. This is
+     the coverage advantage from Section 6.3, but stronger.
+
+WHY I STILL WOULD NOT CHOOSE IT:
+
+  1. IT DOES NOT KNOW WHO DID IT. The database change log has no user, no email,
+     no request. It sees "row changed", not "Aditya changed it". Both our
+     observability product AND the audit log need to say who performed the
+     action. This is the single biggest problem and there is no clean fix — the
+     usual workaround is to write the user ID into a column on every table first,
+     which is application work we would then have to do everywhere anyway.
+
+  2. IT STILL CANNOT TELL WHICH ROW IS THE MAIN OBJECT. Grouping five rows
+     together does not tell you that the job is the data connection and the
+     parameters belong to it. That knowledge only exists in forebitt's code. We
+     would have to write it down again in the pipeline and keep the two in sync.
+
+  3. IT STILL BREAKS ON THE V1 DOUBLE-SAVE. Door B does two separate
+     transactions, so we get two transaction markers and still have to decide
+     they were one user action.
+
+  4. OUR TABLE AND COLUMN NAMES BECOME XMI'S CONTRACT. If we later rename a
+     column, we break an external partner's integration. Right now our database
+     shape is private. This is a permanent cost that grows over time.
+
+  5. REAL OPERATIONAL RISK ON A PRODUCTION DATABASE. This kind of pipeline holds
+     a replication slot open. If the consumer stalls or falls behind, the
+     database keeps every change log file until it catches up, and that can fill
+     the disk and take the database down. It is a well-known failure mode and it
+     needs monitoring we do not have today.
+
+  6. CAPTURING THE OLD VALUES MAKES THE DATABASE WRITE MORE. To get before-images
+     we have to turn on a setting that increases the volume of change-log data
+     Postgres produces on every write.
+
+  7. THE SECRETS PROBLEM IS WORSE, NOT BETTER. Credential values would flow into
+     the pipeline, and filtering out individual fields is harder at the
+     infrastructure level than in our own code.
+
+  8. IT SPANS SEVERAL DATABASES. The connection is in forebitt's database, the
+     credential in primage's, flows in unhygienix's. So it is one pipeline per
+     database, and anything that spans services cannot be assembled at all.
+
+  9. IT IS A LOT OF NEW INFRASTRUCTURE. Compared with 7 blocks of code in one
+     repo, this is a new pipeline, new monitoring, new failure modes, and a new
+     thing on the critical path of a production database.
+
+  HONEST SUMMARY FOR THE MEETING: change data capture fixes the MECHANICAL
+  problems (values, grouping) but not the MEANING problems (who did it, what
+  business object it is). And it buys those fixes with a permanent link between
+  our database shape and a partner's integration, plus real risk to a production
+  database.
+
+--------------------------------------------------------------------------------
+9.2  DATABASE TRIGGERS WRITING TO AN EVENTS TABLE
+--------------------------------------------------------------------------------
+A variant of the above. Put a trigger on each table; it writes an event row into
+an events table inside the same transaction.
+
+  Good: has old and new values, is atomic with the change so it can never be
+        lost, and the user ID can be passed in via a session setting.
+  Bad:  still one event per row, so the same combining problem. Logic lives in
+        SQL that nobody on the team maintains, is hard to test, and would need
+        writing per table across roughly 91 tables. Same secrets problem.
+
+  Not obviously better than doing it in Go, and much harder to test.
+
+--------------------------------------------------------------------------------
+9.3  TRANSACTIONAL OUTBOX  (this one is not a competitor — it is an upgrade)
+--------------------------------------------------------------------------------
+Worth mentioning so it is clear we have thought about reliability.
+
+Today the publish happens after the database commit, and if the publish fails the
+error is logged and ignored (see job_service.go:1602-1605). So a message can be
+lost. An outbox means: write the event into a table in the SAME transaction as
+the change, and a small worker sends it afterwards and marks it done. Then nothing
+can be lost.
+
+This sits on top of Approach 1, at the same lines. We have decided to stay with
+the simpler fire-and-forget for M1 and to state that limitation honestly to XMI.
+If we later need a guarantee, the outbox goes in exactly where the publish call
+is today.
+
+--------------------------------------------------------------------------------
+9.4  COLLECT EVENTS DURING THE REQUEST, SEND THEM ALL AT THE END
+--------------------------------------------------------------------------------
+A nicer version of Approach 1 that a good architect might suggest: instead of
+publishing inline, each handler adds its event to a list held for that request,
+and one shared piece of code sends everything when the request finishes
+successfully.
+
+  Good: only one place actually publishes, so double-sending becomes impossible
+        without the suppression trick from Section 6.2. Also naturally gives us
+        "only send if the request succeeded".
+  Bad:  more indirect, so harder to follow when debugging, and the shared code
+        has to be sure the database transaction actually committed.
+
+  Reasonable to adopt later. Not worth the extra machinery for 7 call sites.
+
+--------------------------------------------------------------------------------
+9.5  JUST LET XMI POLL OUR EXISTING API
+--------------------------------------------------------------------------------
+The status quo. Mentioned only because it is the baseline we are replacing:
+DV-15621 explicitly says rate limiting problems "should be helped by enabling
+pub/sub for status instead of polling". Polling is the problem, not the option.
+
+
+================================================================================
+SECTION 10 — WHAT WE EMIT TODAY, AND WHY IT DOES NOT COVER XMI
+================================================================================
+LEAD WITH THIS SECTION. It is a stronger opener than the delete example, because
+it is not a bug that can be patched with one line — it is a missing event.
+
+--------------------------------------------------------------------------------
+10.1  WE ALREADY PUBLISH FOR UPDATE AND DELETE. HERE IS EXACTLY WHAT.
+--------------------------------------------------------------------------------
+UPDATE — forebitt/api/server/job_service.go:1584-1606
+
+    if dbJob.Name != in.Job.Name || dbJob.ImportDataTypeID != in.Job.ImportDataType.Id {
+        message := hevent.EventStruct{
+            Service:  events.ForebittService,      // "forebitt"
+            Action:   events.UpdateAction,         // "update"
+            Object:   events.DataImportJob,        // "dataImportJob"
+            ObjectID: in.Job.Id,
+            Attributes: map[string]string{
+                events.AdditionalAction: events.UpdateCRQDataset,   // "updatecrqDataset"
+                events.OrganizationID:   in.Job.OrganizationId,
+                events.DataImportJobID:  in.Job.Id,
+                events.Timestamp:        fmt.Sprintf("%d", time.Now().UnixMilli()),
+            },
+        }
+        events.PublishEvent(ctx, *s.Options.Events, message)       // :1602
+    }
+
+DELETE — job_service.go:1913-1932, the same shape with
+Action = "delete" and AdditionalAction = "deleteCRQDataset".
+
+The actual JSON that goes on the wire today:
+
+    {
+      "service":  "forebitt",
+      "action":   "update",
+      "object":   "dataImportJob",
+      "objectId": "d56ada74-...",
+      "attributes": {
+        "additionalAction": "updatecrqDataset",
+        "organizationId":   "org-abc",
+        "dataImportJobId":  "d56ada74-...",
+        "timestamp":        "1753876262000"
+      }
+    }
+
+Plus four SNS message attributes used for routing: object, action, service, and
+requestId (added automatically at hank/aws/sns/service.go:40).
+
+--------------------------------------------------------------------------------
+10.2  THREE THINGS TO NOTICE, AND THE THIRD IS THE ARGUMENT
+--------------------------------------------------------------------------------
+1. NO ACTOR. There is no user, no email. Today's event cannot say who did it.
+
+2. NO VALUES AND NO NAME. It says "job d56ada74 was updated". Not what it is
+   called, not what changed, not what it is now.
+
+3. IT ONLY FIRES IF THE NAME OR THE DATASET TYPE CHANGED.
+   Look at line 1584 again:
+
+       if dbJob.Name != in.Job.Name || dbJob.ImportDataTypeID != in.Job.ImportDataType.Id {
+
+   So today:
+       user renames the connection            -> event published
+       user changes the dataset type          -> event published
+       THE STAGE CHANGES                      -> NOTHING PUBLISHED
+       a setting/parameter value changes      -> NOTHING PUBLISHED *
+       the connection is created (V2 route)   -> NOTHING PUBLISHED
+                                                 (dataConnections_v2.go has zero
+                                                  PublishEvent calls)
+
+   * one narrow exception at job_parameters.go:232, which fires only when
+     materialization parameters are added, materialization was not already
+     enabled, and a feature flag is on.
+
+   XMI's number one request is DATA CONNECTION STAGE CHANGES. That is exactly the
+   case that emits nothing today.
+
+WHY THIS IS THE RIGHT THING TO OPEN WITH: it is not a defect to patch. The
+condition at line 1584 is doing its job correctly — it exists to tell pegleg to
+refresh a cleanroom question's dataset when the name or type changes. It was never
+meant to be a general change feed. So we are not fixing a bug, we are adding a
+capability that does not exist yet, and that is a much easier thing to get
+approved than "your existing thing is broken".
+
+--------------------------------------------------------------------------------
+10.3  THE ONE-LINE VERSION
+--------------------------------------------------------------------------------
+    We already publish an event when a data connection is renamed. We publish
+    nothing when its stage changes, and the stage is the only thing XMI has asked
+    for. Whatever else we decide today, that gap has to be closed in the service
+    function, because that is the only place that knows the stage changed.
+
+
+================================================================================
+SECTION 11 — WHAT DO WE SEND, AND WHAT DO WE STORE?
+================================================================================
+Two separate questions that get mixed up:
+
+    11.1 - 11.3   what goes in the MESSAGE we send
+    11.4 - 11.6   what goes in the object_events TABLE
+
+--------------------------------------------------------------------------------
+11.1  CREATE — full state, and nothing on the "from" side
+--------------------------------------------------------------------------------
+Nothing existed before, so every field's "from" is empty. That is not a gap, it is
+what "created" means.
+
+    {
+      "id":         "9f3c1e0a-...",              <- our idempotency key
+      "type":       "data_connection.created",
+      "objectId":   "d56ada74-...",
+      "objectName": "Adidas EMEA CRM Data",
+      "changeType": "CREATED",
+      "object": {
+        "name":        "Adidas EMEA CRM Data",
+        "category":    "CLEANROOM",
+        "status":      "ACTIVE",
+        "stage":       "MAPPING_REQUIRED",
+        "dataSource":  "Client AWS S3",          <- datasources.csv DisplayName
+        "datasetType": "CRM Data",               <- datatypes.csv DisplayName
+        "parameters": {
+          "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers/",
+          "SampleFilePath": "s3://adidas-emea-cleanroom/crm/schema/sample_2026_06.csv",
+          "FileFormat":     "CSV",
+          "FieldDelimiter": ",",
+          "FileHeader":     "true",
+          "QuoteCharacter": "\"",
+          "JobFrequency":   "DAILY"
+        }
+      },
+      "previousValues": null,
+      "performedBy": "aditya.bhardwaj@liveramp.com",
+      "eventTime":   "2026-07-30T09:31:07Z"
+    }
+
+THESE ARE THE REAL PARAMETER NAMES. A CLIENT_AWS ("Client AWS S3") connection
+declares exactly these, per forebitt/data/datasource_parameters.csv:
+
+    DataLocation, SampleFilePath, FileFormat, FieldDelimiter, FileHeader,
+    QuoteCharacter, JobFrequency, IdentifierType, RefreshType, GPGEncryption,
+    ModelType, MappingField, UsesPartitions, MATERIALIZATION_ENABLED,
+    MATERIALIZATION_TTL
+
+Worth knowing which is which when talking to Anil:
+    DataLocation    = where the data actually is (the S3 path)
+    SampleFilePath  = the schema reference file we read the column layout from
+    FieldDelimiter  = comma, semicolon, pipe or tab (forebitt/data/fielddelimiters.csv)
+
+Note "object" is NOT jobModel marshalled directly. It is an explicit, hand-written
+list of fields. See 11.6 for why that matters.
+
+--------------------------------------------------------------------------------
+11.2  UPDATE — the question Anil will actually ask
+--------------------------------------------------------------------------------
+"Do you send the whole thing, or only the difference?"
+
+RECOMMENDATION: BOTH. The full current state, plus the OLD values of only the
+fields that changed. This is the shape Stripe uses for its own webhooks
+(`data.object` plus `data.previous_attributes`), and it is the right answer here
+for a specific reason given below.
+
+Worked example — the user repoints the connection at a new S3 location and
+switches the field delimiter from comma to pipe. Nothing else is touched.
+
+    {
+      "id":         "1a77bd52-...",
+      "type":       "data_connection.updated",
+      "objectId":   "d56ada74-...",
+      "objectName": "Adidas EMEA CRM Data",
+      "changeType": "UPDATED",
+
+      "object": {                                  <- FULL current state
+        "name":        "Adidas EMEA CRM Data",
+        "category":    "CLEANROOM",
+        "status":      "ACTIVE",
+        "stage":       "CONFIGURATION_COMPLETE",
+        "dataSource":  "Client AWS S3",
+        "datasetType": "CRM Data",
+        "parameters": {
+          "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers_v2/",   <- new
+          "SampleFilePath": "s3://adidas-emea-cleanroom/crm/schema/sample_2026_06.csv",
+          "FileFormat":     "CSV",
+          "FieldDelimiter": "|",                                              <- new
+          "FileHeader":     "true",
+          "QuoteCharacter": "\"",
+          "JobFrequency":   "DAILY"
+        }
+      },
+
+      "previousValues": {                          <- ONLY what changed, old value
+        "parameters": {
+          "DataLocation":   "s3://adidas-emea-cleanroom/crm/customers/",
+          "FieldDelimiter": ","
+        }
+      },
+
+      "performedBy": "aditya.bhardwaj@liveramp.com",
+      "eventTime":   "2026-07-30T11:02:44Z"
+    }
+
+Read it as: "here is the connection as it is now; the only things that are
+different are that the data used to live at .../crm/customers/ and the delimiter
+used to be a comma."
+
+Note what is NOT in previousValues: SampleFilePath, FileFormat, FileHeader,
+QuoteCharacter, JobFrequency, name, stage, status. They did not change, so they
+are absent. That keeps the difference small even though the snapshot is complete.
+
+TWO MORE EXAMPLES WORTH HAVING READY:
+
+  The stage change — the one XMI actually asked for:
+
+      "object":         { ..., "stage": "CONFIGURATION_COMPLETE", ... }
+      "previousValues": { "stage": "MAPPING_REQUIRED" }
+
+  Only the schema reference file was repointed, everything else identical:
+
+      "object":         { ..., "parameters": { "SampleFilePath":
+                                 "s3://adidas-emea-cleanroom/crm/schema/sample_2026_07.csv", ... } }
+      "previousValues": { "parameters": { "SampleFilePath":
+                                 "s3://adidas-emea-cleanroom/crm/schema/sample_2026_06.csv" } }
+
+  This second one is a good one to show Anil, because it is the case Hank's hooks
+  handle worst: nothing on the data_import_jobs row changed at all. The entire
+  change is in the child table. So the hook records would be one DELETE with an
+  empty ID and seven CREATEs with brand new UUIDs, and nothing anywhere would say
+  that only SampleFilePath moved.
+
+--------------------------------------------------------------------------------
+11.3  WHY BOTH, AND NOT JUST THE DIFFERENCE
+--------------------------------------------------------------------------------
+This is the part worth saying out loud, because it links two decisions that look
+unrelated.
+
+WE HAVE DECIDED THAT PUBLISHING IS BEST-EFFORT — if SNS is unavailable the event
+is lost and we carry on (job_service.go:1602-1605 logs and swallows the error).
+
+Now consider a consumer keeping its own copy of the connection:
+
+    IF WE SEND ONLY DIFFERENCES:
+      event 1  DataLocation  .../crm/customers/ -> .../crm/customers_v2/   applied
+      event 2  FieldDelimiter          "," -> "|"                          LOST
+      event 3  name change                                                 applied
+      XMI's copy still says FieldDelimiter = ",", forever. One lost message has
+      permanently corrupted their view, and neither side can tell. Worse, that is
+      a field they would parse files with.
+
+    IF WE SEND THE FULL STATE:
+      event 2 lost, but event 3 carries the complete current object, so XMI's copy
+      is CORRECT AGAIN as soon as anything else changes. The stream is
+      self-healing.
+
+So: because we chose the cheaper delivery guarantee, we should send the fuller
+message. Those two decisions pull in opposite directions and that is fine — but we
+should not choose the cheap option on BOTH, because diff-only plus best-effort is
+the one combination that silently corrupts a consumer.
+
+Two more reasons:
+  - XMI's use cases are all "act on the current state" (trigger flow 2 when flow 1
+    is complete). A full state object is directly usable; a diff has to be applied
+    to something first.
+  - A NEW consumer, or a replay from the beginning, gets usable state immediately
+    rather than having to rebuild it from every diff since the start of time.
+
+COST: bigger rows. A connection with ~10 settings is roughly 1-3 KB of JSON. We
+should put a real number on this before committing (see the open items) but it is
+not the kind of number that changes the design.
+
+--------------------------------------------------------------------------------
+11.4  WHAT THE object_events TABLE HOLDS
+--------------------------------------------------------------------------------
+The table stores what we sent, so that replay sends exactly the same thing again.
+
+    object_events
+      id                 bigserial     primary key
+      cursor_position    bigint        from a sequence - what "since_cursor" pages on
+      idempotency_key    uuid  UNIQUE  the CloudEvents id - makes retries harmless
+      event_time         timestamptz   stamped by the producer, not by us
+      received_at        timestamptz   when orinix wrote the row
+      org_id             varchar(40)
+      cleanroom_id       varchar(40)   nullable - see the open question
+      object_type        varchar(40)   "DATA_CONNECTION"
+      object_id          varchar(40)
+      object_name        varchar(255)  the name at the time of the event
+      change_type        varchar(20)   CREATED | UPDATED | DELETED
+      performed_by       varchar(255)
+      schema_version     int
+      object_snapshot    jsonb         the full "object" block from 11.2
+      previous_values    jsonb         the "previousValues" block from 11.2
+      context_fields     jsonb         requestId, method, dataSourceName, and
+                                       anything we add later without a migration
+
+    append-only - no updates, no deletes (other than the retention job)
+    indexes: (cleanroom_id, cursor_position), (org_id, cursor_position),
+             (object_type, object_id, cursor_position), unique(idempotency_key)
+
+WHY THIS SHAPE:
+  - cursor_position gives XMI a bookmark they can resume from a week later. A
+    timestamp cannot do this, because timestamps are not unique.
+  - idempotency_key + ON CONFLICT DO NOTHING means a redelivered message is a
+    no-op. This is what makes at-least-once delivery safe.
+  - object_snapshot and previous_values as JSONB means a new field on a data
+    connection needs NO MIGRATION.
+  - context_fields is the escape hatch. Josh's audit work wants the gRPC method
+    name on the record; that goes here, not in a new column.
+  - Append-only means replay is just "select where cursor_position > X" - the
+    exact same query the pull API already uses.
+
+REPLAY, CONCRETELY: XMI says "resend everything for cleanroom C since cursor
+918400". orinix runs
+
+    SELECT * FROM object_events
+     WHERE cleanroom_id = ? AND cursor_position > ?
+     ORDER BY cursor_position LIMIT ?
+
+and re-delivers each row, rebuilding the identical message from object_snapshot +
+previous_values. Nothing is recomputed and nothing is guessed, because we stored
+what we sent.
+
+--------------------------------------------------------------------------------
+11.5  HOW MUCH DO WE EXPOSE?
+--------------------------------------------------------------------------------
+Three tiers. We control this completely, which is one of the quiet advantages of
+producing the event ourselves.
+
+  SEND — business fields the customer already sees in our own UI:
+      name, category, status, stage, dataSource name, datasetType name,
+      parameter names and values, who did it, when
+
+  KEEP INTERNAL — store in the table for our own debugging, do not put in the
+  delivered payload:
+      internal row IDs of child records, requestId, gRPC method name, retry counts
+
+  NEVER CAPTURE AT ALL — not in the table, not in the message:
+      anything from primage's Credential table. primage/models/models.go:219-226
+      has a "Value" column holding the secret. Nothing in this pipeline should be
+      able to reach it.
+
+--------------------------------------------------------------------------------
+11.6  ONE RULE THAT MATTERS MORE THAN IT LOOKS
+--------------------------------------------------------------------------------
+BUILD THE PAYLOAD FROM AN EXPLICIT FIELD LIST. DO NOT MARSHAL THE MODEL.
+
+    // NO
+    snapshot, _ := json.Marshal(jobModel)
+
+    // YES
+    snapshot := DataConnectionSnapshot{
+        Name:        job.Name,
+        Category:    job.Category,
+        Status:      job.Status,
+        Stage:       job.Stage,
+        DataSource:  dataSource.DisplayName,   // "Client AWS S3"
+        DatasetType: dataType.DisplayName,     // "CRM Data"
+        Parameters:  exportableParams(params), // allow-list, see below
+    }
+
+and the parameter allow-list is equally explicit, so a new parameter added to a
+data source in datasource_parameters.csv is NOT automatically published:
+
+    var exportableParameters = map[string]bool{
+        "DataLocation": true, "SampleFilePath": true, "FileFormat": true,
+        "FieldDelimiter": true, "FileHeader": true, "QuoteCharacter": true,
+        "JobFrequency": true, "RefreshType": true, "IdentifierType": true,
+        // GPGEncryption deliberately excluded - decide before adding
+    }
+
+Why: DataImportJob has around thirty columns today and will have more next year.
+If we marshal the model, then the day somebody adds a column to that table, its
+contents are automatically published to an external partner, with no review and no
+one noticing. An explicit struct means adding a column to the database changes
+nothing until we choose to expose it.
+
+This is also our answer if we are asked "how do you know you are not leaking
+anything?" - because the answer is a list somebody can read, in one file.
+
+
+================================================================================
+SECTION 12 — WHAT WE NEED FROM YOU
+================================================================================
+  1. Approve Approach 1 for the data connection events.
+
+  2. Decide the scope of an event. A Data Connection belongs to an ORGANISATION
+     and has no cleanroom ID on it at all (forebitt/models/data_import_job.go:20).
+     But our event format currently says events are keyed by cleanroom. Do we:
+        (a) send it as an organisation event, or
+        (b) send one copy per cleanroom that uses the connection?
+     This decides how XMI looks the events up, so it is worth 5 minutes now.
+
+  3. Confirm all three doors are still in use. If the V1 ones are dead we
+     instrument 3 places instead of 7. If they are alive we do all 7.
+
+  4. Josh — separate from orinix: are you happy for us to raise the empty-ID
+     delete record (section 4.2) as an audit log bug on its own?
+
+  5. Agree the message and table shape (Section 11). My proposal: full current
+     state PLUS the old values of only the changed fields, stored as two JSONB
+     columns. The reason is in 11.3 — diff-only combined with best-effort delivery
+     is the one combination where a single lost message permanently corrupts a
+     consumer's view, and neither side can tell.
+
+  6. Agree how much detail goes in the message (Section 8). My proposal: current
+     state only for the flow-run and stage events XMI is blocked on, full
+     before-and-after for create / update / delete of the objects themselves.
+     If you would rather we start with current-state-only everywhere and add the
+     detail in a second phase, that is a safe change to make later and I am happy
+     to take it — but Josh's audit log work will need the full detail eventually,
+     so it is a postponement rather than a saving.

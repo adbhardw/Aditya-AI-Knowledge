@@ -1,0 +1,140 @@
+Q7 — Cursor scope, idempotency key generation, HMAC symmetry, DLQ practice, WIF vs static SA key
+Date: 2026-07-07
+Status: mostly answered directly; WIF vs static-key is a genuine open call, not yet decided
+
+------------------------------------------------------------------------
+
+CONFIRMED — a customer can register both WEBHOOK and PUBSUB at once
+
+No uniqueness constraint on (cleanroom_id, object_type) in
+callback_registrations — only a lookup index. DeliveryDispatcher.dispatch()
+already fans out to every ACTIVE matching registration regardless of
+delivery_type, so two rows (one WEBHOOK, one PUBSUB) for the same
+cleanroom+object_type both fire independently for the same event. Already
+correct in the scaffold, no change needed.
+
+------------------------------------------------------------------------
+
+CURSOR SCOPE — global value, cleanroom-scoped query
+
+cursor_position is one shared Postgres BIGSERIAL across the whole table,
+not a per-cleanroom counter. A given cleanroom's cursor values have gaps
+(other cleanrooms' rows consume values in between) — that's fine, a cursor
+only needs to be monotonically increasing, not dense or gapless per
+cleanroom. GetCleanroomEvents always filters WHERE cleanroom_id = X AND
+cursor_position > since_cursor, so the RETURNED rows are cleanroom-scoped
+even though the raw numbers are global. Matches the approved design doc's
+own "Cursor: PostgreSQL Sequence" specification — one sequence, no
+per-cleanroom coordination needed, which matters at hundreds-of-cleanrooms
+scale.
+
+------------------------------------------------------------------------
+
+IDEMPOTENCY KEY — generated once by the PRODUCER, not derived from columns
+
+The key is the CloudEvents envelope's own `id` (a UUID), minted by
+unhygienix/forebitt/picanmix at the moment of the real mutation, BEFORE
+publishing to SNS. Not computed from any columns — the discipline is reuse
+across retries, not generation:
+  - Minted once, held across any publish-retry loop (if a producer retries
+    a failed SNS publish of the SAME event, it must reuse the same id, not
+    mint a new one — this is the one place idempotency silently breaks if
+    done wrong)
+  - Flows UNCHANGED through every hop: SNS -> SQS -> object_events.
+    idempotency_key (orinix's own dedup) -> X-Habu-Event-Id header on
+    webhook delivery (XMI's dedup, per their explicit feedback that this
+    must be sent) -> should also be attached as a Pub/Sub message attribute
+    for PUBSUB consumers to dedupe the same way (not yet in the scaffold —
+    worth adding to PubSubDeliveryChannel)
+
+Defense-in-depth option, not a replacement: a secondary deterministic hash
+(SHA-256 of cleanroom_id + object_id + change_type + changed_fields) as a
+second uniqueness check at ingest, in case a producer fails to preserve the
+id across its own retries. Not needed for M1 unless this failure mode is
+actually observed — a mitigation for a problem we haven't seen, not a known gap.
+
+ACTION ITEM surfaced here: PubSubDeliveryChannel doesn't currently attach
+the event id as a Pub/Sub message attribute — should be added so PUBSUB
+consumers can dedupe the same way WEBHOOK consumers do via X-Habu-Event-Id.
+
+------------------------------------------------------------------------
+
+HMAC IS SYMMETRIC, NOT PUBLIC/PRIVATE KEY
+
+One shared secret (signing_secret), identical on both sides. Habu computes
+the HMAC-SHA256, XMI recomputes with the same secret and compares — the
+payload itself is plain JSON, never encrypted; HMAC proves authenticity/
+integrity only. This is NOT asymmetric (no private-key-signs/public-key-
+verifies split) — that would be heavier (key pair generation, public key
+distribution/rotation) and isn't what's scoped. Matches Stripe's
+Stripe-Signature and GitHub's X-Hub-Signature-256 exactly — this is the
+actual industry standard for webhooks, not a shortcut.
+
+Consequence worth documenting: because it's symmetric, the secret is
+exactly as sensitive on XMI's side as ours — a leak on either end lets an
+attacker forge signed payloads. Worth telling XMI explicitly to store it
+like a credential.
+
+------------------------------------------------------------------------
+
+DLQ — industry practice, confirmed Habu-owned not customer-facing
+
+  - Retry: SQS maxReceiveCount (5, matches approved doc) + redrive policy
+    to a linked DLQ, increasing visibility timeout between attempts as
+    backoff.
+  - Post-DLQ: CloudWatch alarm on DLQ depth > 0 pages Habu's on-call, NOT
+    XMI. XMI gets no failure signal in M1 (this was an open LIDAC
+    question — defaulting to Habu-owned/alerted as the standard first cut).
+  - Replay: manual runbook step for M1 — on-call inspects the DLQ message,
+    confirms root cause resolved, redrives via AWS's native console/CLI
+    action. No custom tooling needed yet.
+  - Reframing the earlier "SQS-native vs Postgres-tracked" open question:
+    not actually either/or — SQS owns retry MECHANICS, a lightweight status
+    marker (not a full attempts-counter) is still useful for support/on-call
+    visibility ("did XMI get event X?") without inspecting raw SQS
+    internals. Worth deciding explicitly rather than defaulting silently.
+
+------------------------------------------------------------------------
+
+GCP STATIC SA KEY vs WORKLOAD IDENTITY FEDERATION — genuine open call,
+not settled
+
+Static key (billing's proven path):
+  + Already working code to copy (BillingMessagePublisherHelper)
+  + One afternoon of setup
+  - Long-lived credential in Primage; leak = valid until manually revoked
+  - Rotation is manual/coordinated: LiveRamp rotates -> Habu updates
+    Primage -> Habu redeploys (known, bounded pain, already documented as
+    fragile, but bounded)
+
+WIF — real cost, not previously weighted honestly enough:
+  1. XMI must configure a GCP Workload Identity Pool + Provider trusting
+     AWS STS, naming Habu's specific AWS account + role ARN — real work on
+     their side too, not free
+  2. Habu needs an AWS IAM role scoped to sts:GetCallerIdentity, ARN must
+     exactly match what XMI configured
+  3. Token exchange itself (GoogleIdentityFederationAwsToken) has several
+     hops: assume AWS role -> SigV4-sign a GetCallerIdentity request
+     (never sent) -> URL-encode as subject token -> exchange with Google
+     STS for a short-lived token, scoped to an audience string that must
+     match XMI's config exactly. Getting pool/provider/role/audience
+     aligned across two clouds takes real back-and-forth.
+  4. Per-consumer cost multiplies — every future Pub/Sub consumer repeats
+     step 1 on their own project. Pays off once there are SEVERAL
+     consumers, not obviously for exactly one.
+  5. Bigger debugging surface — a WIF failure could be at any of several
+     hops (assume-role, SigV4 mismatch, audience mismatch, pool/provider
+     config, clock skew) vs static key's simple "401, invalid key." Less
+     institutional familiarity too (only tragicomix/Java and unhygienix/Go
+     have ever used it; static key is billing's proven, well-understood path).
+
+RECOMMENDATION FRAMING (not yet decided): for M1 with exactly one known
+Pub/Sub consumer, static SA key matching billing's proven path is
+defensible, not a step backward — GENERAL-PURPOSE MODULES (ch. 5) cuts
+here: WIF's main benefit (avoiding per-consumer key proliferation) isn't a
+real problem yet with one consumer. The case for WIF strengthens
+specifically once there's more than one external Pub/Sub consumer — a
+plausible M2 argument, not necessarily an M1 one. Aditya to decide whether
+to switch PubSubDeliveryChannel/OrinixPubSubCredentialsProvider to the
+static-key pattern (mirroring BillingMessagePublisherHelper) or keep WIF as
+scaffolded.

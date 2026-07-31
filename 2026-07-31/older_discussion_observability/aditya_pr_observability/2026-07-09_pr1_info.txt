@@ -1,0 +1,20 @@
+orinix — PR #1 reference
+Date: 2026-07-09
+
+PR:      https://github.com/LiveRamp/orinix/pull/1
+Title:   Add orinix M1 scaffold
+Branch:  add-orinix-scaffold -> main
+Repo:    LiveRamp/orinix (private) — migrated here from the earlier
+         deklareddotcom/github-iac attempt, which stalled on a broken
+         service-account token (see orinix-why-and-how for that history)
+
+What shipped: full M1 scaffold — orinix-proto (gRPC contract),
+orinix-backend (ingestion, delivery, registration, replay),
+orinix-server (Spring Boot app). 30+ files, two local commits squashed
+into one PR commit. Platform-managed files (catalog-info.yaml,
+.snyk.d/import.yaml) untouched.
+
+Design doc: https://liveramp.atlassian.net/wiki/spaces/~7120200751337419d4448994eb0175e31894fe/pages/5602181406/Observability+Cleanroom+Pub+Sub+Design
+
+Full file-by-file, why-designed-this-way, Spring Boot + Ousterhout
+walkthrough: see 2026-07-09_pr1_full_walkthrough.txt in this same folder.

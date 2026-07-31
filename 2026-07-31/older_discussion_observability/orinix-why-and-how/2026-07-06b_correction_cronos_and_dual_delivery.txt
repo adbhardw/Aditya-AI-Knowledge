@@ -1,0 +1,86 @@
+Correction — cronos publisher claim was wrong, and M1 delivery is BOTH webhook and Pub/Sub
+Date: 2026-07-06
+Status: two corrections to the record, folding into the M1 scope doc
+
+------------------------------------------------------------------------
+
+CORRECTION 1 — cronos is not a FLOW_RUN publisher. It's a scheduler.
+
+You're right to push back on this. I re-checked instead of re-asserting:
+
+  cronos/README.md line 1: "Habu Scheduler Service"
+  cronos DB setup uses Quartz tables (data/db/quartz_2.3.2.sql)
+  cronos/src/main/java/com/habu/cronos has NO file matching *Flow* or *Run*
+    anywhere in its source tree.
+
+cronos is a cron trigger — it fires scheduled jobs, it does not own or store
+Flow/FlowRun state. So it was never going to be the thing that publishes
+"FLOW_RUN completed."
+
+Where the FLOW_RUN state actually lives, checked directly:
+
+  unhygienix (Go) owns the whole Flow/FlowRun domain:
+    proto/flows.proto, models/flows.go, db/flows.go, db/flow_provisioning.go,
+    api/server/flows_access.go, api/server/flows_branch.go, etc.
+  unhygienix already has hank in go.mod (the SNS publish library).
+
+So the real publisher for FLOW_RUN completed is unhygienix, not cronos —
+and unhygienix already has the publish library available, same as it does
+for QUESTION events. The design doc's original line "forebitt/cronos → FLOW
++ FLOW_RUN events" was the thing I should have checked against the actual
+code before repeating it as a blocker. I didn't, and called out a
+non-existent gap as a result. Striking the cronos dependency from the
+working-principle doc — there was nothing there to block on.
+
+(Separately verified: an earlier research doc — 2026-06-29_billing_approach_
+event_publish.txt — documented that pegleg's PostRunConfigService calls
+unhygienix.endCleanRoomRun() when a run finishes, which is presumably where
+unhygienix would fire the event. I did not re-verify that exact call site
+just now — flagging it as previously-documented, not freshly confirmed, so
+it doesn't get treated as more certain than it is.)
+
+------------------------------------------------------------------------
+
+CORRECTION 2 — M1 delivers via BOTH webhook callback AND Pub/Sub, not
+webhook-now/Pub-Sub-later
+
+I had scoped PubSubDeliveryChannel as a schema seam only, deferred past M1.
+That's wrong per your note: XMI and Josh already concluded M1 ships both
+mechanisms. Fixing this in the working-principle doc now.
+
+What this actually changes:
+
+  1. Both DeliveryChannel implementations are M1, not one now / one later:
+     WebhookDeliveryChannel AND PubSubDeliveryChannel both get built and
+     wired into the CallbackDeliveryWorker in the first delivery-capable
+     commit.
+
+  2. callback_registrations needs to store DIFFERENT config depending on
+     delivery_type — a webhook registration needs a URL, a Pub/Sub
+     registration needs a GCP project + topic, not a URL. So the column
+     isn't just a label, it's a discriminator that decides which config
+     fields are populated AND which DeliveryChannel implementation the
+     worker invokes for that row. Schema needs a delivery_config JSONB
+     column (or two nullable typed columns) alongside delivery_type, not
+     just the enum by itself.
+
+  3. This actually strengthens the Q1 Java recommendation rather than
+     changing it: GCP Pub/Sub publish is now confirmed M1 scope (not a
+     "maybe later" nice-to-have), and the only proven, working reference
+     for that in this codebase is still pegleg's Java
+     BillingMessagePublisherHelper. If we were leaning Go, this correction
+     would have made that gap bigger, not smaller.
+
+------------------------------------------------------------------------
+
+WHY delivery_type EXISTS AT ALL (answering your direct question)
+
+It's the thing that lets one registrations table serve two delivery
+mechanisms without the ingest path, the registration API, or the DB schema
+caring which one a given XMI (or future) consumer picked. Given both
+mechanisms are confirmed for M1 now, this isn't a "just in case" hedge
+anymore — it's load-bearing on day one: the delivery worker reads
+delivery_type off each row and dispatches to WebhookDeliveryChannel or
+PubSubDeliveryChannel accordingly. Same event, same object_events row,
+two possible outs, decided per-registration, decided at the DB row level,
+not in code that branches all over the ingest/registration path.

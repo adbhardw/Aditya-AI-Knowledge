@@ -1,0 +1,236 @@
+FINAL APPROACH — orinix -> XMI(MCS) CALLBACK, AUTH/AUTHZ END TO END
+Consolidates everything traced across the prior follow-up docs in this
+folder into one actionable checklist + the sidecar-vs-direct decision.
+Date: 2026-07-22
+
+
+===========================================================
+OPTIONS EVALUATED BEFORE LANDING HERE
+===========================================================
+
+  - Static shared secret / API key: rejected. No per-caller identity, can't
+    scope or revoke access to one specific caller, and a leak means
+    standing access forever until someone manually rotates it everywhere
+    it's used.
+  - Custom mTLS (per-service X.509 certs): rejected. Technically sound, but
+    means building and operating a separate PKI (issuance, rotation, trust
+    distribution) that no comparable LiveRamp service actually uses for
+    this kind of internal callback — new infrastructure to invent and
+    maintain, not a proven, familiar pattern.
+  - Plain signed tokens with no central permission layer: rejected as
+    insufficient on its own. Proves identity, but answers nothing about
+    "is this identity allowed to do this specific thing" — would still
+    require building an authorization layer from scratch.
+  - CAC-based (Nexus-issued signed JWT + centralized CAC permission check):
+    SELECTED. Identity and permission are both handled by existing,
+    centrally-maintained LiveRamp infrastructure — nothing new to build
+    company-side, and it's the exact same mechanism already proven in
+    production for the equivalent MCS<->VMA callback (PR #735 / #302).
+
+FINAL VERDICT: mutual authn/authz via Nexus (issues + signs the token) and
+CAC (checks the permission) — orinix authenticates as its own service
+account, MCS's existing CAC-gated endpoint pattern authorizes the specific
+call. No new auth infrastructure required on the receiving (MCS) side;
+orinix only needs a service account + token-fetching mechanism (sidecar,
+recommended) on the calling side.
+
+
+===========================================================
+DIRECTION OF THE CALL, STATED PLAINLY
+===========================================================
+
+orinix is the CALLER (mirrors VMA's role in the MCS<->VMA example).
+MCS/XMI is the CALLEE — the new callback endpoint gets hosted there (mirrors
+MCS's `vma_map_updated` endpoint from PR #735).
+
+So: orinix only ever needs to PRODUCE a token and send it. All verification
++ permission-checking is the RECEIVING side's job — that's MCS, not orinix.
+orinix's job is small and mechanical: get a token, POST it, done.
+
+
+===========================================================
+VERIFIED: DOES MCS ALREADY HAVE A TOKEN-GENERATOR SIDECAR? — YES
+===========================================================
+
+Re-checked directly:
+`measurement-control-service/kubernetes-helm-deployment/measurement-control-service/base-values.yaml:159-163`
+
+    accessTokenGetter:
+      enabled: true
+      image:
+        repository: us-central1-docker.pkg.dev/liveramp-eng/auth-tools/access-token-getter
+        tag: "1.0.1"
+
+Confirmed true. But note precisely what this sidecar is FOR on MCS's side:
+it's there so MCS can call OTHER services (like VMA) as itself. It is NOT
+what protects MCS's OWN inbound callback endpoint — inbound protection for
+MCS is `authnProxy` (confirmed OFF on MCS: `authnProxy.enabled: false`,
+same file, line 156-157) plus the CAC call inside `common_init_ctx`.
+
+So for the NEW orinix->MCS callback specifically: MCS doesn't need any NEW
+infra on its own side. It already has everything required to receive and
+authorize this call — a new endpoint + a new permission is purely an
+application-code change (see section 3). The infra question ("sidecar or
+not") is entirely about ORINIX's side, the caller.
+
+
+===========================================================
+1. ORINIX SIDE — WHAT'S NEEDED (the caller)
+===========================================================
+
+Step 1a. Create a LiveRamp V2 service account for orinix.
+  Done via Nexus's Service Account Manager (`apps/service-account`,
+  "Create Account" use case). This itself requires whoever does it to hold
+  the right CAC permission (per the plantuml diagram: sa_create -> cac).
+  This is an access-request / ops task, not code — find out who on the
+  platform/security team owns this provisioning today (same person/team who
+  set up MCS's and VMA's SAs originally would know the process).
+
+Step 1b. Get that SA's long-lived credentials (a JSON keyfile) into Vault.
+  Mirrors exactly what MCS/VMA already do
+  (`--creds-file-path=/secrets/api/credentials.json`, sourced from Vault via
+  K8s secret). Whoever provisions the SA in step 1a should hand back this
+  keyfile; it goes into Vault under orinix's own path, never committed to
+  git, never held in application config directly.
+
+Step 1c. Decide: sidecar vs. calling Nexus directly for the token.
+  This is the actual open decision — full comparison below.
+
+Step 1d. Write the actual callback-sending code.
+  Mechanically trivial once 1a-1c are done — mirrors VMA's
+  `utils/callbacks.py` pattern: fire-and-forget on a thread pool/async task,
+  swallow all exceptions so a failed callback never blocks orinix's real
+  work, send `Authorization: Bearer <token>` + `LR-Org-ID` header to the new
+  MCS callback URL.
+
+
+===========================================================
+2. THE ACTUAL DECISION: RUN THE access-token-getter SIDECAR, OR CALL NEXUS
+   DIRECTLY FOR THE JWT?
+===========================================================
+
+OPTION A — Run the access-token-getter sidecar (mirrors MCS/VMA exactly)
+
+  What it looks like: add the sidecar container to orinix's pod spec
+  (same Helm block MCS/VMA use — `kongSidecars.accessTokenGetter`), mount
+  orinix's Vault-sourced credentials.json into it, and orinix's app code
+  just asks `localhost:PORT/token` (or the unix socket) for a fresh token
+  right before each callback POST.
+
+  Pros:
+    + The proven, company-standard pattern — literally what MCS, VMA,
+      billing_service, segment, and a dozen other unrelated production
+      services already do. Lowest-risk choice; nothing to invent.
+    + Token caching, refresh, and rate-limit avoidance are handled FOR you
+      by the sidecar (its README states this is exactly what it's optimized
+      for) — orinix's app code never has to think about token expiry,
+      retry logic, or hammering Nexus with redundant requests.
+    + orinix's own app process never touches the long-lived credentials.json
+      directly — only the sidecar does. Better isolation: a bug or
+      vulnerability in orinix's app code can't leak the long-lived secret,
+      only (at worst) a short-lived token.
+    + Language/framework agnostic — works identically no matter what
+      orinix is written in, and survives any future rewrite of orinix's
+      stack without touching the auth mechanism.
+    + Familiar to the rest of the org — any LiveRamp SRE, security
+      reviewer, or on-call engineer already knows this pattern. Nothing
+      unusual to explain or get flagged in a review.
+    + Sidecar is lightweight (MCS's own resource limits: 1 CPU, 32Mi memory)
+      — negligible operational cost.
+
+  Cons:
+    - One more container per pod to deploy, monitor, and keep patched
+      (though this is centrally maintained by LiveRamp's auth-tools team,
+      not something orinix's team has to build or fix internally).
+    - Some one-time setup work: wiring the Helm values, the Vault secret
+      mount, and (for local dev) either running the sidecar via
+      compose/docker locally or using its `--offline-garbage-mode` flag to
+      bypass it during pure local testing.
+
+OPTION B — orinix calls Nexus's Authenticator directly (no sidecar, custom
+code implementing the OAuth2 password-grant call itself)
+
+  What it looks like: orinix's own app code holds/reads credentials.json
+  directly, implements the OAuth2 password-grant request to Nexus's
+  `service-account` Authenticator itself, and manages caching/refresh of
+  the resulting token in its own process.
+
+  Pros:
+    + One fewer container in the pod, marginally simpler deployment
+      topology at first glance.
+    + Full control over the exact HTTP call, useful only if there's some
+      unusual reason the standard sidecar genuinely can't be used (no
+      evidence of such a reason here — the sidecar is explicitly built to
+      be usable from any language over plain HTTP or a Unix socket).
+
+  Cons:
+    - Re-implements something already solved, correctly, by a shared
+      company tool — token caching, refresh timing, and Nexus-side
+      rate-limit avoidance all have to be built and maintained by orinix's
+      own team instead of inherited for free.
+    - orinix's app process now directly handles the long-lived credential
+      file — larger security surface than option A; any vulnerability in
+      orinix's own code is a more serious exposure (long-lived secret, not
+      just a short-lived token).
+    - Deviates from the company-standard pattern. Likely to raise questions
+      in a security/infra review ("why doesn't this use
+      access-token-getter like everything else"), and harder for other
+      teams to reason about or support later.
+    - Has to correctly implement OAuth2 password-grant semantics
+      (per service-account's own README: "OAuth 2 password grant
+      authentication for LiveRamp service accounts") — a real protocol to
+      get right, not just "send a POST somewhere."
+
+  RECOMMENDATION: Option A. There is no concrete advantage to Option B here
+  strong enough to outweigh reinventing a solved, security-sensitive
+  problem, and every comparable service traced in this investigation
+  (MCS, VMA, and a dozen others) already made this same choice. Mirror it.
+
+
+===========================================================
+3. MCS/XMI SIDE — WHAT'S NEEDED (the callee)
+===========================================================
+
+No new infra. Purely an application-code + config change, following the
+EXACT shape of PR #735:
+
+  3a. New restricted permission, e.g.
+      `restricted/measurementControl:callback.orinixEvent`
+      (permissions.py-style constant).
+
+  3b. New endpoint (mirrors `vma_map_updated_...`), guarded by
+      `common_init_ctx(..., permission=<normal-human-equivalent>,
+      restricted_permission=<the new one>)` — same pattern already proven
+      in production.
+
+  3c. Whatever the endpoint needs to actually DO with the incoming event
+      (application logic — outside the scope of this auth-focused doc).
+
+  3d. THE MISSING PIECE, not code: someone with the right access needs to
+      grant the new restricted permission (3a) to orinix's service account
+      (from section 1a) inside Nexus. This is the "roles I added in Nexus"
+      step Max described — without it, orinix's calls will authenticate
+      fine (valid token) but get a clean 403 from CAC every time (no
+      permission). Track this as an explicit, separate action item — it's
+      easy to build everything else correctly and still be blocked here.
+
+
+===========================================================
+4. FULL CHECKLIST, IN ORDER
+===========================================================
+
+  [ ] 1. Request/create orinix's LiveRamp V2 service account (Nexus).
+  [ ] 2. Get its credentials.json into Vault, scoped to orinix's own path.
+  [ ] 3. Add the access-token-getter sidecar to orinix's pod (Helm), mount
+         the Vault secret into it. (Recommended — see section 2.)
+  [ ] 4. Write orinix's callback-sending code: ask sidecar for token,
+         POST to MCS's new callback URL with Authorization + LR-Org-ID,
+         fire-and-forget, swallow errors.
+  [ ] 5. On MCS: add the new restricted permission constant.
+  [ ] 6. On MCS: add the new callback endpoint, gated via
+         common_init_ctx(permission=..., restricted_permission=...).
+  [ ] 7. Grant the new restricted permission to orinix's service account,
+         in Nexus. (Separate action from all the code above — don't let
+         this fall through the cracks.)
+  [ ] 8. End-to-end test: confirm a real call from orinix's sidecar-issued
+         token reaches MCS, passes CAC, and hits the new endpoint logic.

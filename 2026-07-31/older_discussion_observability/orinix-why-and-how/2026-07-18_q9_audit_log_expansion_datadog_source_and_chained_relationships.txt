@@ -1,0 +1,709 @@
+Q9-Q13 — Extending orinix to cover Josh's audit log ask: method vs
+resource, reads, retention, the real Datadog log line, and chained
+entity relationships
+Date: 2026-07-18
+Status: Q9-Q11 answered from existing design docs. Q12 originally
+grounded in a real Datadog screenshot (unhygienix, 2026-07-18T04:01:18Z),
+then CONFIRMED against actual source — hank/db/audit.go, hank/db/
+service.go, and unhygienix/api/server/security.go — see the CORRECTED
+block inside Q12 below. Q13 is framed with a general principle but the
+actual Dataset/DataConnection/Credential FK direction is NOT verified
+against unhygienix's real schema — flagged explicitly, not assumed.
+
+Context: Josh Wo (Principal Architect) shared his audit logging design
+and pushed on whether orinix (DV-13856) should expand to also cover
+audit logging, not just external observability notifications. See
+[[project_orinix_observability]] and the earlier diff doc at
+aditya_josh_discussion/2026-07-08_orinix_vs_josh_audit_log_design_diff.txt
+for the three-way split this builds on: orinix (external push),
+Josh's DV-13347 (internal write-audit trail), Jon's ask (read-access
+audit — not covered by either today).
+
+------------------------------------------------------------------------
+
+Q9: Josh's Datadog audit log shows a "Method" that was invoked (e.g.
+CreateQuestionRun). orinix's design shows what RESOURCE was impacted,
+not the method. Is this a real conflict?
+
+A: No — they're two different layers, and both can be kept without
+picking one over the other.
+
+Stripe, GitHub, and Salesforce all log resource + verb as the primary
+audit field (charge.succeeded, repo.create), not an RPC/method name.
+That's exactly orinix's existing event_type pattern:
+com.habu.cleanroom.<object_type>.<action>. The "Method" Josh is
+pointing at is very likely a generic interceptor logging the raw
+gRPC route for every call it wraps — cheap to instrument exhaustively
+across 80+ entity types because it doesn't need to know what each
+call means, but it pushes "figure out what CreateQuestionRun means to
+a customer" onto every downstream reader.
+
+Fix: object_events.context_fields (JSONB, already exists, already
+GIN-indexed) is exactly where "the method that was called" belongs as
+ADDITIONAL metadata, not a replacement for object_type/change_type.
+Adding e.g. "invokedMethod": "CreateCleanRoomQuestionRunStatistics" to
+context_fields costs zero schema migration and satisfies both views
+at once.
+
+------------------------------------------------------------------------
+
+Q10: Right now object_events only captures CREATE/UPDATE. Can we save
+READ events too? And can we use the cleanroom_id from request context
+(the way Josh described using it for his write/update audit) to
+populate these rows?
+
+A: Read events are real, new instrumentation — not a config flag.
+
+Confirmed in the 2026-07-08 diff doc: there is no emit point today on
+any read/view path in pegleg, unhygienix, or picanmix. This is the
+same gap Jon separately flagged (Q2 epic — "who viewed this data") and
+it remains open regardless of what Josh's design covers.
+
+Two things worth being explicit about before committing to it:
+
+  1. Volume asymmetry — every GET vastly outnumbers every mutation.
+     The current GIN index and the 90-day partial index on event_time
+     are sized for a mutation-rate table, not a read-rate table.
+     Adding reads without re-sizing that plan risks the same table
+     doing two very different jobs badly.
+
+  2. cleanroom_id context for reads is actually EASIER than Josh's
+     problem, not harder. His Entity Enrichment Registry exists
+     because ~70K/day of his events come from entities that don't
+     carry cleanRoomId directly, needing chained ByID lookups. Read
+     paths are almost always already scoped by an explicit
+     cleanroomId path/query param — you need it to run the query in
+     the first place — so there's no enrichment-registry equivalent
+     needed for reads. Worth saying this directly to Josh: read-
+     auditing does not inherit his hardest problem.
+
+------------------------------------------------------------------------
+
+Q11: Is it possible to save all of this — write audit, read audit,
+Josh's 80+ entity types — in the SAME object_events table, or do we
+need something more?
+
+A: Schema-wise, one table is right. Retention-wise, it isn't — yet.
+
+Stripe, GitHub, and Salesforce all converge on one polymorphic shape
+at the storage layer (actor + resource_type + resource_id + action +
+metadata). object_events already has this: org_id, cleanroom_id,
+object_type, object_id, event_type (the action), performed_by (the
+actor), context_fields (JSONB, unstructured extra). No new columns
+needed to hold more entity types or more action kinds.
+
+What none of those companies collapse is RETENTION. Salesforce's
+standard Setup Audit Trail is 6 months; Field Audit Trail (compliance-
+grade) is a separate, explicitly longer-retention product tier.
+GitHub's enterprise audit log is a differently-retained materialization
+over the same event stream, not the same physical table serving both
+an activity feed and a legal-hold audit trail.
+
+The concrete blocker: object_events' current DDL runs a nightly hard
+delete — "DELETE FROM object_events WHERE event_time < NOW() -
+INTERVAL '90 days'" (2026-06-01/cloudevents_real_payload_examples_
+2026-06-01.md, line ~561). That's fine for "notify XMI something
+changed." It is not fine for "prove to a customer's compliance team
+what happened in their cleanroom 14 months ago" — the actual point of
+an audit log. This is the real architectural decision, more load-
+bearing than whether the columns fit: does audit-grade data get a
+separate longer-retention table/partition fed from the same event, or
+does object_events' retention change wholesale (with the cost/volume
+consequences of also carrying reads)? Worth sketching both before
+picking one (Design It Twice — see Ousterhout tie-in below).
+
+------------------------------------------------------------------------
+
+Q12: [Grounded in a real Datadog screenshot, unhygienix service,
+2026-07-18T04:01:18Z] Where does Datadog actually get these audit
+logs from? Does Hank save them to some DB? Why, what, and how?
+
+A: Confirmed from the screenshot: this is a raw stdout log line, not
+a queryable event.
+
+The log's own facets say so directly — dirname:
+/var/log/pods/unhygienix_unhygienix-.../unhygienix,
+container_name:unhygienix. That's the Datadog Agent tailing container
+stdout and shipping it to Datadog's log index. There is no queue, no
+topic, no object_events-equivalent table behind THIS specific
+artifact — it's unstructured JSON written to stdout by whatever's at
+audit.go:161, scraped by an agent. That directly answers "where is
+Datadog getting these" — log collection, not a subscription to an
+event bus.
+
+What the actual log line confirmed, field by field:
+
+  "Method": "/proto.CleanRoomRunStatsService/CreateCleanRoomQuestion
+  RunStatistics" — the literal protobuf service/method path, with
+  caller: audit.go:161 and purpose: audit alongside it. At the time
+  this line was first read, that combination LOOKED like a single
+  RPC-layer interceptor, which would have been a correction to the
+  original diff doc's "EVERY CREATE/UPDATE/DELETE GORM hook" framing.
+  SUPERSEDED — see the CORRECTED 2026-07-18 block later in this same
+  Q12 answer: reading hank/db/audit.go directly confirmed it's exactly
+  what the original diff doc said — a GORM AfterCreate/AfterUpdate/
+  AfterDelete hook — not an RPC interceptor. "Method" is a log-context
+  field the GORM hook reads, populated separately by unhygienix's own
+  authenticationInterceptor (api/server/security.go), not evidence of
+  where Hank itself intercepts. No open question remains here.
+
+  "ObjectType": "CleanRoomQuestionRunDatasetStatistics" — not in
+  current object_events coverage (QUESTION, DATA_CONNECTION,
+  EXPORT_JOB) and not in the M1 expansion list either (Question,
+  Flow, Data Connection, Dataset). It's also structurally a CHILD of a
+  question run, not a top-level cleanroom object — so even the
+  resource model needs a decision: is a stats object its own
+  object_type row, or a context_fields entry nested under the parent
+  QUESTION_RUN event? Concrete evidence the 80+-entity-type gap isn't
+  just more volume, it's shapes the current model hasn't represented
+  yet.
+
+  "OrgID": "", "ActionByID": "", "ActionByEmail": "" — empty on this
+  row. CORRECTION: the full Datadog payload (tags: env:stage,
+  cluster_name:stage) confirms this is a STAGE row, not production as
+  first assumed — do not present this to Jon/Josh as a confirmed
+  production data-quality gap. object_events.org_id is NOT NULL in
+  the current DDL, so a row shaped like this would still fail to
+  insert as-is regardless of environment. Mechanism now confirmed (see
+  CORRECTED block below): claims.Organization and tokenClaims.User both
+  come from the same parsed JWT in unhygienix's authenticationInterceptor,
+  and clientName: zabra indicates a service-credential call, which
+  plausibly carries no bound end-user or single org by the nature of
+  that credential type — a mechanical explanation, not a guess. Still
+  unconfirmed: whether this pattern holds in prod traffic too, or is a
+  stage-only artifact (e.g. seeded test data, a staging-only job).
+  Pull a handful of PRODUCTION rows before asserting this as a general
+  data-quality gap to Jon or Josh.
+
+Where does a queryable DB fit in, then? Per the 2026-07-08 diff doc,
+Josh's DV-13347 already assumes "the existing INTERNAL audit log" is
+queryable — delivered to Pegleg, which "writes an enriched row into an
+internal audit store." That implies there IS already a DB-backed path
+(distinct from the stdout-scraped Datadog copy) — but per the
+CORRECTED block immediately below, it is NOT fed by hank/db/audit.go
+itself. Whatever feeds Pegleg's store is either (a) a log pipeline
+ingesting these exact stdout lines, or (b) separate instrumentation
+Josh's team added elsewhere. Ask Josh directly which.
+
+------------------------------------------------------------------------
+CORRECTED 2026-07-18, same day — read the actual hank + unhygienix
+source instead of inferring from the screenshot alone. Every open item
+in Q12 above is now confirmed, not hypothesized:
+
+  1. GORM AfterCreate/AfterUpdate/AfterDelete hooks, CONFIRMED, not RPC-
+     layer. hank/db/audit.go defines an `Audit` struct with
+     BeforeCreateHook/AfterCreate/BeforeUpdateHook/AfterUpdate/
+     AfterDelete methods. hank/db/service.go's `New()` calls
+     applyEmbeddedHooks(db), which registers `gorm:audit_before_create`
+     and `gorm:audit_before_update` as GLOBAL callbacks on the *gorm.DB
+     connection — meaning EVERY Create/Update through that connection
+     triggers them for any model that embeds `db.Audit` (AfterCreate/
+     AfterUpdate/AfterDelete are GORM's own standard callback method
+     names, invoked automatically by GORM for any struct that defines
+     them — no extra registration needed for those three). Confirmed
+     91 files in unhygienix embed `db.Audit`. This VINDICATES the
+     original 2026-07-08 diff doc's "every GORM hook" framing — my
+     "maybe RPC-layer interceptor" hedge earlier in this same doc was
+     wrong, now corrected.
+
+  2. Hank's audit hooks do NOT write to a DB. Confirmed by reading
+     every line of audit.go: AfterCreate/AfterUpdate/AfterDelete each
+     do exactly one thing — hlog.LogEntryCtx(ctx).Infof("Audit Log:
+     %s", ...). No db.Create(&auditLog), no SNS/SQS publish call, no
+     reference to hank/events anywhere in the file. Hank's audit
+     mechanism is 100% logging-only. This settles the "does Hank save
+     it to a DB" question with certainty: no.
+
+  3. Where "Method" and "OrgID" actually come from — NOT Hank, the
+     calling service. hank/db/audit.go reads them from
+     hlog.LogEntryCtx(ctx).Data (requestInfo["method"], requestInfo
+     ["organizationID"]) — fields already attached to the context by
+     something upstream. Hank itself never sets "method" or
+     "organizationID" as context fields anywhere in the repo (grepped
+     the whole tree). The actual setter is unhygienix's own
+     authenticationInterceptor (api/server/security.go:934-971), a
+     global gRPC unary interceptor: on every authenticated call it
+     parses the JWT, and IF the type assertion to *hauth.AuthClaims
+     succeeds, sets hlog.AddFieldsContext(ctx, {"clientName":
+     claims.Subject, "organizationID": claims.Organization, "method":
+     info.FullMethod}). This is why the screenshot's Method field is
+     the FULL "/proto.Service/Method" path (info.FullMethod, unmodified)
+     rather than a bare method name — confirmed, not guessed.
+
+  4. Why OrgID/ActionByID/ActionByEmail were empty on that real row —
+     now mechanically explained, not just plausible. ActionByID/
+     ActionByEmail come from tokenClaims.User inside the same
+     AuthClaims object security.go just parsed; OrgID comes from
+     claims.Organization on that identical object. clientName: zabra
+     in the screenshot means this was a service-to-service call
+     authenticated via zabra's own client credential — a credential
+     type that plausibly carries no bound end-user (empty User) and
+     no single bound org (empty Organization), by the nature of what
+     a service credential is, not a Hank bug or a missing field
+     somewhere. Two call sites in the same interceptor
+     (DownloadCleanRoomQuestionRunFile, DownloadErrorReport) skip this
+     block entirely and return early — a real, separate, narrower gap
+     (those two RPCs get literally none of clientName/organizationID/
+     method set) worth flagging on its own, distinct from the zabra
+     case.
+
+  5. THE central finding for the audit-log-expansion conversation:
+     Hank's audit logging (db.Audit, log-only) and the event-publishing
+     mechanism that would feed object_events (hank/events.EventClient,
+     backed by SNS) are TWO STRUCTURALLY INDEPENDENT SYSTEMS that
+     happen to live in the same shared library, and DO NOT CALL EACH
+     OTHER. Confirmed: unhygienix's own services/events/service.go
+     (PublishEvent/PublishEventAsync, wrapping hank/events.New(...)
+     .Publish()) is invoked by hand-written call sites like
+     api/server/events.go's triggerSnowflakeCleanRoomWarehouseCreation
+     Event — explicit, per-call-site application code, never triggered
+     automatically by the db.Audit GORM hooks. So "can we get Hank's
+     audit trail into object_events for free" is a clean NO — there
+     is no existing wiring between them. Getting there means either
+     (a) adding an explicit PublishEvent call at each of the ~91
+     db.Audit-embedding models' mutation points (same lift as adding
+     any new orinix publisher today, at 91x the call sites), or (b)
+     modifying Hank's shared AfterCreate/AfterUpdate/AfterDelete hooks
+     themselves to also publish — which is a cross-cutting change to
+     shared infrastructure every Hank-consuming service would inherit
+     instantly, a much bigger and riskier blast radius than option (a).
+     This is a real fork-in-the-road decision, not a foregone
+     conclusion — worth putting to Josh/Jon explicitly as a choice,
+     not assuming either path.
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+Q13: Chained/cascading relationships — if a Dataset changes, does that
+mean the underlying Data Connection changed too (or vice versa)? If a
+credential is rotated, does that mean both a credential event AND a
+data_connection event should publish?
+
+A: General principle: publish one event per row that actually
+mutated, not one event per perceived business relationship. Don't
+fabricate an event on object B just because object A (which is
+related to B) changed.
+
+Stripe doesn't fire customer.updated when a related subscription
+changes, and vice versa — each object gets its own event, fired only
+when that object's own state was actually written. Two cases to tell
+apart here:
+
+  1. REAL cascading write — the "related" row is actually re-
+     persisted as a side effect (e.g. a DataConnection schema push
+     that causes a Dataset's schema_snapshot to be rewritten too).
+     This is not double-counting or a design problem — it's two real
+     mutations, so two real events, exactly matching the pattern
+     already used for DATA_CONNECTION.schema_changed in the existing
+     examples (2026-06-01/cloudevents_real_payload_examples...
+     Scenario 2). Nothing new needed here beyond instrumenting both
+     write paths, same as any other publisher.
+
+  2. NO second write, but a real "this affects a downstream resource"
+     relationship the consumer still needs to know about (e.g.
+     rotating a Credential doesn't touch any DataConnection row, but
+     XMI's workflow cares that a DataConnection depending on that
+     credential might now need re-validation). Don't synthesize a
+     fake data_connection.updated with an empty/fabricated diff here
+     — changedFields must reflect a real diff on that specific row,
+     or every consumer's "trust changedFields" assumption breaks.
+     Instead: publish the one real event (credential.updated) and put
+     the reference to what it affects in context_fields —
+     e.g. "affectedDataConnectionIds": [...] — the exact same pattern
+     already used for context.questionId on EXPORT_JOB events, where
+     Question didn't change but the export job's context still names
+     it.
+
+------------------------------------------------------------------------
+CORRECTED 2026-07-18, same day — the FK direction is now VERIFIED
+against the real GORM models (not assumed). Read directly:
+unhygienix/models/dataset.go, forebitt/models/data_import_job.go,
+primage/models/models.go.
+
+  THE REAL CHAIN, confirmed:
+    Dataset (unhygienix) --[DataImportJobID]--> DataImportJob (forebitt)
+    DataImportJob (forebitt) --[CredentialID]--> Credential (primage)
+
+  Three things this settles:
+
+  1. "DataConnection" in the observability docs IS forebitt's
+     DataImportJob. Confirmed directly — data_import_job.go has
+     `func NewImportJobFromProtoV2(p *dataconnections.DataConnection)
+     DataImportJob`, a literal proto-to-model mapping from the
+     "DataConnection" name to the internal "DataImportJob" model. Not
+     an assumption anymore.
+
+  2. Credential lives in a THIRD, separate service (primage) — not
+     forebitt, not unhygienix. `primage/models/models.go` defines
+     `Credential{ UUID, hdb.Audit, TimeAudit,
+     OrganizationCredentialsID, Name, Value }`. So the credential-
+     affects-data-connection question in this Q13 spans three
+     independently-owned, independently-Hank-audited services, not
+     one DB you could just JOIN across. Resolving "which DataImportJobs
+     does this Credential affect" for the affectedDataConnectionIds
+     context field (option 2 above) is a genuine cross-service lookup
+     — forebitt would need to query by CredentialID, or primage would
+     need to know its consumers. Real integration work, not a detail.
+
+  3. Direction is one-way pointers only, both hops — DataImportJob.
+     CredentialID and Dataset.DataImportJobID are plain nullable
+     varchar columns, no GORM foreign-key/cascade behavior visible on
+     either. So nothing cascades automatically at the DB layer in
+     either direction. Whether a credential rotation writes a NEW
+     Credential row (new ID, forcing an UPDATE to DataImportJob.
+     CredentialID — a real Case 1 cascading write) or mutates Value
+     in place on the SAME row (no DataImportJob write at all — Case 2)
+     depends on how primage's credential-rotation code path is written
+     — not fully traced end-to-end here (primage/api/server/
+     credential.go has the handlers; the actual Create-vs-Update call
+     site wasn't confirmed). That specific detail is still open, but
+     the FK direction and cross-service split are no longer guesses.
+------------------------------------------------------------------------
+
+  Cost of case 2: populating affectedDataConnectionIds means a
+  reverse lookup at publish time (which DCs reference this
+  credential?) — the same complexity class as Josh's Entity
+  Enrichment Registry problem, just reappearing on the observability
+  side. Not free, but a known, already-solved-elsewhere shape rather
+  than a new kind of problem.
+
+  NOT VERIFIED: which direction the real containment/reference
+  relationship runs between Dataset, DataConnection, and Credential
+  in unhygienix's actual domain model (e.g. does DataConnection FK to
+  Credential, or the reverse; is Dataset owned by DataConnection or a
+  peer). Nothing in the docs reviewed so far pins this down. Before
+  building either case above for these three specifically, read the
+  actual GORM models / proto definitions rather than assuming
+  direction from the names — a wrong assumption here is exactly a
+  Chesterton's Fence miss (see the cronos FLOW_RUN mistake already
+  logged in [[project_orinix_observability]] as a precedent for what
+  happens when this step gets skipped).
+
+------------------------------------------------------------------------
+
+Q14: Does an audit log line get emitted because of something on the
+DATABASE TABLE (a column, a trigger), or because of a METHOD that
+gets called somewhere? Walk through CreateDataConnection concretely,
+simply.
+
+A: It's a method, purely. Nothing about the database table matters —
+no column, no DB trigger, no config anywhere in Postgres. It's a
+property of the Go struct definition, checked automatically by GORM
+every time you call Create/Update/Delete. Here's the mechanism, then
+the concrete trace.
+
+  THE MECHANISM, simply:
+
+  GORM (the ORM library) has a built-in habit: whenever you call
+  db.Create(&thing), right after it inserts the row, it asks "does
+  `thing` happen to have a method called AfterCreate?" If yes, GORM
+  calls it automatically. This is just Go: if a struct EMBEDS another
+  struct that has a method, the outer struct gets that method for
+  free, as if it wrote it itself.
+
+  hank/db/audit.go defines a small struct called `Audit` with methods
+  AfterCreate, AfterUpdate, AfterDelete on it. Any model that embeds
+  `hdb.Audit` — like `type DataImportJob struct { UUID; hdb.Audit;
+  ... }` — automatically GETS those three methods. GORM doesn't know
+  or care that they came from Hank; it just sees "this struct has an
+  AfterCreate method" and calls it after every insert. That's the
+  whole trick. A model that does NOT embed hdb.Audit simply doesn't
+  have the method, GORM's check finds nothing, and no audit line is
+  ever produced for it — silently, no error.
+
+  (Side note on BeforeCreateHook/BeforeUpdateHook specifically — those
+  two are NOT GORM's standard method names, so they need the extra
+  step in hank/db/service.go's applyEmbeddedHooks(), which manually
+  registers a callback that looks for a method with exactly that name
+  and calls it if found. AfterCreate/AfterUpdate/AfterDelete don't
+  need this extra step — GORM already looks for those three by
+  default on every model, no registration required.)
+
+  THE CONCRETE TRACE — CreateDataConnection, actually followed line by
+  line, not assumed:
+
+    1. forebitt/api/server/job_service.go:1396
+       CreateDataConnection(ctx, in) — the RPC handler.
+
+    2. It calls CreateImportJobV2(...) (job_service.go:1293) twice —
+       once with IsDraft=true to create the row, once with
+       IsDraft=false to finalize it. (This is also why forebitt's own
+       CreateDataConnection produces at least two separate audit log
+       lines for one user action — one CREATE, one UPDATE — worth
+       knowing if Jon ever counts audit lines and expects 1:1 with
+       user actions.)
+
+    3. The draft branch calls CreateImportJob(...) (job_service.go:
+       1082), which calls InsertJob(...) (forebitt/db/job.go:146),
+       which calls InsertJobInTransaction(tx, job) (job.go:162).
+
+    4. Line 163, the actual moment: `err := tx.Create(&job).Error` —
+       `job` is a `*models.DataImportJob`, which embeds `hdb.Audit`.
+
+    5. GORM runs the INSERT, then — automatically, no extra code
+       anywhere in forebitt — checks "does *models.DataImportJob have
+       an AfterCreate method?" Yes, inherited from hdb.Audit. GORM
+       calls job.AfterCreate(scope).
+
+    6. That method (hank/db/audit.go) reads the JWT claims off the
+       request context (actor: user ID/email) plus whatever log
+       fields the service's own auth interceptor already attached
+       (method: the gRPC route, organizationID: from the JWT) —
+       builds an AuditLog struct, and logs it as one JSON line:
+       "Audit Log: {...}".
+
+    7. Datadog's Agent, tailing that container's stdout, ships the
+       line to Datadog. That's the log Josh screenshotted.
+
+  Nothing in steps 4-7 required forebitt's engineers to write any
+  audit-specific code for DataImportJob — embedding hdb.Audit in the
+  struct definition was the entire opt-in. That's also exactly why
+  Josh's design covers 80+ entity types so easily: it's one line
+  (embed hdb.Audit) per model, not per-mutation-path instrumentation.
+
+------------------------------------------------------------------------
+
+Q15: [Aditya asked to check primage specifically] For the credential
+rotation question left open in Q13 — does rotating a credential in
+primage create a brand-new row, or update the existing one in place?
+Does this change whether a DataConnection write is implied?
+
+A: Checked primage/db/credentials.go directly. The answer is more
+layered than "one row" — there are two different models involved, and
+they behave differently on rotation.
+
+  There are TWO levels in primage, not one:
+    OrganizationCredential — the stable "bundle" (one per org +
+      credential source, e.g. "Acme Corp's Snowflake credentials").
+      This is almost certainly what DataImportJob.CredentialID
+      actually points to (grounded in DataImportJob's own
+      NewImportJobFromProtoV2 pulling CredentialID straight off the
+      DataConnection proto, at the org/source-account level, not an
+      individual secret field).
+    Credential — individual field-level values underneath a bundle
+      (e.g. one row for "password", one for "access key"). Both
+      models embed hdb.Audit independently.
+
+  UpdateOrganizationCredential (primage/db/credentials.go:398), the
+  actual rotation path:
+    - `tx.Model(oc).Updates(*oc)` on the OrganizationCredential — an
+      IN-PLACE update, SAME ID preserved. This alone fires hdb.Audit's
+      AfterUpdate hook on OrganizationCredential (it embeds hdb.Audit
+      too — confirmed in primage/models/models.go).
+    - Then: `tx.Scopes(...).Delete(&models.Credential{})` — DELETES
+      every individual Credential row under that bundle — followed by
+      CreateCredential(...) in a loop — CREATES brand-new Credential
+      rows with brand-new IDs for the new values. So at the
+      individual-field level, rotation really is delete-then-recreate,
+      not an update.
+    - Net effect: one rotation action can produce MANY audit log
+      lines — one AfterUpdate (OrganizationCredential) + N AfterDelete
+      + N AfterCreate (one pair per individual credential field) —
+      not the one-line-per-action a human would picture.
+
+  What this means for Q13's open question: since DataImportJob.
+  CredentialID most likely points at the STABLE OrganizationCredential
+  ID (which is updated in place, ID never changes), rotation does NOT
+  force a write to DataImportJob — Case 2 from Q13 (no real second
+  write, use context_fields to reference the affected DataConnection)
+  is the right model, not Case 1. NOT independently verified: that
+  DataImportJob.CredentialID literally equals OrganizationCredential.ID
+  and not some individual Credential.ID — inferred from how the proto
+  mapping and the RPC naming (GetOrCreateOrganizationCredential,
+  CreateOrganizationCredential) are structured, not confirmed by
+  reading a line that assigns one directly to the other. Worth a final
+  grep on that specific assignment before stating it as fact to Josh.
+
+  GOOD NEWS while checking that: the reverse lookup this whole
+  question needs already exists. forebitt/api/server/job_service.go:
+  436, GetDataConnectionCountByCredential(ctx, in) — takes a
+  CredentialID, calls db.FetchDataConnectionCountByCredentionID
+  (job.go:264), returns how many DataConnections reference it. That's
+  exactly the query an "affectedDataConnectionIds" context field on a
+  credential.updated event would need to run. So the cross-service
+  reverse-lookup flagged as "real integration work" above is only
+  partially new work — the read path forebitt would need already
+  exists as a callable RPC; what's missing is wiring it into whatever
+  publishes the credential event, not building the lookup from
+  scratch.
+
+------------------------------------------------------------------------
+
+Q16: Does UPDATE or DELETE call AfterUpdate/AfterDelete the same way
+CREATE calls AfterCreate? Simple example against a real struct
+(unhygienix/models/measurement.go:57, MeasurementDataset).
+
+A: Yes, exactly parallel — one method per verb, GORM picks the one
+matching whichever call you actually made.
+
+  type MeasurementDataset struct {
+      UUID
+      hdb.Audit          // <- embedding, no field name, just the type
+      MeasurementPlanReportID string
+      DatasetID               string
+      ...
+  }
+
+  Because hdb.Audit is embedded (not named as a field), Go gives
+  MeasurementDataset every method Audit defines, for free, as if
+  MeasurementDataset had written them itself: AfterCreate, AfterUpdate,
+  AfterDelete, BeforeUpdateHook. GORM doesn't know or care they came
+  from Audit — after any DB call, it just asks "does this struct have
+  a method with this exact name?" and calls it if so.
+
+    db.Create(&measurementDataset)              -> checks AfterCreate -> Action: "CREATE"
+    db.Save(&measurementDataset) / .Update(...)  -> checks AfterUpdate -> Action: "UPDATE"
+    db.Delete(&measurementDataset)               -> checks AfterDelete -> Action: "DELETE"
+
+  Same struct, same embedded Audit, only the Action field in the
+  logged line changes, based on which of the three GORM calls actually
+  ran — nothing else differs between a create-triggered log line and
+  an update-triggered one.
+
+  One real asymmetry worth flagging: hdb.Audit has BeforeUpdateHook
+  but no equivalent BeforeDeleteHook — only AfterDelete exists for
+  deletes. So delete audit lines only ever see state from after GORM
+  has already done the delete-scope work; there's no "before" hook to
+  capture pre-delete detail the way BeforeUpdateHook can for updates.
+
+------------------------------------------------------------------------
+
+Q17: Where exactly do BeforeCreateHook/AfterCreate/BeforeUpdateHook/
+AfterUpdate/AfterDelete live — which file, which lines?
+
+A: hank/db/audit.go, all five on the same `*Audit` receiver:
+
+    Line 125  func (a *Audit) BeforeCreateHook(scope *gorm.Scope) error
+    Line 150  func (a *Audit) AfterCreate(scope *gorm.Scope) error
+    Line 166  func (a *Audit) BeforeUpdateHook(scope *gorm.Scope) error
+    Line 183  func (a *Audit) AfterUpdate(scope *gorm.Scope) error
+    Line 199  func (a *Audit) AfterDelete(scope *gorm.Scope) error
+
+  Two copies exist locally and they're byte-for-byte identical
+  (checked with diff): the source checkout at
+  project-sprint-understanding-1/hank/db/audit.go, and the actual
+  versioned dependency Go resolves at build time,
+  ~/go/pkg/mod/github.com/deklareddotcom/hank@v1.23.1-0.20250813161745-c53aa6f6741a/db/audit.go
+  (the one the IDE opened). Confirmed unhygienix, forebitt, and
+  primage's go.mod all pin that exact same version string — all three
+  services run the identical audit.go, not three drifted copies.
+
+------------------------------------------------------------------------
+
+Q18: For the proposed cold-tier archive (S3/GCS) in the design doc
+section — whose bucket/account would this actually be? LiveRamp's?
+
+A: Almost certainly LiveRamp's AWS account, but this is inferred from
+circumstantial evidence in the code, not confirmed against actual
+infra/IAM — flag it as an open item in the review, don't state it as
+settled.
+
+  What points that way:
+  - unhygienix's own container images are hosted at ECR account
+    947657079417 (us-east-2) — visible directly in the Datadog log's
+    own tags (image_name:947657079417.dkr.ecr.us-east-2.amazonaws.com/
+    unhygienix), so Habu's existing AWS footprint already lives under
+    a specific account.
+  - The orinix repo itself already migrated to github.com/LiveRamp/
+    orinix (per [[project_orinix_observability]], 2026-07-08 entry) —
+    the org umbrella is LiveRamp, not the old deklareddotcom.
+  - hank already has a working aws/s3 package (hank/aws/s3/) used
+    elsewhere in the stack, so there's precedent for Habu services
+    writing to S3 under whatever account already backs that package's
+    config — same account is the natural default for a new archive
+    bucket too.
+
+  What ISN'T confirmed: bucket ownership/IAM is an infra decision, not
+  something visible in application source code — no bucket name,
+  account ID, or Terraform config for a bucket like this was found in
+  any repo checked out locally. This needs a real answer from
+  DevOps/infra (the same team that owns github-iac and repo
+  provisioning per [[project_orinix_observability]]), not an inference
+  from ECR tags. Say "almost certainly LiveRamp's existing AWS org,
+  exact account TBD with infra" in the review, not a flat "yes."
+
+------------------------------------------------------------------------
+
+Q19: For the cold tier (S3/GCS archive) — how would someone actually
+access/query it "quickly" when they need older audit history? Isn't
+object storage slow to search?
+
+A: Two real options, with a real tradeoff between them — worth naming
+both in the review rather than promising one speed for everything.
+
+  OPTION A — partitioned query engine directly over the archive
+  (Athena over S3 Parquet, or BigQuery external tables over GCS).
+  If the archive is partitioned to match how people actually ask for
+  it — by cleanroom_id, then by date — a query like "show CR-1's
+  activity from March" only scans that partition's files, not the
+  whole archive. This runs in low single-digit seconds for a
+  well-partitioned query, not real-time-millisecond like Postgres, but
+  genuinely interactive — someone can click into an "older history"
+  tab and get an answer while they wait, not file a ticket and come
+  back tomorrow. This is the right default for "show it in a UI."
+
+  OPTION B — Datadog-style rehydration: temporarily reload a whole
+  time range back into a hot searchable index, investigate there, let
+  it expire back out. This is built for occasional deep investigation
+  (a compliance audit, an incident review), not everyday browsing —
+  Datadog's own default rehydrated-log retention is 15 days, and the
+  reload itself takes real time, not instant. Wrong tool for "customer
+  clicks a tab and expects an answer in 2 seconds."
+
+  Recommendation: Option A (partitioned Athena/BigQuery-style engine)
+  for anything user-facing, i.e. the "audit history" tab in a UI.
+  Option B (rehydration) only if Habu ever needs Datadog-specific
+  investigation tooling on top, which is a separate, lower-priority
+  need. The real tradeoff to be upfront about in the review: object-
+  storage query engines are NOT as fast as a live Postgres index no
+  matter how well partitioned — if a genuinely instant/low-latency
+  requirement shows up for old data, that's an argument for extending
+  the HOT tier's retention instead of relying on cold storage, and
+  should be raised as a real cost-vs-latency tradeoff, not assumed
+  away.
+
+------------------------------------------------------------------------
+
+OUSTERHOUT TIE-IN
+
+  DEEP VS. SHALLOW MODULES (ch. 4) — Hank's generic per-RPC interceptor
+  (Q9, Q12) is shallow by design: trivial to apply everywhere, but it
+  hands the reader the raw method name instead of a resolved meaning.
+  orinix's curated object_type/action pair is deeper: more thought at
+  publish time, nothing left for the consumer to reverse-engineer.
+
+  INFORMATION HIDING (ch. 4) — in Q13 case 2, a consumer reacting to
+  "my data connection may be affected" shouldn't need to know HOW
+  credentials relate to data connections internally. Putting
+  affectedDataConnectionIds in context_fields hides that relationship
+  behind the one event that actually changed.
+
+  PULL COMPLEXITY DOWNWARD (ch. 8) — same case: the publisher already
+  knows the credential-to-DC relationship at write time and resolves
+  it once. Not doing this pushes "go figure out which DC this
+  credential affects" onto every consumer, repeatedly.
+
+  DEFINE ERRORS OUT OF EXISTENCE (ch. 9) — refusing to fabricate a
+  second event with an empty diff (Q13) isn't a style preference, it
+  eliminates a whole category of "trusted changedFields turned out to
+  be lying" consumer bugs before they can exist.
+
+  DESIGN IT TWICE (ch. 4) — the retention question in Q11 (same table,
+  same TTL vs. a separate longer-retention audit partition) is a
+  genuine two-options-worth-sketching decision, not something to
+  settle in the same breath as "does the column exist."
+
+  CHESTERTON'S FENCE, APPLIED PROSPECTIVELY — the Dataset/DataConnection/
+  Credential relationship in Q13 and the RPC-layer-vs-ORM-layer question
+  in Q12 were both explicitly flagged rather than assumed when first
+  raised, and both got resolved the same day by reading the actual
+  source (see the CORRECTED blocks in Q12 and Q13) instead of staying
+  open guesses. One genuine remainder: whether credential rotation in
+  primage creates a new Credential row or mutates Value in place wasn't
+  traced to its actual call site — still flagged as open in Q13, not
+  assumed either way. The same verify-before-generalizing discipline
+  also caught the stage-vs-production mixup in Q12 (the screenshot was
+  assumed to be a production row and wasn't — env:stage in the full
+  payload's tags caught it), and echoes the cronos FLOW_RUN mistake
+  earlier in this project — applied here after the fact instead of
+  before, but applied.

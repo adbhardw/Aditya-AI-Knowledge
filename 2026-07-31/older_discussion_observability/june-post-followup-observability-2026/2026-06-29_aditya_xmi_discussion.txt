@@ -1,0 +1,150 @@
+XMI Observability Meeting Prep — Delivery Mechanism
+Date: 2026-06-29
+Author: Aditya Bhardwaj
+Tickets: DV-13856 (Callback Registration) + DV-15090 (Clean Room Pub/Sub — Internal M1)
+
+------------------------------------------------------------------------
+
+YOUR POSITION GOING IN
+
+You support orinix as the delivery engine (confirmed). The open fight is whether orinix
+publishes directly to GCP Pub/Sub (XMI's ask) or whether XMI exposes a webhook endpoint
+(a simple HTTPS REST URL that Habu POSTs to) — your preference for M2 scalability.
+
+------------------------------------------------------------------------
+
+IF XMI SAYS: "WE WANT PUB/SUB, JUST PUBLISH TO OUR TOPIC DIRECTLY"
+
+Acknowledge first — it is not wrong for M1:
+
+    For M1, since XMI is a LiveRamp team, IAM coordination is internal. Workload Identity
+    Federation is doable — no static key, orinix exchanges its AWS STS token for a
+    short-lived GCP token. We can make it work for XMI specifically.
+
+Then land the multi-cloud overhead argument:
+
+    The problem is not XMI. The problem is what happens when team MI comes in on Azure
+    Service Bus, or a SafeHaven team on a different GCP project. Each one requires:
+
+      - orinix to add a new SDK dependency (google-cloud-pubsub, azure-servicebus, etc.)
+      - New Workload Identity Federation config per GCP project, or new IAM trust per cloud
+      - New Terraform per consumer — any service account change on XMI's side needs a
+        Habu SRE + TF PR
+      - orinix carries GCP/Azure credentials permanently — Habu owns credential rotation
+        risk for external cloud infra it does not control
+
+The counter-offer:
+
+    XMI builds one Cloud Run HTTPS endpoint (a simple REST URL that accepts POST requests).
+    They already own GCP — this is trivial for them. orinix POSTs a CloudEvents payload
+    to that URL. XMI fans out to their Pub/Sub internally. Habu manages zero GCP
+    credentials. This is identical to what every production webhook system does
+    (Stripe, GitHub, Salesforce).
+
+------------------------------------------------------------------------
+
+THE KEY COMPARISON
+
+                            orinix → GCP Pub/Sub direct     XMI exposes Cloud Run webhook
+                            ----------------------------     -----------------------------
+XMI build work              Create topic + grant Habu IAM   Build one Cloud Run endpoint
+Habu build work             GCP SDK + WIF config + TF        HTTP POST — zero new SDK
+Adding Azure consumer       New SDK + new WIF + new TF       Same HTTP POST, different URL
+XMI service account change  Habu TF PR + orinix redeploy    XMI's own problem
+Scales to M2 external       Per-cloud bridge — never scales  One webhook pattern, all clouds
+
+------------------------------------------------------------------------
+
+ON LAMBDA BRIDGE vs ORINIX (IF SOMEONE RAISES IT)
+
+Already settled — but have the argument ready:
+
+Lambda bridge (SNS to Lambda to Pub/Sub):
+    SNS retries 3 times then drops the event. No durable buffer. Silent failure
+    for Flow chaining.
+
+orinix with SQS:
+    Explicit ACK — delete SQS message only after both the object_events write AND
+    the delivery succeed. Message survives orinix crash or deploy. DLQ catches
+    failures and is inspectable in the AWS console.
+
+For XMI's Flow chaining use case, a dropped FLOW_RUN completed event means Flow 2
+never triggers — that is a silent production failure. SQS durability is non-negotiable.
+
+------------------------------------------------------------------------
+
+THE ONE QUESTION TO FORCE A DECISION
+
+    "XMI, does your preference for Pub/Sub mean you hard-block on exposing an inbound
+    HTTPS endpoint (a simple REST URL we POST to) — or is that just your preference?
+    If you build a Cloud Run endpoint and fan out to Pub/Sub internally, is that
+    acceptable? Because it keeps Habu's architecture clean for every future consumer."
+
+If XMI says they cannot expose an inbound endpoint: GCP Workload Identity Federation
+for M1 is the fallback, with a documented commitment that M2 external consumers get
+webhooks regardless.
+
+------------------------------------------------------------------------
+
+DECISIONS TO LAND TODAY
+
+  1. Delivery mechanism for M1: webhook (Cloud Run) vs direct Pub/Sub
+     Must decide today — this gates the entire M1 architecture.
+
+  2. M1 event priority: DataConnection + FlowRun events first
+     Unblocks XMI's most critical workflows while remaining decisions are finalized.
+
+  3. Latency SLA confirmation: is sub-5-second latency for Flow chaining acceptable?
+
+------------------------------------------------------------------------
+
+BACKGROUND: WHAT ORINIX OWNS END-TO-END
+
+  unhygienix / forebitt / picanmix / cronos
+    publish to: SNS habu-observability-events  (new topic, hevent pattern)
+                      |
+                      v
+              SQS: sqs-habu-observability-consumer
+                      |
+                      v
+                  orinix  (single service, two outputs)
+                    [1] INSERT INTO object_events   -- always, durable store
+                    [2] deliver to registered consumers:
+                        - XMI webhook (Cloud Run)?   HTTP POST CloudEvents payload
+                        - XMI Pub/Sub (direct)?      google-cloud-pubsub SDK + WIF
+                        - Future Azure team?          azure-servicebus SDK + Azure AD
+                        - Future AWS team?            direct SQS send — same cloud
+
+Same service (orinix), different delivery plugins per consumer type.
+
+------------------------------------------------------------------------
+
+XMI'S CONFIRMED USE CASES (M1)
+
+  1. DataConnection stage changes — highest-frequency real-world trigger today
+  2. FlowRun state changes — powers Flow chaining
+  3. Dataset assignment changes — dataset assigned or removed from a question
+  4. Quick-start trigger — all datasets assigned triggers an automatic run
+
+Flow chaining requires low-latency push delivery. 60-second polling is not acceptable.
+Sub-5-second latency is the target.
+
+------------------------------------------------------------------------
+
+EVENT SCHEMA (FIXED — CLOUDEVENTS v1.0)
+
+  {
+    "specversion": "1.0",
+    "id":          "evt-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "source":      "urn:habu:cleanroom:cr-abc",
+    "type":        "com.habu.cleanroom.data_connection.updated",
+    "time":        "2026-06-01T10:32:00Z",
+    "data": {
+      "objectType":    "DATA_CONNECTION",
+      "objectId":      "97b6cf60-f8be-48aa-b7a0-ec112c1fb801",
+      "changeType":    "UPDATED",
+      "changedFields": { "stage": { "from": "MAPPING_REQUIRED", "to": "CONFIGURATION_COMPLETE" } }
+    }
+  }
+
+Same envelope regardless of delivery mechanism — pull API, webhook, or Pub/Sub.

@@ -1,0 +1,228 @@
+DV-15091 subtasks — created via Jira API, re-parented from DV-15898
+Date: 2026-07-13
+Originally created under: DV-15898 "Pub/Sub Review meeting XMI/Josh" (Story, Epic DV-13856)
+Re-parented same day to: DV-15091 "Clean Room Pub/Sub - Internal Users (M1)"
+  (Product Prioritization, under Epic DV-15090 — the actual M1 ticket this
+  whole build has referenced throughout; DV-15898 was just a meeting-note
+  ticket, not the right home)
+Note: sprint field and labels deliberately skipped on all subtasks per instruction.
+
+------------------------------------------------------------------------
+UPDATE 2026-07-13, later same day: DV-16030-16041 turned out to have no
+"Edit" button in the Jira UI (screen-scheme gap for Sub-task issue type in
+project DV, not a permission problem - EDIT_ISSUES was true on both, API
+field updates worked fine). Per Aditya's fallback instruction, created 12
+replacement tickets as Story type (same type as the editable DV-15898),
+same content, same Focus Area/Scrum Team/Assignee/Tech Lead/PM/Priority,
+linked to DV-15091 via "Relates" (true subtask-parent isn't possible here
+since Story and DV-15091's type (Product Prioritization) are the same
+hierarchy level). Sprint and labels skipped again, left for Aditya to add
+manually in the UI where they're actually editable.
+
+  DV-16045  Finalize orinix language & architecture decision (Java, Strategy pattern)
+  DV-16046  Scaffold orinix repository (orinix-proto / orinix-backend / orinix-server)
+  DV-16047  Implement webhook delivery channel (HMAC-SHA256 signed)
+  DV-16048  Implement GCP Pub/Sub delivery channel - resolve WIF vs static SA key
+  DV-16049  Idempotency design - producer-minted event ID, end-to-end propagation
+  DV-16050  DLQ handling + log-backed event replay
+  DV-16051  Provision AWS infra - SNS topic + SQS queues (Terraform)
+  DV-16052  Wire external-api-server integration (gRPC client + REST endpoints)
+  DV-16053  Confirm cross-team publisher dependency - unhygienix FLOW_RUN SNS publish
+  DV-16054  Update Confluence design doc (idempotency, HMAC, delivery_config, schema, DLQ)
+  DV-16055  Decide migration tooling standard - Liquibase vs plain SQL
+  DV-16056  Prepare and deliver LIDAC presentation
+
+DV-16030 through DV-16041 (the original subtasks) were subsequently
+DELETED (Aditya confirmed) once the DV-16045-16056 Story replacements were
+in place. Current, final live set of tickets for this work: DV-16045
+through DV-16056, all linked to DV-15091 via "Relates".
+
+Root cause of the missing Edit button, as far as it could be determined
+without Jira admin access: NOT a permissions issue (mypermissions showed
+EDIT_ISSUES=true identically on the Sub-task and the Story), NOT a
+workflow-status lock (both were the exact same status object, id 10036
+"To Do"). By elimination, almost certainly the Issue Type Screen Scheme —
+Sub-task has no Edit screen mapped in project DV, Story does. Could not
+confirm directly: viewing issuetypescreenscheme config requires Jira
+admin rights ("Only Jira administrators can access issue type screen
+schemes"), which this account doesn't have.
+
+CREATED (all 12, no sprint, no labels):
+  DV-16030  Finalize orinix language & architecture decision (Java, Strategy pattern)
+  DV-16031  Scaffold orinix repository (orinix-proto / orinix-backend / orinix-server)
+  DV-16032  Implement webhook delivery channel (HMAC-SHA256 signed)
+  DV-16033  Implement GCP Pub/Sub delivery channel - resolve WIF vs static SA key
+  DV-16034  Idempotency design - producer-minted event ID, end-to-end propagation
+  DV-16035  DLQ handling + log-backed event replay
+  DV-16036  Provision AWS infra - SNS topic + SQS queues (Terraform)
+  DV-16037  Wire external-api-server integration (gRPC client + REST endpoints)
+  DV-16038  Confirm cross-team publisher dependency - unhygienix FLOW_RUN SNS publish
+  DV-16039  Update Confluence design doc (idempotency, HMAC, delivery_config, schema, DLQ)
+  DV-16040  Decide migration tooling standard - Liquibase vs plain SQL
+  DV-16041  Prepare and deliver LIDAC presentation
+
+------------------------------------------------------------------------
+
+1. Finalize orinix language & architecture decision (Java, Strategy pattern)
+
+Decided orinix (new cleanroom observability service) is Java/Spring Boot,
+not Go, and not a Java+Go hybrid. Reasoning: SQS consumption and GCP
+Pub/Sub publish are both already proven in production Java (pegleg's
+AWSSQSConfiguration and BillingMessagePublisherHelper); neither exists in
+Go anywhere in this codebase (hank has no SQS support). WIF is proven in
+both languages so that didn't tip it. Full comparison (Java vs Go vs
+Hybrid, every option scored against SQS/Pub-Sub/WIF/precedent) is written
+up in orinix-why-and-how/2026-07-06d_q1_FINAL_java_vs_go_vs_hybrid.txt.
+Status: Done.
+
+------------------------------------------------------------------------
+
+2. Scaffold orinix repository (orinix-proto / orinix-backend / orinix-server)
+
+Multi-module Maven/Spring Boot repo created at LiveRamp/orinix, mirroring
+pegleg's own module split. orinix-proto holds the gRPC contract
+(GetCleanroomEvents, RegisterCallback). orinix-backend holds domain logic
+(ingest, delivery, registration). orinix-server is the runnable Spring
+Boot app (gRPC server, SQS listener config). PR: LiveRamp/orinix#1.
+Status: Done, merged.
+
+------------------------------------------------------------------------
+
+3. Implement webhook delivery channel (HMAC-SHA256 signed)
+
+WebhookDeliveryChannel implements the Strategy interface DeliveryChannel.
+POSTs the CloudEvents payload to a registered callback_url, signs it with
+HMAC-SHA256 using a per-registration signing_secret (symmetric, same
+model as Stripe/GitHub webhooks), attaches X-Habu-Signature and
+X-Habu-Event-Id headers.
+Status: Done (implementation), open: end-to-end test against a real XMI
+endpoint has not happened yet.
+
+------------------------------------------------------------------------
+
+4. Implement GCP Pub/Sub delivery channel — resolve WIF vs static SA key
+
+PubSubDeliveryChannel implements the same DeliveryChannel interface,
+publishing via com.google.cloud.pubsub.v1.Publisher. Currently scaffolded
+using Workload Identity Federation (OrinixPubSubCredentialsProvider, using
+zabra-aws's GoogleIdentityFederationAwsToken). Open decision, not yet
+made: WIF (more setup cost, no standing credential) vs a static GCP
+service-account key (matches pegleg's proven billing-publisher pattern,
+much lower setup cost for exactly one known consumer today). Full
+tradeoff writeup: orinix-why-and-how/2026-07-07_q7_cursor_idempotency_hmac_dlq_wif.txt.
+Status: Open — needs a decision before this channel can be considered final.
+
+------------------------------------------------------------------------
+
+5. Idempotency design — producer-minted event ID, end-to-end propagation
+
+The idempotency key is the CloudEvents envelope's own `id` (a UUID), minted
+once by the producing service, reused across that producer's own publish
+retries, and propagated unchanged through SNS -> SQS -> object_events
+(unique constraint) -> X-Habu-Event-Id header (webhook) -> should also be
+a Pub/Sub message attribute (not yet added to PubSubDeliveryChannel —
+see action item below). XMI (and any consumer) must dedupe on this ID,
+since delivery is at-least-once, never exactly-once.
+Status: Mostly done. Remaining: attach event ID as a Pub/Sub message
+attribute in PubSubDeliveryChannel so PUBSUB consumers can dedupe the same
+way webhook consumers do.
+
+------------------------------------------------------------------------
+
+6. DLQ handling + log-backed event replay
+
+DLQ is a separate SQS queue per consumer (e.g. sqs-habu-dlq-xmi), wired
+via SQS's native redrive policy (maxReceiveCount=5) — no custom
+application code for the routing itself. Replay has two tiers: SQS's own
+start-message-move-task action for recent failures (bounded by ~14-day
+queue retention), and a new ReplayService (reads directly from
+object_events, unbounded, reuses the same cursor query GetCleanroomEvents
+already uses) for reprocessing/backfill cases a queue-bounded redrive
+can't reach. CallbackDeliveryWorker refactored to expose a shared
+deliverToRegistration() method so live delivery and replay never diverge.
+Status: Done (code + design). Open: whether a delivery_log table is
+wanted for Habu-side observability/dedup on top of this (currently
+skipped for M1 — XMI-side dedup via event ID is the required correctness
+layer regardless).
+
+------------------------------------------------------------------------
+
+7. Provision AWS infra — SNS topic + SQS queues (Terraform)
+
+Needed: new SNS topic habu-observability-events (additive only — the
+existing operational hevent topic that drives picanmix/cronos must not be
+touched), SQS sqs-habu-observability-internal (ingest), SQS
+sqs-habu-delivery-xmi (per-consumer delivery, M1 has one static queue for
+the one known consumer, not dynamic per-registration provisioning), and a
+linked DLQ with redrive policy (maxReceiveCount=5) on the delivery queue.
+Status: Not started — this is infra/Terraform work, separate from the
+application code in LiveRamp/orinix#1.
+
+------------------------------------------------------------------------
+
+8. Wire external-api-server integration (gRPC client + REST endpoints)
+
+external-api-server needs one new grpc.client.orinix.address entry
+(application.yml) and @GrpcClient("orinix") injected wherever
+GetCleanroomEvents / RegisterCallback are called — identical pattern to
+every existing @GrpcClient("pegleg")/("forebitt")/("picanmix") call
+already in that codebase, confirmed via the existing global interceptors
+(JwtBearerInterceptor, RequestIdInterceptor) applying automatically, no
+new auth code needed on the caller side. REST endpoints to add:
+GET /v1/cleanrooms/{id}/events (cursor pull) and
+POST /v1/cleanrooms/{id}/callbacks (registration).
+Status: Not started.
+
+------------------------------------------------------------------------
+
+9. Confirm cross-team publisher dependency — unhygienix FLOW_RUN SNS publish
+
+FLOW and FLOW_RUN are owned by unhygienix (proto/flows.proto, db/flows.go,
+api/server/flows_*.go), which already has hank (the SNS publish library)
+in go.mod. An earlier assumption that cronos would publish FLOW_RUN events
+was wrong — cronos is a Quartz-based scheduler with no Flow/FlowRun domain
+code at all. No blocking gap was found, but this needs an explicit
+confirmation from whoever owns unhygienix that the ~3-line SNS publish
+addition for FLOW_RUN is actually planned/assigned, since XMI's flow-
+chaining use case depends specifically on this event firing.
+Status: Open — needs confirmation, not yet a confirmed commitment from
+the unhygienix owning team.
+
+------------------------------------------------------------------------
+
+10. Update Confluence design doc (idempotency, HMAC, delivery_config, schema, DLQ)
+
+Draft content already written, ready to paste in:
+aditya_observability_discussion/2026-07-07_confluence_update_draft.txt.
+Covers: delivery_type/delivery_config shape and dual-registration example,
+idempotency key generation/propagation contract, HMAC-SHA256 signing
+detail (symmetric, Stripe/GitHub-equivalent), DLQ/retry policy, and the
+object_events schema restated for completeness.
+Status: Draft ready, not yet pasted into the actual Confluence page.
+
+------------------------------------------------------------------------
+
+11. Decide migration tooling standard — Liquibase vs plain SQL
+
+The original design doc assumed Liquibase (matches unhygienix/Go
+convention — changelog.yaml), but neither pegleg nor cronos (the Java
+services orinix's shape is modeled on) use Liquibase — both apply plain
+versioned .sql files by hand. orinix's actual migrations
+(001_create_object_events.sql, 002_create_callback_registrations.sql) are
+plain SQL for now, matching the Java-fleet convention, but this was a
+judgment call, not a confirmed platform standard.
+Status: Open — flagged for Anil (Principal Architect) at LIDAC, not yet
+answered.
+
+------------------------------------------------------------------------
+
+12. Prepare and deliver LIDAC presentation
+
+Three Miro diagram prompt versions drafted (miro-prompt-july/), plus a
+full Q&A prep doc for Anil (Principal Architect) and the XMI team
+(orinix-working-principle/2026-07-06_lidac_prep_qa.txt), leading with the
+open tension between the originally-approved doc's delivery-phasing
+recommendation (Pull first, Webhook second, Pub/Sub "special-case only")
+and the actual Josh/XMI conclusion (webhook + Pub/Sub both in M1).
+Status: Materials ready. Open: the actual LIDAC session and resolving
+that phasing tension on the record.

@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>DV-13856 — Clean Room Observability</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#e6edf3;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+
+/* ── slide engine ── */
+.deck{flex:1;position:relative;overflow:hidden}
+.slide{position:absolute;inset:0;padding:56px 72px 48px;display:none;flex-direction:column;justify-content:flex-start;animation:fadein .35s ease}
+.slide.active{display:flex}
+@keyframes fadein{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+
+/* ── nav bar ── */
+nav{height:48px;background:#161b22;border-top:1px solid #30363d;display:flex;align-items:center;justify-content:center;gap:16px;flex-shrink:0}
+nav button{background:#21262d;color:#8b949e;border:1px solid #30363d;padding:6px 20px;border-radius:6px;cursor:pointer;font-size:13px;transition:all .2s}
+nav button:hover{background:#388bfd22;color:#58a6ff;border-color:#388bfd}
+#counter{color:#8b949e;font-size:13px;min-width:60px;text-align:center}
+
+/* ── type chips ── */
+.chip{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;letter-spacing:.5px;margin-bottom:6px}
+.chip-v1{background:#1f6feb33;color:#58a6ff;border:1px solid #1f6feb}
+.chip-v2{background:#e3672333;color:#f0883e;border:1px solid #e36723}
+.chip-v3{background:#2ea04333;color:#3fb950;border:1px solid #2ea043}
+.chip-arch{background:#8957e533;color:#d2a8ff;border:1px solid #8957e5}
+.chip-data{background:#db616133;color:#ff7b72;border:1px solid #db6161}
+
+/* ── headings ── */
+h1{font-size:42px;font-weight:700;line-height:1.15;margin-bottom:10px}
+h2{font-size:28px;font-weight:700;margin-bottom:6px}
+.sub{color:#8b949e;font-size:16px;margin-bottom:32px}
+.subtitle-big{font-size:20px;color:#8b949e;margin-bottom:36px;line-height:1.5}
+
+/* ── layout helpers ── */
+.cols{display:grid;gap:20px;flex:1}
+.cols-2{grid-template-columns:1fr 1fr}
+.cols-3{grid-template-columns:1fr 1fr 1fr}
+.cols-13{grid-template-columns:1fr 2fr}
+.cols-31{grid-template-columns:2fr 1fr}
+
+/* ── cards ── */
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px 24px}
+.card-v1{border-left:4px solid #58a6ff}
+.card-v2{border-left:4px solid #f0883e}
+.card-v3{border-left:4px solid #3fb950}
+.card-red{border-left:4px solid #ff7b72}
+.card-purple{border-left:4px solid #d2a8ff}
+.card h3{font-size:15px;font-weight:600;margin-bottom:10px}
+.card p,.card li{font-size:13px;color:#8b949e;line-height:1.7}
+.card ul{padding-left:16px}
+.card .tag{font-size:11px;color:#58a6ff;font-weight:600;margin-bottom:6px}
+.card .tag-o{color:#f0883e}
+.card .tag-g{color:#3fb950}
+.card .tag-p{color:#d2a8ff}
+.card .tag-r{color:#ff7b72}
+
+/* ── code blocks ── */
+pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:14px 18px;font-size:12px;font-family:'SF Mono','Fira Code',monospace;color:#e6edf3;overflow-x:auto;line-height:1.6;flex-shrink:0}
+code{font-family:'SF Mono','Fira Code',monospace;font-size:12px}
+.hl-blue{color:#79c0ff}
+.hl-green{color:#7ee787}
+.hl-orange{color:#ffa657}
+.hl-red{color:#ff7b72}
+.hl-purple{color:#d2a8ff}
+.hl-gray{color:#8b949e}
+
+/* ── flow diagram ── */
+.flow{display:flex;flex-direction:column;align-items:flex-start;gap:0}
+.fbox{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 16px;font-size:12px;min-width:220px}
+.farrow{color:#8b949e;font-size:18px;margin:4px 0 4px 30px;line-height:1}
+.farrow-label{font-size:11px;color:#8b949e;margin-left:12px}
+
+/* ── table ── */
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{background:#21262d;color:#8b949e;padding:8px 12px;text-align:left;font-weight:600;border-bottom:1px solid #30363d}
+td{padding:8px 12px;border-bottom:1px solid #21262d;color:#e6edf3}
+tr:last-child td{border-bottom:none}
+.td-v1{color:#58a6ff;font-weight:600}
+.td-v2{color:#f0883e;font-weight:600}
+.td-v3{color:#3fb950;font-weight:600}
+
+/* ── badge ── */
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
+.b-new{background:#1f6feb33;color:#58a6ff}
+.b-extend{background:#2ea04333;color:#3fb950}
+.b-infra{background:#8957e533;color:#d2a8ff}
+
+/* ── sprint bar ── */
+.sprint-bar{display:flex;gap:0;border-radius:8px;overflow:hidden;height:44px;margin-top:auto}
+.sp{display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600}
+.sp-v1{background:#1f6feb;flex:2}
+.sp-v2{background:#e36723;flex:3}
+.sp-v3{background:#2ea043;flex:2}
+
+/* ── arch diagram ── */
+.arch{background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:18px;font-family:'SF Mono','Fira Code',monospace;font-size:11px;line-height:1.7;flex:1;overflow-y:auto;white-space:pre}
+
+/* ── big number ── */
+.stat{font-size:40px;font-weight:700;line-height:1}
+.stat-label{font-size:13px;color:#8b949e;margin-top:4px}
+
+/* ── title slide ── */
+.title-slide{justify-content:center}
+.title-slide h1{font-size:52px}
+.divider{height:2px;background:linear-gradient(90deg,#1f6feb,#e36723,#2ea043);border-radius:2px;margin:24px 0}
+.meta-row{display:flex;gap:32px;margin-top:16px}
+.meta-item{font-size:13px;color:#8b949e}
+.meta-item span{color:#e6edf3;font-weight:600}
+
+/* ── highlight box ── */
+.hbox{background:#1f6feb11;border:1px solid #1f6feb44;border-radius:8px;padding:12px 16px;font-size:13px;margin-top:auto}
+.hbox-o{background:#e3672311;border-color:#e3672344}
+.hbox-g{background:#2ea04311;border-color:#2ea04344}
+</style>
+</head>
+<body>
+
+<div class="deck">
+
+<!-- ═══════ SLIDE 1 — TITLE ═══════ -->
+<div class="slide active title-slide">
+  <div class="chip chip-arch">CFI-1388 · DV-13856</div>
+  <h1>Clean Room<br>Observability &amp;<br>Callback Registration</h1>
+  <div class="divider"></div>
+  <p class="subtitle-big">Platform-grade event delivery backbone for Habu.<br>V1 ships an Activity Feed to every user. V2 adds push webhooks.<br>V3 hardens it for enterprise.</p>
+  <div class="meta-row">
+    <div class="meta-item">Author <span>Aditya Bhardwaj</span></div>
+    <div class="meta-item">Ticket <span>DV-13856</span></div>
+    <div class="meta-item">Initiative <span>CFI-1388 — Clean Rooms Feel Like Enterprise Software</span></div>
+    <div class="meta-item">Date <span>May 2026</span></div>
+  </div>
+  <div class="sprint-bar" style="margin-top:40px">
+    <div class="sp sp-v1">V1 · Sprints 1–2</div>
+    <div class="sp sp-v2">V2 · Sprints 3–5</div>
+    <div class="sp sp-v3">V3 · Sprints 6–7</div>
+  </div>
+</div>
+
+<!-- ═══════ SLIDE 2 — PROBLEM ═══════ -->
+<div class="slide">
+  <div class="chip chip-data">PROBLEM</div>
+  <h2>Clean room objects change silently</h2>
+  <p class="sub">External systems (XMI UI, customer integrations) hold references to Questions, Data Connections, Exports. When state changes, those references go stale with no notification.</p>
+  <div class="cols cols-3" style="flex:1">
+    <div class="card card-red">
+      <div class="tag tag-r">QUESTION</div>
+      <h3>Output columns removed</h3>
+      <p>A question's dimensions change from 5 columns to 3. XMI's dashboard was built expecting all 5. Breaks silently — no warning sent.</p>
+      <ul style="margin-top:10px">
+        <li>Dataset assignments swapped</li>
+        <li>Question renamed or deleted</li>
+        <li>Status DRAFT → PUBLISHED</li>
+      </ul>
+    </div>
+    <div class="card card-red">
+      <div class="tag tag-r">DATA CONNECTION</div>
+      <h3>Field type changed</h3>
+      <p>purchase_count changes from Integer to String. SQL using SUM(purchase_count) now fails at runtime. Schema consumers have no advance notice.</p>
+      <ul style="margin-top:10px">
+        <li>Field added or removed</li>
+        <li>Data connection deleted</li>
+        <li>Any question referencing it breaks</li>
+      </ul>
+    </div>
+    <div class="card card-red">
+      <div class="tag tag-r">EXPORT / FLOW</div>
+      <h3>Status invisible to integrations</h3>
+      <p>Export job completion, failure, or configuration changes are not pushed to anyone. External systems poll repeatedly to detect state.</p>
+      <ul style="margin-top:10px">
+        <li>99% of polls return "no change"</li>
+        <li>Wasted API calls, compute, network</li>
+        <li>Reactive posture — not enterprise</li>
+      </ul>
+    </div>
+  </div>
+  <div class="hbox" style="margin-top:16px">
+    Two audiences need different solutions: <strong style="color:#58a6ff">Human users</strong> need an audit trail UI. <strong style="color:#f0883e">Programmatic systems</strong> (XMI, SafeHaven) need push webhooks.
+  </div>
+</div>
+
+<!-- ═══════ SLIDE 3 — V1 OVERVIEW ═══════ -->
+<div class="slide">
+  <div class="chip chip-v1">V1 · SPRINTS 1–2</div>
+  <h2>Activity Feed UI — Audit Trail for Every User</h2>
+  <p class="sub">One interceptor. One table. One new API. Ships value to every Habu user with zero setup required.</p>
+  <div class="cols cols-13" style="flex:1;gap:24px">
+    <div style="display:flex;flex-direction:column;gap:16px">
+      <div class="card card-v1">
+        <div class="tag">NEW TABLE</div>
+        <h3>object_events (PostgreSQL)</h3>
+        <p>Written atomically inside the same DB transaction as the mutation. If the delete rolls back, the event row rolls back too. Append-only — never updated.</p>
+        <pre style="margin-top:10px"><span class="hl-gray">event_id</span>      UUID
+<span class="hl-gray">cleanroom_id</span>  UUID
+<span class="hl-gray">object_type</span>   QUESTION | DATA_CONNECTION
+<span class="hl-gray">event_type</span>    UPDATED | DELETED | CREATED
+<span class="hl-gray">changed_fields</span> JSONB
+<span class="hl-gray">performed_by</span>  sarah@acme.com
+<span class="hl-gray">event_time</span>    2026-05-12T10:32:00Z</pre>
+      </div>
+      <div class="card card-v1">
+        <div class="tag">NEW API</div>
+        <h3>GET /cleanrooms/{id}/events</h3>
+        <p>Cursor-based. Filterable by objectType, since timestamp, performedBy. Also usable by XMI as a polling upgrade — no webhook server needed on XMI side.</p>
+      </div>
+    </div>
+    <div class="card card-v1" style="padding:0;overflow:hidden">
+      <div style="background:#21262d;padding:10px 16px;font-size:12px;color:#8b949e;font-weight:600;border-bottom:1px solid #30363d">
+        Clean Room: Acme Corp × LiveRamp · Activity Tab
+      </div>
+      <div style="padding:14px 16px;font-size:12px;font-family:'SF Mono','Fira Code',monospace">
+        <div style="background:#21262d;border-radius:6px;padding:6px 10px;margin-bottom:12px;color:#8b949e;font-size:11px">
+          Filter: [All Types ▾]  [All Users ▾]  [Last 30 days ▾]
+        </div>
+        <div style="border-left:3px solid #58a6ff;padding:8px 12px;margin-bottom:10px;background:#1f6feb11;border-radius:0 6px 6px 0">
+          <div style="color:#58a6ff;font-size:11px;font-weight:600">QUESTION UPDATED</div>
+          <div style="color:#e6edf3;font-size:12px;margin:3px 0">"Revenue Analysis" — columns removed</div>
+          <div style="color:#8b949e;font-size:11px">Removed: customer_segment, channel &nbsp;·&nbsp; sarah@acme.com &nbsp;·&nbsp; 2026-05-12 14:32</div>
+        </div>
+        <div style="border-left:3px solid #f0883e;padding:8px 12px;margin-bottom:10px;background:#e3672311;border-radius:0 6px 6px 0">
+          <div style="color:#f0883e;font-size:11px;font-weight:600">DATA CONNECTION UPDATED</div>
+          <div style="color:#e6edf3;font-size:12px;margin:3px 0">"CRM_Import" — field type changed</div>
+          <div style="color:#8b949e;font-size:11px">purchase_count: Integer → String &nbsp;·&nbsp; john@acme.com &nbsp;·&nbsp; 2026-05-12 11:15</div>
+        </div>
+        <div style="border-left:3px solid #ff7b72;padding:8px 12px;margin-bottom:10px;background:#db616111;border-radius:0 6px 6px 0">
+          <div style="color:#ff7b72;font-size:11px;font-weight:600">QUESTION DELETED</div>
+          <div style="color:#e6edf3;font-size:12px;margin:3px 0">"Lookalike Segments" — permanently deleted</div>
+          <div style="color:#8b949e;font-size:11px">admin@liveramp.com &nbsp;·&nbsp; 2026-05-11 16:45</div>
+        </div>
+        <div style="border-left:3px solid #3fb950;padding:8px 12px;background:#2ea04311;border-radius:0 6px 6px 0">
+          <div style="color:#3fb950;font-size:11px;font-weight:600">QUESTION UPDATED</div>
+          <div style="color:#e6edf3;font-size:12px;margin:3px 0">"Attribution Model" — dataset swapped</div>
+          <div style="color:#8b949e;font-size:11px">Q1_Sales_2026 → Q2_Sales_2026 &nbsp;·&nbsp; sarah@acme.com &nbsp;·&nbsp; 2026-05-11 09:00</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ SLIDE 4 — V2 OVERVIEW ═══════ -->
+<div class="slide">
+  <div class="chip chip-v2">V2 · SPRINTS 3–5</div>
+  <h2>Webhook Callback Delivery — Push to Programmatic Consumers</h2>
+  <p class="sub">XMI registers once. Habu calls XMI automatically on every change. No polling. No missed updates.</p>
+  <div class="cols cols-2" style="flex:1;gap:24px">
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card card-v2">
+        <div class="tag tag-o">NEW TABLE — callback_registrations</div>
+        <pre><span class="hl-gray">id</span>              cb-456
+<span class="hl-gray">cleanroom_id</span>    cr-abc
+<span class="hl-gray">object_type</span>     QUESTION  <span class="hl-gray">(or ALL)</span>
+<span class="hl-gray">object_id</span>       NULL  <span class="hl-gray">← all questions in CR</span>
+<span class="hl-gray">callback_url</span>    https://xmi.../habu-events
+<span class="hl-gray">signing_secret</span>  whsec_a3f9...  <span class="hl-gray">(encrypted)</span></pre>
+      </div>
+      <div class="card card-v2">
+        <div class="tag tag-o">NEW TABLE — delivery_log</div>
+        <pre><span class="hl-gray">event_id</span>        evt-789
+<span class="hl-gray">registration_id</span> cb-456
+<span class="hl-gray">attempt_number</span>  1
+<span class="hl-gray">http_status</span>     200
+<span class="hl-gray">response_ms</span>     45
+<span class="hl-gray">delivered_at</span>    2026-05-12T10:32:15Z</pre>
+      </div>
+      <div class="card card-v2">
+        <div class="tag tag-o">NEW — Callback Delivery Worker (Java)</div>
+        <p>Reads SQS → looks up callback_registrations → builds payload → HMAC signs → POSTs → writes delivery_log → ACKs SQS</p>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card card-v2">
+        <div class="tag tag-o">REGISTRATION API</div>
+        <pre><span class="hl-blue">POST</span> /cleanrooms/{crId}/callbacks
+{
+  <span class="hl-orange">"objectType"</span>: <span class="hl-green">"QUESTION"</span>,
+  <span class="hl-orange">"objectId"</span>: <span class="hl-gray">null</span>,  <span class="hl-gray">// all questions</span>
+  <span class="hl-orange">"callbackUrl"</span>: <span class="hl-green">"https://xmi.../habu-events"</span>,
+  <span class="hl-orange">"authConfig"</span>: { <span class="hl-orange">"authType"</span>: <span class="hl-green">"BEARER"</span> }
+}</pre>
+      </div>
+      <div class="card card-v2">
+        <div class="tag tag-o">WHAT XMI RECEIVES</div>
+        <pre><span class="hl-blue">POST</span> https://xmi.../habu-events
+<span class="hl-gray">X-Habu-Signature: sha256=a3f9...</span>
+<span class="hl-gray">X-Habu-Event-Id: evt-789</span>
+{
+  <span class="hl-orange">"eventType"</span>: <span class="hl-green">"UPDATED"</span>,
+  <span class="hl-orange">"objectName"</span>: <span class="hl-green">"Revenue Analysis"</span>,
+  <span class="hl-orange">"changedFields"</span>: {
+    <span class="hl-orange">"dimensions"</span>: {
+      <span class="hl-orange">"removed"</span>: [<span class="hl-green">"customer_segment"</span>]
+    }
+  },
+  <span class="hl-orange">"changedBy"</span>: <span class="hl-green">"sarah@acme.com"</span>
+}</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ SLIDE 5 — V2 DELIVERY FLOW ═══════ -->
+<div class="slide">
+  <div class="chip chip-v2">V2 · DELIVERY INTERNALS</div>
+  <h2>Worker Flow — From SQS to XMI Endpoint</h2>
+  <p class="sub">Every step is deliberate. Write before ACK. Check before POST. Circuit break on sustained failure.</p>
+  <div class="cols cols-2" style="flex:1;gap:24px">
+    <div class="card" style="font-family:'SF Mono','Fira Code',monospace;font-size:12px;line-height:2">
+      <div style="color:#8b949e;font-size:11px;font-weight:600;margin-bottom:12px">CALLBACK DELIVERY WORKER — STEP BY STEP</div>
+      <div><span style="color:#f0883e">1.</span> <span style="color:#e6edf3">receiveMessage(SQS)</span> <span style="color:#8b949e">← visibility timeout 30s starts</span></div>
+      <div><span style="color:#f0883e">2.</span> <span style="color:#e6edf3">CHECK delivery_log</span> <span style="color:#8b949e">← already delivered? skip</span></div>
+      <div><span style="color:#f0883e">3.</span> <span style="color:#e6edf3">query callback_registrations</span> <span style="color:#8b949e">← find cb-456</span></div>
+      <div><span style="color:#f0883e">4.</span> <span style="color:#e6edf3">build JSON payload</span> <span style="color:#8b949e">← from event</span></div>
+      <div><span style="color:#f0883e">5.</span> <span style="color:#e6edf3">HMAC-SHA256(secret, body)</span> <span style="color:#8b949e">← X-Habu-Signature</span></div>
+      <div><span style="color:#f0883e">6.</span> <span style="color:#e6edf3">circuitBreaker.check(url)</span></div>
+      <div style="padding-left:20px"><span style="color:#3fb950">CLOSED</span> <span style="color:#8b949e">→ proceed &nbsp;&nbsp;</span><span style="color:#ff7b72">OPEN</span> <span style="color:#8b949e">→ fail fast (no HTTP)</span></div>
+      <div><span style="color:#f0883e">7.</span> <span style="color:#e6edf3">HTTP POST to callback URL</span></div>
+      <div><span style="color:#f0883e">8.</span> <span style="color:#e6edf3">WRITE delivery_log</span> <span style="color:#8b949e">← BEFORE ACK ← critical order</span></div>
+      <div><span style="color:#f0883e">9.</span> <span style="color:#e6edf3">deleteMessage(SQS)</span> <span style="color:#8b949e">← ACK</span></div>
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid #30363d">
+        <div><span style="color:#ff7b72">FAILURE PATH:</span></div>
+        <div style="color:#8b949e">retry 1s → 5s → 30s → max retries → DLQ</div>
+        <div style="color:#8b949e">DLQ → CloudWatch alarm → PagerDuty</div>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card card-v2">
+        <div class="tag tag-o">ACK EXPLAINED</div>
+        <h3>ACK = deleteMessage() — explicit, not automatic</h3>
+        <p>Reading from SQS only hides the message for 30s (visibility timeout). It is NOT deleted. You must call deleteMessage() to permanently remove it. If worker crashes before ACK, message reappears and is retried. This is the safety net.</p>
+      </div>
+      <div class="card card-v2">
+        <div class="tag tag-o">CIRCUIT BREAKER — 3 STATES</div>
+        <h3>Resilience4j — one annotation in Java</h3>
+        <p style="margin-bottom:8px">CLOSED → normal, calling endpoint on every event</p>
+        <p style="margin-bottom:8px">OPEN → 5+ consecutive failures, stop calling for 60s, fail fast, free worker threads</p>
+        <p>HALF-OPEN → try 1 call after cooldown, if 200 → CLOSED, if 5xx → OPEN again</p>
+      </div>
+      <div class="card card-v2">
+        <div class="tag tag-o">FAN-OUT</div>
+        <h3>One SNS topic → N independent queues</h3>
+        <p>XMI has SQS-XMI. SafeHaven has SQS-SafeHaven. Each queue is independent — XMI being down does not delay SafeHaven. Adding new consumer = new SQS subscription. Zero code change to unhygienix.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ SLIDE 6 — V3 ═══════ -->
+<div class="slide">
+  <div class="chip chip-v3">V3 · SPRINTS 6–7</div>
+  <h2>Production Hardening — Enterprise-Grade</h2>
+  <p class="sub">No new tables. Extends existing delivery worker and adds a Webhooks UI tab. Makes the system provably correct, observable, and self-serviceable.</p>
+  <div class="cols cols-3" style="flex:1;gap:16px">
+    <div class="card card-v3">
+      <div class="tag tag-g">SECURITY</div>
+      <h3>HMAC Signature Verification</h3>
+      <p>X-Habu-Signature: sha256=... on every outbound POST. Per-registration secret — XMI's secret is different from SafeHaven's. Timestamp header prevents replay attacks. XMI verifies on receipt — rejects if mismatch.</p>
+    </div>
+    <div class="card card-v3">
+      <div class="tag tag-g">RESILIENCE</div>
+      <h3>DLQ Admin UI + Replay</h3>
+      <p>New Webhooks tab in clean room UI. Shows delivery status per registration — green/red, last delivered, success rate. DLQ panel lists failed messages with one-click Replay button. Moves message back to main SQS queue.</p>
+    </div>
+    <div class="card card-v3">
+      <div class="tag tag-g">OBSERVABILITY</div>
+      <h3>Delivery Metrics Dashboard</h3>
+      <p>CloudWatch metrics: delivery success count, failure count, latency histogram, DLQ depth, circuit open count — all by registration and endpoint. Alarm on DLQ depth &gt; 0 → PagerDuty.</p>
+    </div>
+    <div class="card card-v3">
+      <div class="tag tag-g">TESTING</div>
+      <h3>Webhook Test Endpoint</h3>
+      <p>POST /callbacks/{id}/test — sends a synthetic event to the registered URL immediately. Returns http_status, response_time_ms, success flag. XMI can validate their endpoint is reachable before going live.</p>
+    </div>
+    <div class="card card-v3">
+      <div class="tag tag-g">REPLAY</div>
+      <h3>Event Replay API</h3>
+      <p>GET /cleanrooms/{id}/events/{eventId}/replay — re-delivers a specific event from the object_events table to all registered callbacks. For missed or failed deliveries. Queries the durable log, not the queue.</p>
+    </div>
+    <div class="card card-v3">
+      <div class="tag tag-g">IDEMPOTENCY</div>
+      <h3>At-least-once + Dedup</h3>
+      <p>SQS guarantees at-least-once. X-Habu-Event-Id header on every POST lets XMI deduplicate. Worker checks delivery_log before POSTing — if already delivered, skip POST, ACK SQS. Two-layer defence.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ SLIDE 7 — TABLES INVENTORY ═══════ -->
+<div class="slide">
+  <div class="chip chip-data">DATA MODEL</div>
+  <h2>Three New Tables — Complete Inventory</h2>
+  <p class="sub">V1 adds one table. V2 adds two. V3 adds none. All in unhygienix DB via Flyway migrations.</p>
+  <div style="display:flex;flex-direction:column;gap:16px;flex:1">
+    <table>
+      <thead>
+        <tr><th>Table</th><th>Version</th><th>Purpose</th><th>Key Fields</th><th>Writes</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td style="font-family:monospace;color:#58a6ff">object_events</td>
+          <td><span class="td-v1">V1</span></td>
+          <td>Atomic audit log of all mutations. Powers Activity Feed UI.</td>
+          <td style="font-family:monospace;font-size:11px">event_id, object_type, event_type, changed_fields JSONB, performed_by</td>
+          <td>unhygienix interceptor — inside transaction</td>
+        </tr>
+        <tr>
+          <td style="font-family:monospace;color:#f0883e">callback_registrations</td>
+          <td><span class="td-v2">V2</span></td>
+          <td>Stores registered callback URLs, auth config, signing secrets per cleanroom.</td>
+          <td style="font-family:monospace;font-size:11px">cleanroom_id, object_type, object_id, callback_url, signing_secret</td>
+          <td>POST /callbacks API — external-api-server</td>
+        </tr>
+        <tr>
+          <td style="font-family:monospace;color:#f0883e">delivery_log</td>
+          <td><span class="td-v2">V2</span></td>
+          <td>Records every HTTP delivery attempt. Powers idempotency check and V3 UI.</td>
+          <td style="font-family:monospace;font-size:11px">registration_id, event_id, attempt_number, http_status, response_ms, failure_reason</td>
+          <td>Callback Delivery Worker — before ACK</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="cols cols-3" style="gap:16px">
+      <div class="card card-v1">
+        <div class="tag">V1 — object_events write pattern</div>
+        <pre><span class="hl-gray">BEGIN TRANSACTION</span>
+  <span class="hl-orange">doDelete</span>(questionId)
+  <span class="hl-blue">INSERT INTO</span> object_events (...)
+<span class="hl-gray">COMMIT</span>  <span class="hl-gray">← both atomic</span></pre>
+      </div>
+      <div class="card card-v2">
+        <div class="tag tag-o">V2 — SNS publish after commit</div>
+        <pre><span class="hl-gray">-- after COMMIT --</span>
+<span class="hl-blue">IF</span> callbacksExist(objectId):
+  sns.<span class="hl-orange">publish</span>(event)  <span class="hl-gray">← async 1ms</span>
+  <span class="hl-gray">→ SQS → Worker → POST</span></pre>
+      </div>
+      <div class="card card-v2">
+        <div class="tag tag-o">V2 — worker write order</div>
+        <pre><span class="hl-orange">POST</span> to callback URL
+<span class="hl-blue">WRITE</span> delivery_log  <span class="hl-gray">← first</span>
+<span class="hl-orange">deleteMessage</span>(SQS)  <span class="hl-gray">← then ACK</span>
+<span class="hl-gray">-- crash-safe order --</span></pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ SLIDE 8 — FULL ARCHITECTURE ═══════ -->
+<div class="slide">
+  <div class="chip chip-arch">COMBINED ARCHITECTURE</div>
+  <h2>Full Platform-Grade Design — V1 + V2 + V3</h2>
+  <p class="sub">Single interceptor. Two consumers. N downstream systems. One SNS backbone.</p>
+  <div class="arch" style="flex:1">
+<span style="color:#8b949e">┌─────────────────── HABU PLATFORM ────────────────────────────────────────────────────────┐</span>
+<span style="color:#8b949e">│</span>                                                                                          <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>  <span style="color:#79c0ff">unhygienix</span>          <span style="color:#79c0ff">moonraker/conn</span>          <span style="color:#79c0ff">cronos/picanmix</span>                           <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>  Question mutation   DC mutation             Export mutation                            <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>        │                   │                       │                                     <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>        └───────────────────┴───────────────────────┘                                     <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                            │                                                             <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>              ┌─────────────▼─────────────┐                                               <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>              │  <span style="color:#d2a8ff">CRUD Interceptor Layer</span>    │                                               <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>              │  snapshot → diff → event  │                                               <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>              └────┬──────────────────┬───┘                                               <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>  [IN TRANSACTION] │              [POST COMMIT async]                                     <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                   ▼                   │                                                  <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>          <span style="color:#58a6ff">object_events</span>                  ▼                                                  <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>          table (V1)         <span style="color:#ffa657">SNS habu-object-events</span>                                      <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>               │                   │         │         │                                  <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>          UI reads           SQS-XMI  SQS-SH  SQS-Future  ← fan-out, each independent    <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>          Activity Feed          │                                                        <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>          GET /events             ▼                                                        <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                         <span style="color:#ffa657">Delivery Worker (Java)</span>                                          <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                         1. read callback_registrations                                   <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                         2. build payload                                                  <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                         3. HMAC-SHA256 sign  (V3)                                        <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                         4. circuit breaker check  (V3)                                   <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                         5. HTTP POST                                                      <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                         6. write delivery_log → ACK SQS                                  <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                              │           │                                                <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                           200 OK    failure: retry 1s→5s→30s→ <span style="color:#ff7b72">DLQ</span>                       <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                                                       <span style="color:#ff7b72">DLQ</span> → CloudWatch → PagerDuty      <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">│</span>                                                       <span style="color:#ff7b72">DLQ</span> → <span style="color:#3fb950">Admin UI Replay (V3)</span>          <span style="color:#8b949e">│</span>
+<span style="color:#8b949e">└──────────────────────────────────────────────────────────────────────────────────────────┘</span>
+         │                     │                    │
+         ▼                     ▼                    ▼
+    <span style="color:#ffa657">XMI UI</span>              <span style="color:#ffa657">SafeHaven</span>          <span style="color:#ffa657">Future Customer</span>
+    verifies HMAC        own queue           self-serve register
+    updates UI           unaffected by XMI   zero infra change
+  </div>
+</div>
+
+<!-- ═══════ SLIDE 9 — ROADMAP ═══════ -->
+<div class="slide">
+  <div class="chip chip-arch">DELIVERY ROADMAP</div>
+  <h2>Sprint Plan — V1 → V2 → V3</h2>
+  <p class="sub">Ship V1 in 2 sprints to every user. V2 adds webhooks for programmatic consumers. V3 hardens for enterprise.</p>
+  <div style="display:flex;flex-direction:column;gap:14px;flex:1">
+    <div class="card card-v1">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div><span class="chip chip-v1">SPRINT 1–2</span> &nbsp; <strong>V1 — Activity Feed UI</strong></div>
+        <div style="font-size:12px;color:#8b949e">1 new table · 1 new API · UI changes only</div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <span class="badge b-new">DB migration: object_events</span>
+        <span class="badge b-new">CRUD interceptors (unhygienix)</span>
+        <span class="badge b-new">Field differ — JSONB diff</span>
+        <span class="badge b-new">GET /events API (external-api-server)</span>
+        <span class="badge b-new">Activity Feed tab (Frontend)</span>
+      </div>
+    </div>
+    <div class="card card-v2">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div><span class="chip chip-v2">SPRINT 3–5</span> &nbsp; <strong>V2 — Webhook Callback Delivery</strong></div>
+        <div style="font-size:12px;color:#8b949e">2 new tables · 4 new APIs · new service · infra</div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <span class="badge b-new">DB migration: callback_registrations</span>
+        <span class="badge b-new">DB migration: delivery_log</span>
+        <span class="badge b-infra">SNS topic + SQS queues + DLQs</span>
+        <span class="badge b-infra">CloudWatch alarm on DLQ depth</span>
+        <span class="badge b-extend">SNS publish in V1 interceptors</span>
+        <span class="badge b-new">Callback CRUD APIs (external-api-server)</span>
+        <span class="badge b-new">Proto defs (ignoramus)</span>
+        <span class="badge b-new">Callback Delivery Worker — Java service</span>
+      </div>
+    </div>
+    <div class="card card-v3">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div><span class="chip chip-v3">SPRINT 6–7</span> &nbsp; <strong>V3 — Production Hardening</strong></div>
+        <div style="font-size:12px;color:#8b949e">0 new tables · 3 new APIs · UI additions</div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <span class="badge b-extend">HMAC signing in delivery worker</span>
+        <span class="badge b-extend">Circuit breaker — Resilience4j</span>
+        <span class="badge b-extend">Per-field subscription filter</span>
+        <span class="badge b-new">Webhook test API</span>
+        <span class="badge b-new">DLQ replay API</span>
+        <span class="badge b-new">Event replay API</span>
+        <span class="badge b-new">Webhooks UI tab — delivery status + replay</span>
+      </div>
+    </div>
+    <div class="sprint-bar">
+      <div class="sp sp-v1">V1 · 2 Sprints · All users</div>
+      <div class="sp sp-v2">V2 · 3 Sprints · XMI + programmatic consumers</div>
+      <div class="sp sp-v3">V3 · 2 Sprints · Enterprise hardening</div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<nav>
+  <button onclick="go(-1)">← Prev</button>
+  <span id="counter">1 / 9</span>
+  <button onclick="go(1)">Next →</button>
+</nav>
+
+<script>
+let cur=0;
+const slides=document.querySelectorAll('.slide');
+function go(d){
+  slides[cur].classList.remove('active');
+  cur=(cur+d+slides.length)%slides.length;
+  slides[cur].classList.add('active');
+  document.getElementById('counter').textContent=(cur+1)+' / '+slides.length;
+}
+document.addEventListener('keydown',e=>{
+  if(e.key==='ArrowRight'||e.key==='ArrowDown')go(1);
+  if(e.key==='ArrowLeft'||e.key==='ArrowUp')go(-1);
+});
+</script>
+</body>
+</html>

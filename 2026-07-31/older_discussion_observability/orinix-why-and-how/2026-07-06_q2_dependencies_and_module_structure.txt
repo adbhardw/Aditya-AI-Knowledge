@@ -1,0 +1,165 @@
+Q2 — pom.xml dependencies, module structure, and the extensibility pattern
+Date: 2026-07-06
+Status: OPEN — draft grounded in pegleg/cronos's actual poms, needs your confirmation
+
+------------------------------------------------------------------------
+
+WHAT GOES IN THE pom.xml (every line traced to something already proven,
+not guessed)
+
+  Web/RPC layer:
+    org.springframework.boot:spring-boot-starter-web
+      -> pegleg-server and cronos both use this
+    net.devh:grpc-spring-boot-starter
+      -> this is literally where @GrpcClient / @GrpcService come from;
+         confirmed dependency in both pegleg-server and cronos poms
+    io.grpc:grpc-protobuf, io.grpc:grpc-stub
+      -> standard gRPC codegen support, same as every -proto module
+
+  Persistence:
+    org.springframework.boot:spring-boot-starter-data-jpa
+    org.springframework.boot:spring-boot-starter-jdbc
+    org.postgresql:postgresql
+      -> confirmed in cronos's pom exactly this way
+
+  SQS consumption (the thing we're reusing from pegleg):
+    org.springframework.cloud:spring-cloud-starter-aws-messaging
+      -> confirmed: pegleg's AWSSQSConfiguration.java uses
+         org.springframework.cloud.aws.messaging.config.annotation.EnableSqs,
+         SimpleMessageListenerContainerFactory, QueueMessagingTemplate,
+         backed by com.amazonaws.services.sqs.AmazonSQSAsync (AWS SDK v1,
+         not v2 — matching what pegleg already runs, not introducing a
+         second AWS SDK generation into the org)
+
+  GCP Pub/Sub publish (the SDK you asked to reuse):
+    com.google.cloud:google-cloud-pubsub
+      -> confirmed: this exact artifact is a direct dependency in
+         pegleg-backend/pom.xml already, used by
+         BillingMessagePublisherHelper.getPublisher()
+
+  Cross-cloud auth + calling other Habu services:
+    com.habu.zabra:zabra-aws
+      -> already contains GoogleIdentityFederationAwsToken (the WIF class)
+    com.habu.zabra:zabra-grpc-client
+      -> gives orinix the same easy client pattern pegleg uses for
+         UnhygienixClient / MoonrakerClient / PrimageClient, if/when orinix
+         needs to call out (e.g. resolving org info, or org validation)
+
+  Misc (same as every other Java service here):
+    lombok, jackson (transitively via spring-boot-starter-web)
+
+  OPEN SUB-QUESTION — migration tooling:
+    The original June design doc said "object_events + Liquibase migration."
+    Checked: neither pegleg nor cronos use Liquibase — they apply plain
+    versioned .sql files by hand (cronos/data/db/*.sql). Liquibase (YAML
+    changelog + data_migrations folder) is the convention I found in
+    unhygienix (Go), not in the Java services. That design doc line may
+    have been written with a Go mental model before language was decided.
+    Flagging rather than silently picking one — do we match Java's existing
+    convention (plain SQL, simpler, consistent with pegleg/cronos) or
+    introduce Liquibase into the Java fleet for this one service?
+
+------------------------------------------------------------------------
+
+MODULE STRUCTURE (mirrors pegleg's own multi-module split, which is itself
+consistency with an existing pattern, not a new idea)
+
+  orinix/
+  ├── orinix-proto/          published stub jar, same convention as every
+  │                          other "<service>-proto" artifact (unhygienix-
+  │                          proto, gangway-proto, moonraker-proto) —
+  │                          RecordObjectEvent, GetCleanroomEvents,
+  │                          CallbackRegistration RPCs
+  ├── orinix-backend/        domain logic, no Spring Boot app here — mirrors
+  │                          pegleg-backend's role as the "library" module
+  │   ├── ingest/            SqsEventConsumer, idempotent write to
+  │   │                      object_events
+  │   ├── delivery/          DeliveryChannel interface + WebhookDeliveryChannel
+  │   │                      + PubSubDeliveryChannel (see pattern below)
+  │   ├── registration/      CallbackRegistrationService — validates and
+  │   │                      persists callback_registrations rows
+  │   └── db/                JPA entities + migrations
+  └── orinix-server/         Spring Boot app — mirrors pegleg-server: wires
+                             the gRPC server, the SQS listener config, the
+                             REST controller for POST /v1/cleanrooms/{id}/callbacks,
+                             and the CallbackDeliveryWorker as a scheduled/
+                             triggered job
+
+------------------------------------------------------------------------
+
+THE DESIGN PATTERN FOR EXTENSIBILITY: STRATEGY, RESOLVED BY SPRING'S
+QUALIFIER MAP — not a new idea, just naming what we already sketched
+
+You asked for the best pattern so this is extensible for future delivery
+mechanisms (and future event types). DeliveryChannel, as already designed
+in the working-principle doc, IS the Strategy pattern: one interface,
+interchangeable implementations, selected at runtime. What's worth adding
+now is HOW it gets selected, because that choice is either clean or a pile
+of if/else:
+
+  public interface DeliveryChannel {
+      String deliveryType();                      // "WEBHOOK", "PUBSUB", ...
+      DeliveryResult deliver(CallbackRegistration reg, ObjectEvent event);
+  }
+
+  @Component("WEBHOOK")
+  public class WebhookDeliveryChannel implements DeliveryChannel { ... }
+
+  @Component("PUBSUB")
+  public class PubSubDeliveryChannel implements DeliveryChannel { ... }
+
+  // Spring auto-collects every DeliveryChannel bean into a Map keyed by
+  // its @Component name — no factory class to hand-maintain, no switch
+  // statement to extend every time a new channel shows up.
+  @Service
+  public class CallbackDeliveryWorker {
+      private final Map<String, DeliveryChannel> channelsByType;   // injected
+      void deliver(CallbackRegistration reg, ObjectEvent event) {
+          channelsByType.get(reg.getDeliveryType()).deliver(reg, event);
+      }
+  }
+
+Adding a third mechanism later (say, Azure Service Bus for a future MSFT
+consumer) means writing one new @Component class and nothing else —
+CallbackDeliveryWorker, the registration API, and the ingest path are all
+already closed to that change.
+
+Why this is the "best" pattern here rather than something fancier
+(event bus, plugin loader, etc.) — GENERAL-PURPOSE MODULES (ch. 5): the
+book's warning is to build the socket wrench, not fifty single-size
+wrenches, but also not to over-generalize past what the problem needs.
+Strategy + Spring's own DI container is exactly general enough for
+"N delivery mechanisms, chosen per row" — reaching for a heavier plugin
+architecture (dynamic classloading, config-driven registration) would be
+solving a problem we don't have yet, which is its own form of complexity
+Ousterhout warns about just as much as under-designing does.
+
+One more principle this satisfies — PULL COMPLEXITY DOWNWARD (ch. 7):
+CallbackDeliveryWorker is the only thing that knows delivery is
+dispatched by a string key into a map. Nothing above it (ingest, the
+registration endpoint) needs to know that detail exists.
+
+------------------------------------------------------------------------
+
+STILL OPEN
+
+  - Liquibase vs plain SQL for orinix's own migrations (flagged above)
+  - Whether orinix needs zabra-grpc-client at all in M1, or only once it
+    needs to call another service directly (right now nothing in the M1
+    scope requires orinix to call OUT to unhygienix/moonraker/etc. — events
+    arrive pre-enriched via the CloudEvents payload)
+  - Exact REST/OpenAPI shape for the registration endpoint (not drafted yet)
+  - Does orinix need the extra pegleg-style service-JWT layer (JwtServiceCallCredentials)
+    on top of the propagated user JWT, or is the standard propagated JWT alone
+    sufficient like forebitt's calls? (from Q6 — unconfirmed either way)
+  - DELIVERY STATE TRACKING: CallbackDeliveryWorker (as scaffolded in the first
+    commit) relies on SQS's own visibility-timeout + redrive-policy (maxReceiveCount,
+    DLQ on exhaustion) to track retry attempts — no hand-rolled attempts-counter
+    table in Postgres. This matches the approved Confluence doc's stated retry
+    policy ("5 attempts, exponential backoff, jitter, DLQ on exhaustion" per
+    per-consumer queue), but it was a judgment call made while scaffolding, not
+    something explicitly confirmed with you beforehand. Does this match what you
+    had in mind, or did you picture the worker tracking delivery state in Postgres
+    itself (e.g. a delivery_attempts column/table) instead of leaning on SQS's
+    native redrive behavior? Not blocking the first commit, but worth confirming
+    before this becomes harder to change.

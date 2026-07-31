@@ -1,0 +1,549 @@
+orinix PR #1 — full walkthrough: every file, why it exists, Spring Boot
+concepts explained, Ousterhout correlation throughout
+Date: 2026-07-09
+PR: https://github.com/LiveRamp/orinix/pull/1
+
+HOW TO USE THIS FILE: this is written to be a peg you can return to for
+future projects, not just a record of what orinix does. Every Spring Boot
+mechanism is explained from first principles the first time it shows up,
+using orinix's real code as the example — so if you're staring at a
+different Spring Boot service in six months, the shape should already be
+familiar.
+
+================================================================================
+0. MAVEN BASICS — needed before any pom.xml makes sense
+================================================================================
+
+A Maven project is described by a pom.xml (Project Object Model). Three
+ideas matter for reading ours:
+
+  PARENT/CHILD — a child pom's <parent> block points at a parent pom's
+  groupId+artifactId+version. The child inherits the parent's shared config
+  (properties, dependencyManagement) without repeating it. Our orinix-backend
+  and orinix-server both point at the root orinix-parent pom this way.
+
+  <dependencies> vs <dependencyManagement> — <dependencies> means "actually
+  put this jar on the classpath." <dependencyManagement> means "IF something
+  declares this dependency (with no version), use THIS version" — it's a
+  version pin, not an inclusion. The root pom.xml uses dependencyManagement
+  for grpc/pubsub/zabra-aws so every module that DOES declare them gets a
+  consistent version without repeating the version number everywhere.
+
+  BOM IMPORT — a special dependencyManagement entry with <type>pom</type>
+  <scope>import</scope> pulls in an ENTIRE curated set of version pins from
+  another project's own pom. orinix-server imports
+  org.springframework.boot:spring-boot-dependencies this way — that's how
+  spring-boot-starter-web, spring-boot-starter-actuator, lombok etc. can be
+  declared with NO version number in orinix-server's own <dependencies> block
+  and still resolve to a consistent, tested-together set of versions. This is
+  the single most useful Maven trick to recognize in any Spring Boot repo.
+
+================================================================================
+1. ROOT pom.xml — the aggregator
+================================================================================
+
+  <packaging>pom</packaging> + <modules> — this pom builds NOTHING itself,
+  it just tells Maven "build these three modules, in dependency order."
+  Mirrors pegleg's own root pom (pegleg-parent) exactly — this is the
+  established convention in this codebase for multi-module Java services,
+  not something invented for orinix.
+
+  <dependencyManagement> here pins grpc-*, google-cloud-pubsub, and
+  zabra-aws — these are the three things orinix-backend AND orinix-server
+  both potentially need, pinned once so both modules agree on versions.
+
+  OUSTERHOUT: CONSISTENCY (ch. 16) — this whole file's shape (parent pom,
+  three modules named proto/backend/server) is not a new pattern, it is
+  pegleg's shape, copied on purpose so anyone who has read pegleg can
+  navigate orinix on sight.
+
+================================================================================
+2. orinix-proto — the gRPC contract
+================================================================================
+
+  pom.xml: uses the protobuf-maven-plugin to COMPILE orinix.proto into Java
+  classes at build time (target/generated-sources) — nothing here is
+  hand-written Java, it's all generated from the one .proto file. The
+  os-maven-plugin extension exists only so Maven can figure out which
+  OS-specific protoc binary to download (protoc is a native compiler, not
+  pure Java).
+
+  orinix.proto — two RPCs only:
+    GetCleanroomEvents  — the cursor pull API
+    RegisterCallback    — webhook/pubsub registration
+
+  WHY NO THIRD RPC FOR INGESTING EVENTS: the SQS consumer and the DB write
+  both run inside orinix-server, same JVM process. A gRPC call for a
+  same-process operation would add a serialization + network-stack-shaped
+  interface around a plain function call, for zero benefit — nothing crosses
+  a process boundary, so there's nothing for gRPC to actually buy you.
+
+  OUSTERHOUT: DIFFERENT LAYER, DIFFERENT ABSTRACTION (ch. 6) — a layer that
+  doesn't translate into new vocabulary should be deleted, not built. gRPC's
+  entire value proposition is cross-process/cross-language calling; using it
+  for an in-process call would be exactly that kind of pass-through layer.
+
+  OUSTERHOUT: DEEP MODULES (ch. 3) — two RPC methods is the ENTIRE public
+  surface of orinix from the outside world's perspective. Everything else
+  in this document — the SQS consumer, three Postgres tables, the Strategy
+  pattern for delivery, replay — is invisible to any caller. That gap
+  between "two simple methods" and "everything listed above" IS what a deep
+  module looks like in practice, not just a slogan.
+
+================================================================================
+3. orinix-backend/pom.xml — dependency by dependency, and WHY each one
+================================================================================
+
+  orinix-proto (project.version)
+    So orinix-backend's code can use the generated gRPC message classes
+    (Orinix.ObjectEvent, Orinix.GetCleanroomEvents.Request, etc.) even
+    though the actual gRPC SERVER lives in orinix-server, not here.
+
+  spring-boot-starter-data-jpa
+    A Spring Boot "starter" is a curated dependency bundle — one line here
+    silently pulls in Hibernate (the actual JPA implementation), Spring
+    Data JPA (the repository abstraction), and the JDBC/transaction
+    plumbing to wire them together. You never see most of what this starter
+    actually contains; that's the point of a starter.
+
+  postgresql (scope: runtime)
+    The actual JDBC driver Hibernate talks to. scope=runtime means: needed
+    to RUN the app, not needed to COMPILE it (your Java code never imports
+    anything from this jar directly — Hibernate loads it reflectively at
+    startup based on the JDBC URL).
+
+  spring-cloud-starter-aws-messaging
+    Gives you @SqsListener and QueueMessagingTemplate — this is what
+    SqsEventConsumer and CallbackDeliveryWorker are built on. Chosen because
+    it's literally what pegleg's own AWSSQSConfiguration.java already uses
+    in production — reusing a proven pattern, not introducing a new one.
+
+  google-cloud-pubsub
+    The actual GCP Pub/Sub publisher SDK (com.google.cloud.pubsub.v1.Publisher).
+    Same artifact pegleg's billing path (BillingMessagePublisherHelper)
+    already depends on and uses successfully in production.
+
+  zabra-aws
+    Habu's own shared library. The ONE class orinix actually needs from it
+    is GoogleIdentityFederationAwsToken — the AWS-to-GCP Workload Identity
+    Federation token exchange, already proven by tragicomix for GCS access.
+    Pulling in a whole shared library for one class is normal — that's what
+    an internal platform library is FOR: you don't rebuild WIF token
+    exchange, you import the org's existing implementation.
+
+  spring-web
+    Gives WebhookDeliveryChannel and CallbackRegistrationService access to
+    RestTemplate (for the outbound webhook POST and the URL-reachability
+    check) WITHOUT pulling in a full web server (spring-boot-starter-web,
+    which starts an embedded Tomcat/Jetty) — orinix-backend is a plain
+    library module, it should never start a server. spring-web gives you
+    the HTTP CLIENT pieces without the HTTP SERVER pieces.
+
+  lombok (scope: provided)
+    A compile-time code generator, not a runtime library — this is why it's
+    scope=provided (needed only while compiling, stripped before the final
+    jar). @RequiredArgsConstructor, @Getter, @Setter, @Builder throughout
+    this codebase all come from here — every constructor you see auto-
+    generated in the entity/service classes below is Lombok, not hand-written.
+
+  jackson-databind
+    JSON serialization — used everywhere a JSONB column or an HTTP body
+    needs converting to/from Java objects (delivery_config parsing, the
+    CloudEvents payload).
+
+  spring-boot-starter-test (scope: test)
+    JUnit + Mockito + Spring's test context support, bundled the same
+    "starter" way as the JPA one above.
+
+================================================================================
+4. orinix-backend — the db package (JPA in three files)
+================================================================================
+
+  ObjectEventEntity.java / CallbackRegistrationEntity.java
+    @Entity marks a class as mapped to a table; @Table names it;
+    @Column maps each field to a column. This is JPA's declarative mapping —
+    you write a plain Java class with annotations, Hibernate generates the
+    SQL. (You've already studied this deeply in your own JPA notes — this
+    is the exact same mechanism, applied here.)
+
+    @Type(type = "jsonb") on changed_fields / delivery_config — this is how
+    a Postgres-specific column type (JSONB, not a standard SQL type) gets
+    mapped onto a plain Java String field. The column stores real JSON;
+    Java just sees a string it can parse with Jackson.
+
+  ObjectEventRepository.java / CallbackRegistrationRepository.java
+    Both extend JpaRepository<Entity, UUID> and declare ZERO method bodies —
+    Spring Data JPA generates the implementation from the METHOD NAME alone.
+    findByCleanroomIdAndCursorPositionGreaterThanOrderByCursorPositionAsc
+    is parsed by Spring at startup into:
+      SELECT * FROM object_events
+      WHERE cleanroom_id = ? AND cursor_position > ?
+      ORDER BY cursor_position ASC
+    This is "derived query methods" — one of Spring Data's signature
+    features. No SQL, no annotation, just a name Spring can parse.
+
+  OUSTERHOUT: GENERAL-PURPOSE MODULES (ch. 5) — this exact repository method
+  is reused THREE separate places in this PR: GetCleanroomEvents (the pull
+  API), and ReplayService.replayAllSince (bulk replay). One query, two very
+  different callers, because the query itself is general enough ("give me
+  everything after this cursor for this cleanroom") without being
+  over-specific to either caller's use case.
+
+================================================================================
+5. orinix-backend — the ingest package
+================================================================================
+
+  SqsEventConsumer.java
+    @SqsListener("sqs-habu-observability-internal") — Spring Cloud AWS scans
+    for this annotation and wires up the actual polling loop against SQS for
+    you. You write a method that takes the message body; the framework
+    handles receive/delete/visibility-timeout mechanics entirely.
+    Parses the raw CloudEvents JSON with Jackson's JsonNode (a tree model —
+    read fields by path without deserializing into a full typed class,
+    useful when the envelope shape is fixed but you don't want a dedicated
+    POJO for every producer's payload variations).
+
+  ObjectEventIngestService.java
+    A plain @Service — checks existsByIdempotencyKey before inserting
+    (this is the idempotency guarantee discussed at length elsewhere:
+    the event id, minted once by the producer, is what prevents SQS's
+    at-least-once redelivery from creating duplicate rows).
+
+  DeliveryDispatcher.java
+    The FAN-OUT half of delivery — "one event, how many registrations care
+    about it." Deliberately a SEPARATE class from CallbackDeliveryWorker
+    (the DISPATCH half — "for one registration, how do we actually reach
+    it"). These look like one problem and are actually two.
+
+  OUSTERHOUT: BETTER TOGETHER OR APART (ch. 8) — fan-out and dispatch were
+  kept apart on purpose, because they change for different reasons and at
+  different rates: fan-out logic changes if the MATCHING rules change
+  (e.g. adding field-level filtering later); dispatch logic changes if a
+  new DELIVERY MECHANISM is added. Coupling them into one class would mean
+  every delivery-mechanism change risks touching fan-out code too.
+
+================================================================================
+6. orinix-backend — the delivery package: THE STRATEGY PATTERN, IN FULL
+================================================================================
+
+This is the part worth understanding deeply, because it's the one piece of
+this codebase built explicitly as a reusable pattern, not just a one-off
+solution.
+
+--- 6.1 THE INTERFACE ---
+
+  DeliveryChannel.java:
+
+    public interface DeliveryChannel {
+        String deliveryType();
+        DeliveryResult deliver(CallbackRegistrationEntity registration, ObjectEventEntity event);
+    }
+
+  Two methods. deliveryType() returns a string that MATCHES the
+  delivery_type column's value ("WEBHOOK", "PUBSUB") — this string is what
+  connects a database row to a Java implementation at runtime. deliver()
+  is the actual work: given a registration and an event, make it happen,
+  report back success/failure.
+
+--- 6.2 THE TWO IMPLEMENTATIONS ---
+
+  WebhookDeliveryChannel.java — @Component("WEBHOOK")
+    Reads delivery_config's "callback_url" field, computes an HMAC-SHA256
+    signature over the payload using the registration's signing_secret,
+    POSTs via RestTemplate with X-Habu-Signature and X-Habu-Event-Id headers.
+
+  PubSubDeliveryChannel.java — @Component("PUBSUB")
+    Reads delivery_config's "gcp_project_id"/"gcp_topic_id", gets a WIF-
+    authenticated Publisher from OrinixPubSubCredentialsProvider, publishes
+    the event as a PubsubMessage.
+
+  Notice: totally different SDKs (RestTemplate vs Google's Publisher client),
+  totally different auth models (a shared secret vs a federated cloud
+  token), totally different wire formats (signed JSON HTTP body vs a
+  protobuf-ish Pub/Sub message) — and NEITHER of these differences is
+  visible to anything that calls DeliveryChannel.deliver(). That gap is
+  exactly what "Strategy pattern" means in practice: the caller only ever
+  sees the interface, never the implementation-specific mess.
+
+--- 6.3 HOW SPRING PICKS THE RIGHT ONE — THE MECHANISM, NOT JUST THE RESULT ---
+
+  CallbackDeliveryWorker.java has this field:
+
+    private final Map<String, DeliveryChannel> channelsByType;
+
+  This is Spring dependency injection doing something specific: when Spring
+  sees a field of type Map<String, SomeInterface>, it automatically
+  collects EVERY bean implementing SomeInterface into that map, keyed by
+  each bean's name. @Component("WEBHOOK") and @Component("PUBSUB") are what
+  SET those keys. So at runtime, channelsByType is exactly:
+
+    { "WEBHOOK" -> <the WebhookDeliveryChannel instance>,
+      "PUBSUB"  -> <the PubSubDeliveryChannel instance> }
+
+  built with ZERO code written for that collection — you never wrote a
+  factory, a registry, or a switch statement. Dispatch is then just:
+
+    DeliveryChannel channel = channelsByType.get(registration.getDeliveryType().name());
+    channel.deliver(registration, event);
+
+  --- 6.4 THE FORK EXERCISE — ADDING AZURE, TO PROVE THE PATTERN'S VALUE ---
+
+  You asked specifically about a fork to Azure. Here is exactly what that
+  would take, and — more importantly — everything it would NOT take:
+
+  New file needed:
+
+    @Component("AZURE_SERVICE_BUS")
+    public class AzureServiceBusDeliveryChannel implements DeliveryChannel {
+        @Override
+        public String deliveryType() { return "AZURE_SERVICE_BUS"; }
+
+        @Override
+        public DeliveryResult deliver(CallbackRegistrationEntity registration, ObjectEventEntity event) {
+            // parse delivery_config for Azure connection info
+            // publish via the Azure Service Bus SDK
+            // return DeliveryResult
+        }
+    }
+
+  Also needed: add AZURE_SERVICE_BUS to the DeliveryType enum, and extend
+  the delivery_type CHECK/enum constraint on the callback_registrations
+  table if one exists.
+
+  What does NOT change, at all:
+    - CallbackDeliveryWorker — channelsByType picks up the new bean
+      automatically the moment it's a @Component; the dispatch line
+      (channelsByType.get(...)) doesn't know or care that a third option
+      now exists.
+    - DeliveryDispatcher — fan-out logic is delivery-mechanism-agnostic
+      already, nothing to touch.
+    - CallbackRegistrationService — already branches on delivery_type as a
+      string; one more case in whatever validation switch exists there
+      (URL reachability for WEBHOOK, topic check for PUBSUB) is the only
+      touch point, and it's additive, not a rewrite.
+    - orinix.proto's RegisterCallback RPC — already generic
+      (delivery_type as a string field, delivery_config-shaped payload) —
+      no schema change needed unless Azure's config needs genuinely new
+      fields, and even then it's an additive field, not a breaking change.
+    - ReplayService — deliverToRegistration() is channel-agnostic, replay
+      works identically for the new channel with no code change.
+
+  That is the entire cost of adding a cloud: one new class implementing a
+  two-method interface, one enum value, zero changes anywhere delivery is
+  ORCHESTRATED (only where it's IMPLEMENTED). This is the concrete,
+  provable version of "Strategy pattern lets you add behavior without
+  touching existing code" — not a slogan, an actual file list.
+
+  OUSTERHOUT: GENERAL-PURPOSE MODULES (ch. 5) — DeliveryChannel is general
+  enough for "N delivery mechanisms" without being so general it does
+  nothing (compare: a Plugin/Registry system with dynamic class loading
+  would ALSO handle N mechanisms, but solves a problem — "add a mechanism
+  without a redeploy" — that M1 doesn't have. Strategy + Spring's DI
+  container sits at exactly the right level of generality for the actual
+  problem.)
+
+  OUSTERHOUT: INFORMATION HIDING (ch. 4) — "how do we push to XMI" is
+  hidden behind delivery_type + DeliveryChannel. The decision most likely
+  to change (which cloud, which SDK, which auth model) is exactly the
+  decision that's fully contained — change it, and only one new file is
+  touched, nothing upstream even notices.
+
+--- 6.5 THE CREDENTIALS PROVIDER (Pub/Sub's specific complexity, isolated) ---
+
+  OrinixPubSubCredentialsProvider.java exists as its OWN class, separate
+  from PubSubDeliveryChannel, for a reason: the WIF token exchange
+  (assume an AWS role, sign a fake GetCallerIdentity request, exchange it
+  with Google's STS for a short-lived token) is genuinely complex, multi-
+  step logic that has nothing to do with "how do I structure a Pub/Sub
+  message." Splitting it out means PubSubDeliveryChannel's own code stays
+  readable — it just calls credentialsProvider.forProject(projectId) and
+  moves on, not caring how that credential was obtained.
+
+  OUSTERHOUT: PULL COMPLEXITY DOWNWARD (ch. 7) — the multi-step WIF dance
+  is absorbed into one small class so PubSubDeliveryChannel (and anyone
+  reading it) never has to think about AWS STS, SigV4 signing, or Google's
+  audience-string matching. That complexity had to live SOMEWHERE; it's
+  been pulled down into the one place equipped to own it.
+
+--- 6.6 THE REPLAY SERVICE — REUSING THE STRATEGY, NOT DUPLICATING IT ---
+
+  ReplayService.java calls CallbackDeliveryWorker.deliverToRegistration()
+  — the SAME method the live SQS listener calls — rather than having its
+  own copy of the channel-lookup logic. This means replay automatically
+  benefits from the Strategy pattern too: replaying an event to a PUBSUB
+  registration uses PubSubDeliveryChannel exactly the same way live
+  delivery does, with no special-casing anywhere in ReplayService itself.
+
+================================================================================
+7. orinix-backend — the registration package
+================================================================================
+
+  CallbackRegistrationService.java — validates (URL reachability for
+  WEBHOOK), mints the HMAC signing_secret (WEBHOOK only — PUBSUB gets none,
+  since it authenticates via WIF, not a shared secret), persists the row.
+
+================================================================================
+8. orinix-server/pom.xml — why this pom looks different from orinix-backend's
+================================================================================
+
+  Notice orinix-server's pom HAS a <dependencyManagement> block importing
+  spring-boot-dependencies as a BOM, while orinix-backend's does NOT (it
+  declares explicit versions like <version>${spring-boot-starter.version}</version>
+  on its own spring-boot-starter-data-jpa). Why the difference:
+
+  orinix-server is the module that actually BECOMES a runnable Spring Boot
+  application (it has @SpringBootApplication, it gets packaged into an
+  executable jar via spring-boot-maven-plugin) — for that, importing the
+  full spring-boot-dependencies BOM makes sense, because it's coordinating
+  a whole app's worth of Spring Boot pieces (web, actuator, grpc starter,
+  test) that all need to agree on one consistent Spring Boot version.
+
+  orinix-backend is a plain library — it only needs to be COMPILED and
+  used as a dependency, never run standalone, so it pins just the specific
+  things it needs directly rather than pulling in the entire BOM.
+
+  spring-boot-starter-web — gives orinix-server an embedded servlet
+  container (Tomcat by default) even though orinix's real API is gRPC —
+  this is what makes actuator's health/info endpoints (below) reachable
+  over plain HTTP for k8s liveness probes etc.
+
+  spring-boot-starter-actuator — production-readiness endpoints
+  (/actuator/health, /actuator/info) with almost no code — you get these
+  by declaring the dependency and (as seen in application.yml below)
+  opting into which ones to expose.
+
+  net.devh:grpc-spring-boot-starter — THIS is what makes @GrpcService and
+  the whole gRPC server auto-configuration work; it's a third-party starter
+  (not Spring's own) that wires a gRPC server into Spring's lifecycle the
+  same way Spring Boot wires an HTTP server in.
+
+  spring-boot-maven-plugin — the plugin that actually repackages the built
+  jar into an executable "fat jar" (all dependencies bundled in) — without
+  this, `java -jar` wouldn't work, you'd get a jar with just orinix's own
+  classes and a ClassNotFoundException the moment it needed Spring itself.
+
+================================================================================
+9. orinix-server — Spring Boot fundamentals, taught via the actual files
+================================================================================
+
+--- 9.1 OrinixApplication.java — what @SpringBootApplication actually is ---
+
+    @SpringBootApplication
+    public class OrinixApplication {
+        public static void main(String[] args) {
+            SpringApplication.run(OrinixApplication.class, args);
+        }
+    }
+
+  @SpringBootApplication is not one thing — it's a meta-annotation that
+  bundles THREE:
+    @Configuration          — this class itself can define beans
+    @EnableAutoConfiguration — Spring Boot inspects what's on the classpath
+                               (e.g. "postgresql jar present + spring-data-jpa
+                               present" -> auto-configure a DataSource and
+                               an EntityManagerFactory) and wires sensible
+                               defaults WITHOUT you writing that config
+    @ComponentScan          — scan this package and every sub-package for
+                               @Component/@Service/@Repository/@Configuration
+                               classes and register them as beans
+
+  This is WHY every @Component we wrote in orinix-backend (WebhookDeliveryChannel,
+  PubSubDeliveryChannel, DeliveryDispatcher, etc.) gets picked up automatically
+  by orinix-server even though orinix-server never explicitly lists them —
+  ComponentScan finds anything under com.habu.orinix.*, and orinix-backend's
+  classes live in that same package tree.
+
+--- 9.2 OrinixServiceImpl.java — the gRPC server side ---
+
+    @GrpcService
+    public class OrinixServiceImpl extends OrinixServiceGrpc.OrinixServiceImplBase {
+
+  extends OrinixServiceGrpc.OrinixServiceImplBase — this base class is
+  GENERATED (from orinix.proto, by the protobuf-maven-plugin in
+  orinix-proto). @GrpcService (from grpc-spring-boot-starter) is what
+  registers this implementation with the gRPC server Spring Boot starts up
+  — same idea as @RestController for a normal Spring MVC endpoint, just
+  for gRPC instead of REST.
+
+  This class is the actual TRANSLATION layer discussed in section 2 —
+  JPA entity rows in, generated proto message classes out. It's the one
+  place in the whole codebase that has to know about BOTH the DB shape and
+  the wire-protocol shape.
+
+--- 9.3 SqsConfig.java — @Configuration and @Bean, the manual side of Spring ---
+
+    @Configuration
+    @EnableSqs
+    public class SqsConfig {
+        @Bean
+        public AmazonSQSAsync amazonSQSAsync() { ... }
+
+  Where ComponentScan (9.1) is the AUTOMATIC way to register a bean
+  (annotate the class, Spring finds it), @Bean is the MANUAL way — you
+  write a method that CONSTRUCTS the object yourself, and Spring calls it
+  once and manages the result as a bean from then on. You reach for @Bean
+  specifically when the thing being created isn't a class you own (you
+  can't put @Component on AmazonSQSAsync, it's a third-party SDK class) or
+  needs actual construction logic beyond "just call the constructor."
+
+--- 9.4 application.yml / application-dev.yml — externalized configuration ---
+
+  ${ORINIX_DB_HOST:localhost} — Spring's property placeholder syntax:
+  "read the ORINIX_DB_HOST environment variable; if it's not set, use
+  localhost as the default." This is how the SAME jar runs against a local
+  Postgres in dev and a real RDS instance in production — zero code
+  difference, only environment variables differ.
+
+  application-dev.yml — Spring's PROFILE mechanism: this file only gets
+  merged in when the app starts with the "dev" profile active
+  (-Dspring.profiles.active=dev, exactly as the README instructs). Profile-
+  specific files override the base application.yml for just what they
+  redeclare.
+
+================================================================================
+10. OUSTERHOUT PRINCIPLES — FULL INDEX (file -> principle -> why)
+================================================================================
+
+  Deep Modules (ch.3)          orinix.proto (2 RPCs hide everything else)
+  Different Layer, Diff.       orinix.proto (no RPC for the in-process
+  Abstraction (ch.6)           ingest write)
+  Information Hiding (ch.4)    delivery_type/delivery_config + DeliveryChannel
+  General-Purpose Modules(ch.5)ObjectEventRepository's one cursor query
+                                serving 3 callers; DeliveryChannel sized
+                                right for "N mechanisms," not over-built
+  Pull Complexity Downward(7)  OrinixPubSubCredentialsProvider isolating WIF
+  Better Together or Apart(8)  DeliveryDispatcher (fan-out) kept separate
+                                from CallbackDeliveryWorker (dispatch)
+  Define Errors Out of         idempotency_key unique constraint;
+  Existence (ch.9)              cursor_position designed in from day one
+  Design It Twice (ch.10)      Java vs Go vs Hybrid; Strategy vs 4 alternatives
+                                (see orinix-why-and-how Q1/Q4)
+  Consistency (ch.16)          root pom mirrors pegleg-parent; @GrpcClient
+                                convention unchanged for callers
+
+================================================================================
+11. PEGS FOR FUTURE PROJECTS — the transferable Spring Boot cheat sheet
+================================================================================
+
+  - A BOM import (<type>pom</type><scope>import</scope>) is how one line
+    pulls in a whole curated version set. Look for this FIRST when you open
+    an unfamiliar Spring Boot pom — it explains why half the dependencies
+    below it have no <version> tag.
+  - "Starter" artifacts (spring-boot-starter-*) are dependency BUNDLES, not
+    single libraries — expect one starter to silently bring in 5-10 real
+    jars.
+  - Map<String, SomeInterface> as a Spring-injected field is the qualifier-
+    map pattern: every @Component/@Bean implementing that interface gets
+    auto-collected, keyed by bean name. This is the mechanism, not just
+    this codebase's convention — it works in any Spring app.
+  - Spring Data repository method names are PARSED, not just labels —
+    findByXAndYGreaterThanOrderByZAsc becomes real SQL with zero code.
+  - @Configuration + @Bean is the manual escape hatch for anything you
+    can't put an annotation directly on (third-party SDK classes, anything
+    needing real construction logic).
+  - Property placeholders (${VAR:default}) + profile-specific YAML files
+    are how the same artifact runs unmodified across environments.
+  - When comparing two poms in the same multi-module project and one
+    imports a BOM while the other pins versions directly, ask why — usually
+    it's "this one is a runnable app coordinating many pieces" vs "this one
+    is a library with a narrow, specific dependency list."

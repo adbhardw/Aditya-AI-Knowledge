@@ -1,0 +1,174 @@
+DOES CAC DO AUTHENTICATION, AUTHORIZATION, OR BOTH?
++ HOW A SERVICE ACCOUNT ACTUALLY GETS A TOKEN (MCS<->VMA, and what it means for orinix->XMI)
+Sourced from LiveRamp/agentic-core docs (authoritative internal architecture
+docs) and LiveRamp/infra_api_platform (the actual sidecar source/README),
+cross-checked against the real MCS/VMA code already traced.
+Date: 2026-07-21
+
+
+===========================================================
+ANSWER, UP FRONT
+===========================================================
+
+CAC does AUTHORIZATION ONLY. It does NOT do authentication.
+
+There are three separate pieces, three separate jobs, confirmed by
+LiveRamp's own internal docs (agentic-core repo):
+
+  1. access-token-getter sidecar   -> ISSUES a token (for a service account)
+  2. authn-proxy sidecar           -> VERIFIES a token (authentication)
+  3. CAC (Central Access Control)  -> CHECKS a permission (authorization)
+
+Each is a distinct component, usually a distinct sidecar container, and
+none of them do each other's job. This is company-wide plumbing, not
+something MCS/VMA invented — dozens of unrelated LiveRamp services
+(billing_service, segment, ppr_service, aif_connector_service, etc.) all
+use the exact same access-token-getter sidecar image.
+
+
+===========================================================
+1. access-token-getter — WHERE THE TOKEN COMES FROM (the actual answer to
+   "how does a service account generate a token")
+===========================================================
+
+Source: github.com/LiveRamp/infra_api_platform,
+client-libs/token-getter/sidecar/README.md
+
+This is what MCS and VMA both call "Token Getter" (their config just points
+at it under different local port numbers per app: MCS uses :10035, VMA uses
+:10030, etc — same shared sidecar, different apps just run their own local
+copy so ports don't collide in dev).
+
+What it actually is: a small Go binary, deployed as a SIDECAR CONTAINER
+inside the same Kubernetes Pod as the app (MCS, VMA, or in future orinix).
+"Sidecar" here literally means: same pod, shares localhost network with your
+app container, but it's a separate container/process.
+
+How it works, step by step:
+
+  1. Ops/platform provisions a LiveRamp service account for the app, via
+     LiveRamp's OWN identity system — "sso.liveramp.com (v1)" or
+     "serviceaccounts.liveramp.com (v2)". NOT Google Cloud IAM (I'd guessed
+     that earlier, wrong — it's LiveRamp's own internal SA system).
+  2. That service account's long-lived credentials (a JSON keyfile) are
+     stored in Vault, then mounted into the sidecar container as a Kubernetes
+     secret (`--creds-file-path=/creds/xxx.credentials.json`).
+  3. The sidecar reads that keyfile and uses it to fetch a short-lived
+     access token from LiveRamp's identity service, caches it, and serves it
+     locally over plain HTTP or a Unix socket.
+  4. The APP (MCS/VMA/future orinix) never touches the long-lived keyfile at
+     all. It just asks the sidecar for a token right before every outbound
+     call:
+         GET http://127.0.0.1:10030/token          (HTTP)
+         echo "TOKEN" | nc -U /path/to/sock         (Unix socket, faster)
+     and gets back a fresh bearer token string.
+  5. The app sends that string as `Authorization: Bearer <token>` on its
+     outbound request to whatever service it's calling (VMA, MCS, CAC,
+     eventually XMI).
+
+This is the WHOLE reason the sidecar pattern exists, per the README itself:
+"your app does not need to handle extremely sensitive long-lived service
+account keyfiles ... and can take advantage of high performance
+concurrent-safe token caching regardless of language or framework." One
+sidecar binary, reused by every app in every language, so nobody re-invents
+token refresh/caching/rate-limiting per service.
+
+DIRECT ANSWER for MCS<->VMA: both apps have their own access-token-getter
+sidecar, each backed by that app's own LiveRamp service account credentials.
+When MCS calls VMA (or VMA calls MCS), the calling app asks ITS OWN sidecar
+for a token representing ITS OWN service account identity, and sends that.
+Neither app holds the other's secrets — each only ever proves who IT is.
+
+
+===========================================================
+2. authn-proxy sidecar — WHO VERIFIES THE TOKEN (authentication, separate
+   from CAC)
+===========================================================
+
+Source: LiveRamp/agentic-core, docs/features/authentication-and-tenancy.md
+        + docs/deploy-and-operate/authentication-cac.md
+
+This is ANOTHER sidecar (different from access-token-getter), sitting in
+front of the RECEIVING service, port 8087 in the docs' example. Its only job:
+
+  - Take the incoming `Authorization: Bearer <token>` header.
+  - Verify the token's cryptographic signature (i.e. prove it's real, not
+    forged, not expired).
+  - Decode it and write the verified identity into a NEW header:
+    `X-Validated-Access-Token` (containing `{uid, sub, cid}`).
+
+Crucially: this happens BEFORE the request even reaches the app's own code.
+The app (or CAC) never has to verify a raw signature itself — by the time
+anything downstream sees the request, identity has already been established
+and stamped onto a header by this proxy.
+
+Direct quote from the doc's own sequence diagram:
+    C->>P: Authorization: Bearer JWT + lr-org-id
+    P->>P: Verify JWT signature                    <- AUTHENTICATION happens HERE
+    P->>A: + X-Validated-Access-Token (decoded {uid, sub, cid})
+    A->>CAC: POST permission check (fail-closed)    <- AUTHORIZATION happens HERE, separately
+
+
+===========================================================
+3. CAC — PURE AUTHORIZATION, CONFIRMED
+===========================================================
+
+Source: same authentication-cac.md doc, "Wire format" section.
+
+CAC's entire API surface for this purpose is two endpoints:
+    POST /v1/user-org-permission/actions/check              (public permission)
+    POST /v1/user-org-restricted-permission/actions/check    (restricted/internal permission)
+
+Request:  Authorization: Bearer <token> + {"orgID": "...", "permission": "..."}
+Response: {"allAllowed": true/false, "permissions": [...]}
+
+That's it. CAC is never asked "is this token real" — by the time CAC (or the
+app calling CAC) sees the token, the authn-proxy has already vetted it
+upstream. CAC's ONLY question is "does the identity behind this token hold
+this specific permission." Pure lookup, no signature verification logic.
+This is explicitly why the docs call CAC = "Central Access Control", not an
+authentication service.
+
+Quoting the doc's own design rationale for why this split exists at all:
+"Fail-closed by default — a misconfiguration rejects traffic rather than
+silently passing it" and identity isolation is enforced "so two users in the
+same org cannot read each other's threads" — i.e. authentication proves WHO,
+authorization decides WHAT THAT WHO can touch. Same reasoning applies to
+service accounts, not just human users: proving MCS's identity doesn't
+automatically mean MCS should be allowed to hit every VMA endpoint — that's
+still gated by a specific permission MCS's SA has to actually be granted.
+
+
+===========================================================
+4. HOW THIS MAPS ONTO orinix -> XMI
+===========================================================
+
+Straight substitution, same three pieces:
+
+  1. orinix needs its OWN LiveRamp service account, provisioned the same way
+     MCS/VMA's are (via serviceaccounts.liveramp.com), with its own
+     access-token-getter sidecar added to orinix's pod, backed by that SA's
+     credentials (stored in Vault).
+  2. orinix's outbound call to XMI's callback URL: ask its own sidecar for a
+     token (`GET localhost:PORT/token`), send it as
+     `Authorization: Bearer <token>` + `LR-Org-ID`.
+  3. On XMI's receiving side: XMI needs to sit behind (or be integrated with)
+     the authn-proxy pattern so the token gets verified, AND XMI's endpoint
+     needs to declare a specific restricted permission
+     (e.g. `restricted/xmi:callback.orinixEvent`) that gets checked via CAC.
+  4. Someone (via Nexus, presumably — still an inference, not yet confirmed)
+     grants that specific restricted permission to orinix's service account.
+
+THE ACTUAL OPEN QUESTION, now much sharper than before: is XMI (or MCS,
+which is the XMI callback surface per the earlier PRs) ALREADY wired into
+this authn-proxy + CAC pattern for a NEW inbound callback route, the same
+way the vma_map_updated endpoint is? Based on everything traced, the answer
+is very likely yes — MCS already fully participates in CAC (permissions.py,
+common_init_ctx, cac_is_authorized are all live, production code, not
+proposal). So the realistic remaining work is almost entirely on ORINIX's
+side: does orinix have a LiveRamp service account + access-token-getter
+sidecar set up at all today? If not, that's net-new infra plumbing (talk to
+whichever team owns Vault/SA provisioning + sidecar helm charts), separate
+from writing the actual callback-sending code, which is comparatively
+trivial once the sidecar exists (it's just "ask sidecar for token, send POST
+with that token as a header").
