@@ -1,0 +1,413 @@
+================================================================================
+GRAFANA AI CHAT — PASTE-READY DASHBOARD BUILD PROMPTS
+API Tenant Health & Abuse Detection
+Created 2026-08-03
+================================================================================
+
+HOW TO USE
+----------
+Paste STEP 0 first and read the answer — it decides which parser line every
+other query uses. Then paste PART A blocks one at a time (the Grafana assistant
+builds one panel per turn; pasting all eleven at once makes it drop panels).
+
+Substitute before pasting:
+  - datasource name: grafanacloud-habu-logs   (change if yours differs)
+  - dashboard:       Token Requests by Organization
+  - cluster variable: $cluster  (already exists, labelled "Environment")
+
+WHAT IS AND IS NOT BUILDABLE TODAY
+-----------------------------------
+The only aggregatable signal in Loki for this service is the line
+  "Token request successful for clientID=..., userId=..., organizationID=..."
+emitted by Auth0Service. Everything below is derived from it.
+
+  Buildable now (PART A):
+    Dashboard 3  Top talkers            -> A6, A7
+    Dashboard 4  Sudden spike detection -> A8
+    Dashboard 6  Authentication flood   -> A4, A5  (this is THE strongest one:
+                                          the token endpoint is exactly what
+                                          this log measures)
+    Dashboard 7  Consumption heatmap    -> A9
+    Dashboard 10 Client ranking         -> A7
+    Dashboard 2  Abuse table            -> A3 (partial: volume + client split,
+                                          NO 429 column, NO latency column)
+    Dashboard 1  Exec overview          -> A1, A2, A10 (partial: no error rate,
+                                          no latency, no 429)
+
+  NOT buildable until the gateway emits a structured access log (PART B):
+    Dashboard 1  requests/sec, errors/sec, 429/sec, 5xx, P95 latency, top IPs
+    Dashboard 2  the 429 and latency columns
+    Dashboard 5  Rate limit violations  — the 429 log has no parseable org field
+    Dashboard 8  Error correlation      — no latency/status; CPU/mem only if you
+                                          have a Prometheus/Mimir datasource
+    Dashboard 9  Endpoint breakdown     — no route/endpoint field is logged
+
+Do not build Part B panels against fields that do not exist. An empty panel on a
+leadership dashboard costs more credibility than a missing one.
+
+
+================================================================================
+STEP 0 — DISCOVERY (paste this first, read the answer, then continue)
+================================================================================
+
+Using the Loki datasource grafanacloud-habu-logs, run this query over the last
+15 minutes and show me 5 raw log lines verbatim:
+
+{service_name="external-api-server", cluster=~"eks-admin-prod"} |= "Token request successful"
+
+Then tell me exactly three things:
+1. Are these lines JSON-encoded, or plain text with a logging prefix?
+2. What is the exact text between the log level and "Token request successful"?
+3. List every label available on this stream (not fields — labels).
+
+--------------------------------------------------------------------------------
+Based on the answer, pick ONE parser line and use it in every query below.
+Everywhere you see  <<PARSER>>  substitute your chosen line.
+
+  If the lines are PLAIN TEXT (most likely, Spring Boot default):
+    | pattern `<_>clientID=<clientID>, userId=<userId>, organizationID=<organizationID>`
+
+  If pattern fails to extract, fall back to regexp:
+    | regexp `clientID=(?P<clientID>[^,]+), userId=(?P<userId>[^,]+), organizationID=(?P<organizationID>\S+)`
+
+  If the lines are JSON:
+    | json | line=~".*Token request successful.*" | pattern `<_>clientID=<clientID>, userId=<userId>, organizationID=<organizationID>`
+
+Note on cost: organizationID and clientID are parsed FIELDS here, not stream
+labels. Aggregating by them does not create new Loki streams and does not
+increase cardinality on the index. Never promote them to labels.
+
+
+================================================================================
+PART A — PANELS BUILDABLE TODAY
+================================================================================
+
+--------------------------------------------------------------------------------
+A0 — Add the drill-down variable (paste once, before the panels)
+--------------------------------------------------------------------------------
+On the dashboard "Token Requests by Organization", add a new dashboard variable:
+  - Name: org
+  - Type: Textbox
+  - Default value: .*
+  - Label: Organization
+This lets one panel filter to a single organization without editing queries.
+
+
+--------------------------------------------------------------------------------
+A1 — Stat: Total token requests in range
+--------------------------------------------------------------------------------
+On the dashboard "Token Requests by Organization", add a Stat panel titled
+"Total Token Requests" using the Loki datasource grafanacloud-habu-logs.
+
+Query type: Instant.
+Query:
+sum(count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" [$__range]))
+
+Options: Unit = short. Color mode = value. No thresholds.
+Description: "Actual count of successful token requests over the selected time
+range. Uses count_over_time, not rate() — see the panel rules note."
+
+
+--------------------------------------------------------------------------------
+A2 — Stat: Active organizations
+--------------------------------------------------------------------------------
+Add a Stat panel titled "Active Organizations" using grafanacloud-habu-logs.
+
+Query type: Instant.
+Query:
+count(sum by (organizationID) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" <<PARSER>> [$__range])))
+
+Options: Unit = short.
+Description: "Distinct organizations that requested a token in the selected
+range. A sudden drop can mean an outage; a sudden rise can mean credential
+sharing."
+
+
+--------------------------------------------------------------------------------
+A3 — Table: Organization x Client breakdown  (Dashboard 2, partial)
+--------------------------------------------------------------------------------
+Add a Table panel titled "Token Requests by Organization and Client" using
+grafanacloud-habu-logs.
+
+Query type: Instant.
+Query:
+sum by (organizationID, clientID) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" <<PARSER>> [$__range]))
+
+Transformations:
+  1. "Sort by" -> field Value, descending.
+Options:
+  - Unit = short
+  - Cell type for the Value column = Colored background, gradient
+  - Thresholds: green base, yellow at 500, red at 2000
+Description: "Volume per organization per credential. NOTE: 429 count and
+latency columns are intentionally absent — the gateway does not yet emit a
+structured access log with those fields."
+
+
+--------------------------------------------------------------------------------
+A4 — Time series bars: Token requests per hour  (Dashboard 6)
+--------------------------------------------------------------------------------
+NOTE: if panel-4 "Token Requests per Hour (eks-admin-prod)" already exists on
+this dashboard, skip A4 — it is the same panel. Otherwise:
+
+Add a Time series panel titled "Token Requests per Hour" using
+grafanacloud-habu-logs.
+
+Query:
+sum(count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" [1h]))
+
+Query options: Min interval = 1h    <-- REQUIRED, see rules note
+Options: Draw style = Bars. Unit = short. Legend = hidden.
+Description: "Actual count of successful token requests per 1-hour bucket.
+Min interval 1h forces one point per hour so buckets do not overlap."
+
+
+--------------------------------------------------------------------------------
+A5 — Time series bars: Token requests per hour by organization  (Dashboard 6)
+--------------------------------------------------------------------------------
+Add a Time series panel titled "Token Requests per Hour by Organization" using
+grafanacloud-habu-logs.
+
+Query:
+topk(10, sum by (organizationID) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" <<PARSER>> [1h])))
+
+Query options: Min interval = 1h
+Options:
+  - Draw style = Bars, Stacking = Normal
+  - Unit = short
+  - Legend = table, to the right, showing Max and Total
+Description: "Top 10 organizations by token requests, one bar per hour. Stacked
+so total volume and per-org share are both readable."
+
+
+--------------------------------------------------------------------------------
+A6 — Pie chart: Traffic concentration  (Dashboard 3)
+--------------------------------------------------------------------------------
+Add a Pie chart panel titled "Share of Token Requests by Organization" using
+grafanacloud-habu-logs.
+
+Query type: Instant.
+Query:
+topk(10, sum by (organizationID) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" <<PARSER>> [$__range])))
+
+Options:
+  - Legend = table, right, values: Value and Percent
+  - Labels on slices = Percent
+Description: "Answers 'is one tenant dominating our capacity?' at a glance. One
+org above ~40% of all traffic is the single most useful abuse signal on this
+dashboard."
+
+
+--------------------------------------------------------------------------------
+A7 — Bar gauge: Top organizations and Top client IDs  (Dashboards 3 and 10)
+--------------------------------------------------------------------------------
+Add TWO Bar gauge panels using grafanacloud-habu-logs, both Instant queries,
+both horizontal, unit short, display mode Gradient, sorted descending.
+
+Panel 1, titled "Top 10 Organizations":
+topk(10, sum by (organizationID) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" <<PARSER>> [$__range])))
+
+Panel 2, titled "Top 10 Client IDs":
+topk(10, sum by (clientID) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" <<PARSER>> [$__range])))
+
+Description for panel 2: "One organization may own several credentials. If a
+single clientID dominates while its organization looks normal, suspend the
+credential rather than the whole tenant."
+
+
+--------------------------------------------------------------------------------
+A8 — Time series: Spike detection / growth factor  (Dashboard 4)
+--------------------------------------------------------------------------------
+Add a Time series panel titled "Traffic Growth Factor by Organization
+(current 15m vs 6h baseline)" using grafanacloud-habu-logs.
+
+Query:
+(sum by (organizationID) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" <<PARSER>> [15m])) / 15)
+/
+(sum by (organizationID) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" <<PARSER>> [6h])) / 360)
+
+Query options: Min interval = 5m
+Options:
+  - Draw style = Lines
+  - Unit = none (this is a ratio, NOT a rate — do not set a per-time unit)
+  - Thresholds: green base, yellow at 3, red at 10
+  - Legend = table, right, showing Max
+Description: "Current requests/min divided by the 6-hour average requests/min,
+per organization. 1.0 = normal. Above 3 = surging. This finds floods that
+absolute volume hides — an org going from 250/min to 3,000/min matters more than
+one steadily at 300/min. An organization with zero baseline traffic will render
+as +Inf on its first request; that is expected."
+
+
+--------------------------------------------------------------------------------
+A9 — Status history: Consumption heatmap  (Dashboard 7)
+--------------------------------------------------------------------------------
+Add a Status history panel titled "Organization Activity Over Time" using
+grafanacloud-habu-logs.
+
+Query:
+topk(15, sum by (organizationID) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" <<PARSER>> [1h])))
+
+Query options: Min interval = 1h
+Options:
+  - Color scheme = "From thresholds"
+  - Thresholds: green base, yellow at 100, orange at 500, red at 2000
+  - Show values = Auto
+Description: "Time on X, organization on Y, colour by hourly request count.
+Bursts are visible as coloured blocks. Status history is used rather than the
+Heatmap panel because Heatmap buckets a numeric Y axis, not a categorical one."
+
+
+--------------------------------------------------------------------------------
+A10 — Time series: Total log volume (ingestion sanity check)
+--------------------------------------------------------------------------------
+Add a Time series panel titled "Total external-api-server Log Volume per Hour"
+using grafanacloud-habu-logs.
+
+Query:
+sum(count_over_time({service_name="external-api-server", cluster=~"$cluster"} [1h]))
+
+Query options: Min interval = 1h
+Options: Draw style = Bars. Unit = short.
+Description: "All log lines, not just token requests. Use this to sanity-check
+against the equivalent Datadog number before trusting any comparison between the
+two platforms. If this collapses to zero while the service is healthy, the log
+shipper is broken, not the service."
+
+
+--------------------------------------------------------------------------------
+A11 — Logs: Drill-down for a single organization
+--------------------------------------------------------------------------------
+Add a Logs panel titled "Token Requests — Drill Down (org = $org)" using
+grafanacloud-habu-logs.
+
+Query:
+{service_name="external-api-server", cluster=~"$cluster"} |= "Token request successful" |~ "organizationID=$org"
+
+Options: Show time = on, Wrap lines = on, Order = Newest first, Limit = 200.
+Description: "Set the Organization variable at the top of the dashboard to an
+organizationID from the tables above to see the raw requests, including exact
+timestamps and which credential was used."
+
+
+================================================================================
+PART B — BLOCKED PANELS AND WHAT MUST SHIP FIRST
+================================================================================
+
+Do NOT paste this section into Grafana yet. These queries assume a structured
+gateway access log that does not exist today.
+
+PREREQUISITE
+------------
+The API gateway must emit one structured access log per request containing at
+minimum:
+    organizationID  clientID  route  method  status
+    latencyMs       rateLimited  reason  limit  remaining  requestId
+
+Two specific code changes make Part B possible:
+
+  1. The gateway's rate-limit rejection currently logs a plain string with
+     "org=" and no status code. Change it to the same key=value shape the
+     token-success line uses, so organizationID parses out identically:
+       Rate limit exceeded organizationID=<id>, clientID=<id>, route=<path>,
+       method=<verb>, status=429, limitPerSec=<n>, retryAfterSec=<n>
+
+  2. Auth0Service logs only on SUCCESS, after the Auth0 round trip. Add
+     equivalent logging on the failure paths (product-not-enabled rejection and
+     Auth0 errors), otherwise a client flooding with a bad secret produces zero
+     dashboard signal while still consuming resources. Suggested shape:
+       Token request failed organizationID=<id>, clientID=<id>,
+       reason=<PRODUCT_DISABLED|AUTH0_REJECTED|INVALID_CREDENTIALS>
+
+Once those land, the parser line for gateway logs becomes:
+    | logfmt        (if you adopt strict key=value with no prose prefix)
+  or
+    | pattern `<_>organizationID=<organizationID>, clientID=<clientID>, route=<route>, method=<method>, status=<status><_>`
+
+--------------------------------------------------------------------------------
+B1 — Stat: 429 rate  (Dashboard 1 and 5)
+--------------------------------------------------------------------------------
+sum(count_over_time({service_name="api-gateway", cluster=~"$cluster"} |= "status=429" [$__range]))
+
+--------------------------------------------------------------------------------
+B2 — Table: Top organizations receiving 429  (Dashboard 5)
+--------------------------------------------------------------------------------
+topk(10, sum by (organizationID) (count_over_time({service_name="api-gateway", cluster=~"$cluster"} |= "status=429" <<GATEWAY_PARSER>> [$__range])))
+
+--------------------------------------------------------------------------------
+B3 — Time series: 429 ratio per organization  (the real abuse signal)
+--------------------------------------------------------------------------------
+sum by (organizationID) (count_over_time({service_name="api-gateway", cluster=~"$cluster"} |= "status=429" <<GATEWAY_PARSER>> [5m]))
+/
+sum by (organizationID) (count_over_time({service_name="api-gateway", cluster=~"$cluster"} <<GATEWAY_PARSER>> [5m]))
+
+Unit = percentunit. This is the panel that justifies a block: an organization
+whose traffic is >90% rejected and which keeps sending is ignoring Retry-After.
+Volume alone never justifies a block; this ratio plus persistence does.
+
+--------------------------------------------------------------------------------
+B4 — Time series: P95 latency  (Dashboard 1 and 8)
+--------------------------------------------------------------------------------
+quantile_over_time(0.95, {service_name="api-gateway", cluster=~"$cluster"} <<GATEWAY_PARSER>> | unwrap latencyMs [5m]) by (route)
+
+Unit = ms.
+
+--------------------------------------------------------------------------------
+B5 — Bar gauge: Top endpoints  (Dashboard 9)
+--------------------------------------------------------------------------------
+topk(10, sum by (route, method) (count_over_time({service_name="api-gateway", cluster=~"$cluster"} <<GATEWAY_PARSER>> [$__range])))
+
+--------------------------------------------------------------------------------
+B6 — Error correlation overlay  (Dashboard 8)
+--------------------------------------------------------------------------------
+Requires a Prometheus/Mimir datasource for CPU and memory. Build as a single
+Time series panel with mixed datasources and these series, all on Min interval 1m:
+  - requests:  sum(count_over_time({service_name="api-gateway"} [1m]))
+  - 429s:      sum(count_over_time({service_name="api-gateway"} |= "status=429" [1m]))
+  - P95:       the B4 query without "by (route)"     [right Y axis, unit ms]
+  - CPU:       sum(rate(container_cpu_usage_seconds_total{pod=~"api-gateway.*"}[1m]))
+  - Memory:    sum(container_memory_working_set_bytes{pod=~"api-gateway.*"})
+Verify the Prometheus metric names against your cluster before using them.
+
+
+================================================================================
+PANEL RULES — WHY THESE QUERIES LOOK LIKE THIS
+================================================================================
+Paste this section to the Grafana assistant if it proposes a different shape.
+
+1. Use count_over_time([window]), never rate(...[$__auto]) * 3600.
+   rate() over a short auto-selected window measures a burst and then
+   extrapolates it across a whole hour. On bursty traffic it inflates wildly:
+       10 events in a 2-minute burst, then 58 minutes of silence
+         rate([2m]) * 3600  = (10/120) x 3600 = 300   <- fiction
+         count_over_time([1h]) = 10                   <- truth
+   This is exactly the defect that made an existing panel on this dashboard read
+   "780 req/m" when the real figure was ~73 per hour.
+
+2. Min interval must equal the range vector.
+   [1h] only sets how far back each point looks — it does not control how many
+   points are plotted. Without Min interval = 1h, Grafana picks its own step
+   (~15-20 min on a 24h range) and you get overlapping one-hour windows sampled
+   every 20 minutes, landing on :15 and :45 marks instead of clean hourly bars.
+
+3. Unit must match the expression's real dimension.
+   A count per hour under a "req/m" unit is wrong by 60x and nothing in the UI
+   warns you. For bucketed counts use short or none. Never reqpm on a
+   count_over_time panel. For ratios use none or percentunit — never a rate unit.
+
+4. Time series + Draw style Bars, not the Bar chart panel.
+   The Bar chart panel is for categorical data. Time-bucketed counts belong on a
+   Time series panel with the bars draw style.
+
+5. Line filter before parser.
+   Always put |= "Token request successful" before the pattern/regexp parser.
+   Filtering first is dramatically cheaper than parsing every line.
+
+6. Keep organizationID and clientID as parsed fields, never as stream labels.
+   Loki creates one stream per unique label combination. Promoting a tenant id
+   to a label multiplies streams by the tenant count. Parsed fields cost nothing
+   on the index.
+
+7. Titles must state what the panel actually measures.
+   "Orgs above threshold" with no threshold configured is how a dashboard loses
+   credibility. If there is no threshold, do not put one in the title.

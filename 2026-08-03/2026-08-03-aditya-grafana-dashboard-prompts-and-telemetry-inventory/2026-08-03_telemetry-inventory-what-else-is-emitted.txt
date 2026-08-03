@@ -1,0 +1,247 @@
+================================================================================
+TELEMETRY INVENTORY — WHAT ELSE IS EMITTED BESIDES "Token request successful"
+Searched: external-api-server, forebitt, hank, moonraker, api-gateway (chart),
+          dyogram deployment charts
+Date: 2026-08-03
+================================================================================
+
+SHORT ANSWER
+------------
+Yes — considerably more, in two categories, and the second one changes the plan.
+
+  1. LOGS: ~25 additional log statements carry organizationID, out of 390 total
+     log statements in external-api-server. BUT they use four mutually
+     incompatible formats, and only ONE of them is the key=value shape that
+     Datadog auto-parses into a facet.
+
+  2. METRICS: every service — including the api-gateway — already exposes
+     Prometheus metrics via a ServiceMonitor. This was missed in the 2026-08-02
+     investigation, which treated logs as the only source. Roughly half of the
+     "blocked" panels in the dashboard prompt file are buildable TODAY from
+     Prometheus, with no code change at all.
+
+The architectural point that follows:
+     METRICS answer  "how much, how fast, how broken"
+     LOGS    answer  "which tenant"
+     NEITHER alone answers "which tenant is being throttled" — that specific
+     question still needs the gateway to log org + status together.
+
+
+================================================================================
+1. PROMETHEUS METRICS — VERIFIED PRESENT, NOT YET USED
+================================================================================
+
+VERIFIED FROM SOURCE:
+
+  external-api-server/pom.xml:125,133
+      spring-boot-starter-actuator
+      micrometer-registry-prometheus
+
+  external-api-server/src/main/resources/application.yml:19-38
+      management.server.port          = ${MANAGEMENT_SERVER_LISTEN:9444}
+      management.metrics.export.prometheus.enabled = true
+      management.endpoints.web.exposure.include    = prometheus, health, info, metrics
+
+  dyogram/charts/api-gateway/values.yaml:147-156
+      metrics.enabled                    = true
+      metrics.serviceMonitor.enabled     = true
+      metrics.serviceMonitor.interval    = 30s
+
+  dyogram/charts/api-gateway/templates/servicemonitor.yaml
+      endpoint port: management, path: /actuator/prometheus
+
+  dyogram/charts/external-api-server/templates/servicemonitor.yaml
+      port: management, path: /actuator/prometheus
+
+  15 of the dyogram charts ship a ServiceMonitor with metrics enabled:
+      api-gateway, armorica, bucolix, cronos, external-api-server, forebitt,
+      identity-bridge, janus, moonraker, pegleg, picanmix, postaldistrix,
+      primage, unhygienix   (kedge has one but metrics.enabled = false)
+
+WHAT THIS GIVES YOU (standard Micrometer, no custom code required):
+
+      http_server_requests_seconds_count{uri, method, status, outcome}
+      http_server_requests_seconds_sum
+      http_server_requests_seconds_max
+      jvm_memory_used_bytes, process_cpu_usage, system_cpu_usage, ...
+
+  If the gateway is Spring Cloud Gateway, it additionally emits:
+      spring_cloud_gateway_requests_seconds_count{routeId, outcome, status, httpMethod}
+
+  hank instruments its own metrics directly (hank/metrics/prometheus.go:12-34):
+      http_requests_total{path}
+      http_response_time_seconds{method, path, code}     <- has status code
+      requests_in_flight{method, path}
+
+WHAT THIS UNBLOCKS RIGHT NOW (previously listed as Part B / blocked):
+      Dashboard 1  requests/sec        -> rate(http_server_requests_seconds_count[5m])
+      Dashboard 1  errors/sec, 5xx     -> same, filtered on status=~"5.."
+      Dashboard 1  429 rate (total)    -> same, filtered on status="429"
+      Dashboard 1  P95 latency         -> histogram_quantile on the _bucket series
+      Dashboard 8  CPU / memory        -> process_cpu_usage, jvm_memory_used_bytes
+      Dashboard 9  endpoint breakdown  -> topk by uri
+
+WHAT IT STILL DOES NOT GIVE:
+      Any per-organization or per-client breakdown. Micrometer deliberately does
+      not tag HTTP metrics with tenant identifiers — that would be unbounded
+      cardinality and is the correct default. Do NOT add organizationID as a
+      Micrometer tag; the org count multiplied by uri x method x status would
+      produce an enormous number of time series.
+
+UNVERIFIED — YOU MUST CONFIRM:
+      That these series actually exist in your Grafana. What is verified is that
+      the exporter dependency, the exposure config and the scrape config are all
+      in place in source and in the Helm charts. Whether Prometheus/Mimir is
+      wired to your Grafana instance, and under what datasource name, I could not
+      check from the repository.
+
+      CONFIRM WITH: Grafana -> Explore -> pick the Prometheus/Mimir datasource:
+          http_server_requests_seconds_count{service="external-api-server"}
+          http_server_requests_seconds_count{service="api-gateway"}
+      Adjust the label (may be job, app, kubernetes_name rather than service).
+
+
+================================================================================
+2. LOGS — WHAT ELSE CARRIES organizationID
+================================================================================
+
+external-api-server has 390 log statements. Roughly 25 carry an org, client or
+user identifier. The complete list of org-carrying lines:
+
+  service/auth0/Auth0Service.java:75            Token request successful     <- the one you use
+  service/credential/CredentialSourceService.java:30,69,111
+  service/credential/OrganizationCredentialService.java:35,64
+  service/dataconnection/DataSourceService.java:36,76
+  service/dataconnection/IdentifierService.java:28
+  service/user/UserService.java:22
+  service/cleanroom/CleanRoomService.java:35,68,237
+  service/cleanroom/CleanRoomQuestionService.java:710,789,850
+  service/cleanroom/CleanRoomQuestionRunService.java:494
+  service/cleanroom/CleanroomQuestionRunScheduleService.java:52,123,148,166,179,242,258,269
+  service/intelligence/IntelligenceService.java:50,121                       <- see below
+
+THE PROBLEM: FOUR INCOMPATIBLE FORMATS
+
+  Occurrences across external-api-server/src/main/java:
+
+      organizationID={}          1     <- Auth0Service only
+      organizationID {}         13     <- space separated
+      organizationID: {}         9     <- colon separated
+      orgId={}                   2     <- different key name entirely
+      caller={} owner={} cr={}   2     <- IntelligenceService
+
+  Consequence for Datadog: only the key=value form auto-parses into the
+  @organizationID facet. The 22 lines using "organizationID <value>" or
+  "organizationID: <value>" produce NO facet and cannot be grouped by org
+  without a custom Grok parser in the log pipeline.
+
+  Consequence for Loki: one regexp cannot cover all four. Either normalise the
+  log format in code (preferred) or write a parser with alternation:
+
+      | regexp `organizationID[=: ]\s*(?P<organizationID>[0-9a-f-]{8,})`
+
+  That alternation regexp does work for the three organizationID variants but
+  still misses orgId= and the caller=/owner= pair.
+
+HIGH-VALUE LINES NOBODY IS DASHBOARDING
+---------------------------------------
+Two of these are more operationally interesting than request volume:
+
+  IntelligenceService.java:50   log.warn("Org mismatch on getCleanRoomIntelligence: caller={}, owner={}, cr={}")
+  IntelligenceService.java:121  log.warn("Org mismatch in authz check: caller={}, owner={}, cr={}")
+
+  These fire when one organization attempts to access another organization's
+  clean room. That is a cross-tenant authorization failure — a security signal,
+  not a capacity signal. It is already in key=value form, so it is aggregatable
+  today with no code change. A panel counting these by caller is arguably more
+  valuable than anything in the ten-dashboard list.
+
+  Suggested LogQL:
+      sum by (caller) (count_over_time(
+        {service_name="external-api-server", cluster=~"$cluster"}
+        |= "Org mismatch"
+        | pattern `<_>caller=<caller>, owner=<owner>, cr=<cr>` [1h]))
+
+Also present, in the auth filters (http/filters/):
+      "Missing required internal headers for path: {}"
+      "Missing or invalid Authorization header for internal path: {}"
+      "Invalid base64 in {} claim"
+  These are authentication failures. None carry an organizationID (by definition
+  — the request failed before the org was resolved), so they can be counted in
+  total but not attributed to a tenant.
+
+FOREBITT
+--------
+  Searched forebitt for Go log statements containing organization / orgid /
+  tenant / clientid: NO MATCHES. forebitt does not appear to emit tenant-
+  attributable log lines. It does ship a ServiceMonitor, so its HTTP metrics are
+  available.
+
+
+================================================================================
+3. UNRESOLVED — THE LOG FORMAT QUESTION FROM THE PROMPT FILE
+================================================================================
+
+external-api-server/src/main/resources/logback-spring.xml:
+
+      <appender name="json"    ... net.logstash.logback.encoder.LogstashEncoder/>
+      <appender name="console" ... pattern>%cyan(%d{HH:mm:ss.SSS}) %yellow([%thread])
+                                    %highlight(%-5level) %magenta(%logger{36}) - %msg%n</pattern>
+      <root level="info">
+          <appender-ref ref="${LOGBACK_APPENDER:-console}"/>
+      </root>
+
+  So the output is JSON only if the environment variable LOGBACK_APPENDER is set
+  to "json". A repository-wide grep for LOGBACK_APPENDER found it ONLY in the
+  logback XML files themselves — it is set in no chart, no values file, no
+  deployment template in dyogram.
+
+  That means either it is injected from a source outside this repository, or
+  production is emitting the plain coloured console pattern. This is exactly the
+  STEP 0 question in the dashboard prompt file and it is still open.
+
+  RESOLVE IT WITH:
+      kubectl -n external-api-server get pods -l app=external-api-server \
+        -o jsonpath='{.items[0].spec.containers[0].env}' | tr ',' '\n' | grep -i logback
+
+  If unset, the log lines contain ANSI colour escape codes, which is a further
+  reason your Loki queries may need | decolorize before parsing.
+
+
+================================================================================
+4. WHAT CHANGES IN THE DASHBOARD PLAN
+================================================================================
+
+REVISED, relative to 2026-08-03_grafana-ai-dashboard-build-prompts.txt:
+
+  Move from Part B (blocked) to buildable now, using a PROMETHEUS datasource:
+      Dashboard 1  requests/sec, errors/sec, 5xx, 429 total, P95 latency
+      Dashboard 8  CPU / memory / latency correlation
+      Dashboard 9  endpoint breakdown by uri
+
+  Remains genuinely blocked (needs org + status in one record):
+      Dashboard 2  the 429 and latency COLUMNS of the per-org table
+      Dashboard 5  top organizations receiving 429      <- the key abuse signal
+      Dashboard 1  top IPs (not logged anywhere)
+
+  Newly available, not previously on the list:
+      Cross-tenant authorization failures by caller (IntelligenceService)
+      Authentication failure rate (auth filters)
+      In-flight request saturation (hank: requests_in_flight)
+
+THE ONE CHANGE THAT MATTERS MOST
+--------------------------------
+Everything still-blocked reduces to a single missing join: no record contains
+both an organization identifier and an HTTP status. Metrics have status without
+org; logs have org without status.
+
+Fix it in one place — the gateway's rate-limit rejection path — using the
+key=value form so both Datadog faceting and Loki pattern parsing work:
+
+      Rate limit exceeded organizationID=<id>, clientID=<id>, route=<path>,
+      method=<verb>, status=429, limitPerSec=<n>, retryAfterSec=<n>
+
+Second priority: normalise the 22 existing "organizationID <value>" and
+"organizationID: <value>" log lines in external-api-server to
+"organizationID=<value>". That is a mechanical change and it makes two dozen
+existing business-operation logs aggregatable per tenant for free.
