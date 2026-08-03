@@ -1,0 +1,425 @@
+================================================================================
+IMPLEMENTATION PLAN — EMITTING 429, 5xx, LATENCY AND ROUTE TELEMETRY
+What must actually change to unblock the Part B dashboard panels
+Date: 2026-08-03
+================================================================================
+
+SCOPE
+-----
+Unblocks these, from 2026-08-03_grafana-ai-dashboard-build-prompts.txt:
+
+    Dashboard 1   requests/sec, errors/sec, 429/sec, 5xx, P95 latency, top IPs
+    Dashboard 2   the 429 and latency columns of the per-org table
+    Dashboard 5   Rate limit violations by organization
+    Dashboard 8   Error correlation (requests / latency / 429 / CPU / memory)
+    Dashboard 9   Endpoint breakdown
+
+
+================================================================================
+0. EXECUTIVE SUMMARY — THIS IS SMALLER THAN IT LOOKS
+================================================================================
+
+Two of the four things you need ALREADY EXIST and are simply not being queried:
+
+  ALREADY THERE (1) — Prometheus metrics.
+      external-api-server and api-gateway both expose /actuator/prometheus and
+      are scraped by a ServiceMonitor. Micrometer's
+      http_server_requests_seconds_*{uri, method, status, outcome} gives you
+      requests/sec, 5xx rate, 429 rate, P95 latency and endpoint breakdown
+      TODAY. No code change. See section 1.
+
+  ALREADY THERE (2) — organizationID in the log MDC.
+      external-api-server/src/main/java/com/habu/api/external/http/filters/
+      InternalJwtTokenFilter.java:47   MDC.put(ORGANIZATION_ID, organizationID)
+      InternalAuthFilter.java:94       MDC.put(Constants.ORGANIZATION_ID, orgId)
+      Constants.java:22                ORGANIZATION_ID = "organizationID"
+
+      The logs are encoded by LogstashEncoder, which promotes every MDC entry to
+      a TOP-LEVEL JSON field. requestId already proves this works — it reaches
+      the JSON envelope by exactly this route (RequestIdFilter.java:37).
+
+      So on any AUTHENTICATED request, organizationID should already be a
+      top-level JSON field on every log line, with no message parsing at all.
+      VERIFY THIS FIRST — see section 2. It may already be true, in which case
+      the "four incompatible organizationID formats" problem is largely moot.
+
+  MUST BE BUILT (1) — a per-request access log.
+      Nothing today writes one line per HTTP request containing status, latency
+      and route. That single record is what joins "which tenant" to "what
+      happened". See section 3.
+
+  MUST BE BUILT (2) — a structured 429 log at the gateway.
+      The rejection log is a plain string with "org=" and no status code. See
+      section 4.
+
+THE ONE SENTENCE VERSION
+    Metrics already give you status and latency without a tenant. MDC already
+    gives you the tenant without status or latency. You need one access-log line
+    that carries both, plus the gateway's 429 in the same shape.
+
+
+================================================================================
+1. NO CHANGE NEEDED — QUERY THE METRICS YOU ALREADY EXPORT
+================================================================================
+
+VERIFY FIRST (Grafana -> Explore -> Prometheus/Mimir datasource):
+
+    http_server_requests_seconds_count{service="external-api-server"}
+
+  If empty, try job=, app=, or kubernetes_name= instead of service=. If still
+  empty, Prometheus is not wired to this Grafana and section 1 does not apply —
+  fall back to section 3 for everything.
+
+QUERIES ONCE CONFIRMED:
+
+  Requests/sec
+      sum(rate(http_server_requests_seconds_count{service="$svc"}[5m]))
+
+  Errors/sec (5xx)
+      sum(rate(http_server_requests_seconds_count{service="$svc", status=~"5.."}[5m]))
+
+  429/sec (total, no tenant breakdown)
+      sum(rate(http_server_requests_seconds_count{service="$svc", status="429"}[5m]))
+
+  Error ratio
+      sum(rate(http_server_requests_seconds_count{service="$svc", outcome!="SUCCESS"}[5m]))
+      / sum(rate(http_server_requests_seconds_count{service="$svc"}[5m]))
+
+  P95 latency by route
+      histogram_quantile(0.95, sum by (le, uri) (
+        rate(http_server_requests_seconds_bucket{service="$svc"}[5m])))
+
+  Top endpoints
+      topk(10, sum by (uri, method) (
+        rate(http_server_requests_seconds_count{service="$svc"}[5m])))
+
+  CPU / memory for the correlation overlay
+      process_cpu_usage{service="$svc"}
+      jvm_memory_used_bytes{service="$svc", area="heap"}
+
+  hank exposes its own equivalents (hank/metrics/prometheus.go:12-34):
+      http_requests_total{path}
+      http_response_time_seconds{method, path, code}
+      requests_in_flight{method, path}
+
+PRECONDITION FOR P95: the _bucket series only exists if histogram buckets are
+enabled. If histogram_quantile returns nothing, add to application.yml:
+
+    management:
+      metrics:
+        distribution:
+          percentiles-histogram:
+            http.server.requests: true
+          slo:
+            http.server.requests: 50ms,100ms,250ms,500ms,1s,2s,5s
+
+  Cost note: this multiplies the series count for that metric by the number of
+  buckets. It is bounded and normal, but it is not free.
+
+WHAT THIS WILL NEVER GIVE YOU
+      Per-organization or per-client breakdown. Do NOT add organizationID as a
+      Micrometer tag. org_count x uri x method x status x instance is unbounded
+      and will damage your Prometheus. Tenant attribution belongs in logs.
+
+
+================================================================================
+2. VERIFY BEFORE YOU BUILD — IS organizationID ALREADY A JSON FIELD?
+================================================================================
+
+The token-endpoint sample everyone has been looking at does NOT carry
+organizationID as a field, and there is a good reason: /v1/oauth/token is the
+call that MINTS the token. There is no JWT to read yet, so InternalJwtTokenFilter
+has nothing to put in MDC. That sample is the one case where MDC is empty.
+
+Run this against an AUTHENTICATED endpoint instead:
+
+    {service_name="external-api-server", cluster=~"eks-admin-prod"}
+      | json
+      | logger_name=~"com.habu.api.external.service.cleanroom.*"
+      | organizationID != ""
+
+  If rows come back, organizationID is already a top-level JSON field and:
+      - Every org-carrying panel gets simpler: drop line_format and pattern
+        entirely, just use  | json  and group by organizationID.
+      - The "22 log lines use the wrong format" problem stops mattering for
+        aggregation, because you no longer parse the message at all.
+      - Datadog should likewise expose it as a real attribute, not a
+        message-derived one.
+
+  If NO rows come back, check whether LogstashEncoder is configured to include
+  MDC. It does by default; if it has been disabled, re-enable it in
+  logback-spring.xml:
+
+      <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+          <includeMdcKeyName>requestId</includeMdcKeyName>
+          <includeMdcKeyName>organizationID</includeMdcKeyName>
+          <includeMdcKeyName>clientName</includeMdcKeyName>
+      </encoder>
+
+  Note Constants.java:23 — USER_EMAIL is stored under the MDC key "clientName",
+  not "userEmail". Query accordingly.
+
+ALSO WORTH ADDING TO MDC (one line each, in the same filters):
+      clientID    - so per-credential panels work without message parsing
+      NOT userEmail as a raw address if you would rather not have PII in logs;
+      it is already there as clientName, so decide deliberately.
+
+
+================================================================================
+3. CHANGE 1 — ADD A PER-REQUEST ACCESS LOG  (highest value)
+================================================================================
+
+WHY
+  This is the single record that joins tenant to outcome. Metrics have status
+  without org. MDC has org without status. One access-log line, written after
+  the request completes while MDC is still populated, has both.
+
+WHERE
+  external-api-server/src/main/java/com/habu/api/external/http/filters/
+  New file: AccessLogFilter.java
+
+ORDERING — THIS IS THE PART THAT IS EASY TO GET WRONG
+  The filter must run OUTSIDE (before) RequestIdFilter and InternalJwtTokenFilter
+  so that it wraps them, but it must WRITE its log line AFTER chain.doFilter
+  returns — at that point MDC is populated by the inner filters and the response
+  status is known.
+
+  Give it @Order(Ordered.HIGHEST_PRECEDENCE) or an order lower than
+  RequestIdFilter's. Verify with an integration test that organizationID is
+  non-empty in the emitted line for an authenticated request.
+
+SHAPE (extends OncePerRequestFilter)
+
+    long start = System.nanoTime();
+    try {
+        chain.doFilter(request, response);
+    } finally {
+        long latencyMs = (System.nanoTime() - start) / 1_000_000;
+        log.info("access route={}, method={}, status={}, latencyMs={}, bytes={}",
+                 routeTemplate(request), request.getMethod(),
+                 response.getStatus(), latencyMs, response.getBufferSize());
+    }
+
+  organizationID, clientName and requestId are NOT passed as arguments — they
+  arrive automatically as top-level JSON fields from MDC. That is the whole point.
+
+CRITICAL: USE THE ROUTE TEMPLATE, NOT THE RAW URI
+  request.getRequestURI() returns /v1/cleanrooms/9f2a.../questions/7b1c...
+  Logging that produces near-unique route values, which destroys grouping and
+  inflates Loki's parsed-field cardinality.
+
+  Use the Spring handler mapping's best-match pattern instead:
+
+      Object pattern = request.getAttribute(
+          HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
+      // -> /v1/cleanrooms/{cleanroomId}/questions/{questionId}
+
+  Fall back to "UNKNOWN" when null (unmatched paths, 404s) rather than logging
+  the raw URI. This mirrors what Micrometer already does for its uri tag, so
+  metric and log route values will agree — which matters when you overlay them.
+
+EXCLUSIONS
+  Skip /actuator/** and health probes, or your access log will be dominated by
+  kubelet traffic. Follow the existing shouldNotFilter pattern in
+  InternalJwtTokenFilter.java:76.
+
+SAMPLING (only if volume becomes a problem)
+  Log every 4xx/5xx unconditionally; sample 2xx at, say, 1 in 10. Never sample
+  errors. Note the sample rate as a field so queries can multiply back up.
+
+WHAT THIS UNBLOCKS
+  Dashboard 2  429 and latency columns per organization
+  Dashboard 9  endpoint breakdown WITH tenant attribution
+  Dashboard 8  latency correlated with a specific tenant's traffic
+  Plus: 5xx by organization, which no metric can give you.
+
+
+================================================================================
+4. CHANGE 2 — STRUCTURED 429 AT THE GATEWAY
+================================================================================
+
+CURRENT STATE
+  The rejection path logs a plain string with "org=" and no status field, so it
+  cannot be grouped by organization in either Loki or Datadog. In the local study
+  gateway this is RateLimitFilter.java:101; confirm the equivalent line in the
+  production gateway repository, which is NOT checked out locally.
+
+CHANGE — match the key=value shape so Datadog auto-facets it and Loki patterns
+cleanly:
+
+    log.warn("Rate limit exceeded organizationID={}, clientID={}, route={}, " +
+             "method={}, status=429, limitPerSec={}, burstCapacity={}, " +
+             "retryAfterSec={}, requestId={}",
+             orgId, clientId, routeTemplate, method,
+             replenishRate, burstCapacity, retryAfterSeconds, requestId);
+
+  Better still, if the gateway also uses LogstashEncoder: put orgId/clientId in
+  MDC at the point the JWT is parsed, and let them become top-level fields on
+  every gateway log line — same mechanism external-api-server already uses.
+
+ALSO ADD A BOUNDED COUNTER (metrics, for alerting)
+
+    meterRegistry.counter("api_gateway_rate_limit_rejections_total",
+        "route", routeTemplate,
+        "method", method)
+        .increment();
+
+  Deliberately NO org tag on the metric — that is the log's job. This counter
+  exists so a monitor can alert on total rejection volume cheaply, without
+  querying logs.
+
+TWO PRE-EXISTING ISSUES WORTH FIXING IN THE SAME CHANGE
+  a) THE TOKEN ENDPOINT IS NOT RATE LIMITED. The filter skips /v1/oauth/token
+     with the comment "Token endpoint has its own limits", and the oauth route
+     carries no limiter. Credential-flow flooding — the exact scenario that
+     started this work — passes through unthrottled. Either implement those
+     limits or document where they live.
+  b) THE LIMITER FAILS OPEN. On a Redis error the request is allowed, with no
+     metric and no alert on that path. Add:
+         meterRegistry.counter("api_gateway_rate_limit_failopen_total").increment();
+     and alert on it. A Redis outage currently disables all throttling silently,
+     precisely when load is highest.
+
+
+================================================================================
+5. CHANGE 3 — LOG TOKEN-REQUEST FAILURES
+================================================================================
+
+WHERE
+  external-api-server/src/main/java/com/habu/api/external/service/auth0/
+  Auth0Service.java
+
+CURRENT
+  Line 75 logs ONLY on success, after the Auth0 round trip. The
+  ForbiddenException at line 63-65 (ExternalAPIAccess product not enabled) and
+  any Auth0 rejection return without logging anything.
+
+CONSEQUENCE
+  A client looping with a bad secret, or an org without the product enabled,
+  produces ZERO dashboard signal while still consuming a moonraker gRPC call, a
+  provisioning gRPC call and an Auth0 round trip per attempt. Every existing
+  abuse dashboard is blind to failed-auth floods.
+
+CHANGE — same key=value shape, one line per failure path:
+
+    log.warn("Token request failed clientID={}, organizationID={}, reason={}",
+             clientId, organizationID, "PRODUCT_NOT_ENABLED");
+
+  Reasons worth distinguishing: PRODUCT_NOT_ENABLED, AUTH0_REJECTED,
+  APIKEY_LOOKUP_FAILED, INVALID_CREDENTIALS.
+
+  NEVER log the client secret, the token, or any part of either.
+
+  Note the ordering constraint: organizationID is only known AFTER the
+  getAPIKeyInfo gRPC call at line 45-51. If that call itself fails, log with
+  clientID only and reason=APIKEY_LOOKUP_FAILED.
+
+ALSO ADD A COUNTER
+    meterRegistry.counter("token_requests_total", "outcome", "success|failure",
+                          "reason", reason).increment();
+  Bounded: outcome has 2 values, reason has ~4. Safe to tag.
+
+
+================================================================================
+6. CHANGE 4 — NORMALISE THE LEGACY LOG LINES  (optional, do last)
+================================================================================
+
+22 log statements in external-api-server write the org as
+"organizationID <value>" or "organizationID: <value>" instead of
+"organizationID=<value>". Full list in
+2026-08-03_telemetry-inventory-what-else-is-emitted.txt section 2.
+
+IF SECTION 2 CONFIRMS organizationID IS ALREADY IN MDC, THIS IS LOW PRIORITY.
+You would be aggregating on the MDC-derived JSON field, not on the message text,
+so the message format stops mattering for dashboards. It still matters for
+humans reading logs and for anyone grepping, so normalise opportunistically
+rather than as a dedicated project.
+
+If you do it: mechanical find-and-replace, no behaviour change, no test impact.
+
+
+================================================================================
+7. CARDINALITY GUARDRAILS — READ BEFORE IMPLEMENTING
+================================================================================
+
+  SAFE as a Prometheus/Micrometer tag:
+      route template, method, status, outcome, service, env
+      (bounded: ~50 routes x 5 methods x ~15 statuses)
+
+  NEVER a Prometheus/Micrometer tag:
+      organizationID, clientID, userId, requestId, raw URI with ids in it
+
+  SAFE as a Loki stream LABEL:
+      service_name, cluster, namespace, level
+      (level is borderline — it multiplies streams by ~4; acceptable)
+
+  NEVER a Loki stream label:
+      organizationID, clientID, requestId
+      These belong in the JSON body / structured metadata. Loki creates one
+      stream per unique label COMBINATION; a tenant id multiplies your stream
+      count by your tenant count.
+
+  SAFE as a JSON field / MDC entry:
+      everything above, including organizationID, clientID and requestId.
+      MDC entries cost nothing on any index — they are just body content.
+
+  DATADOG: a facet on a body attribute is fine and does not create an index per
+  value. The cost drivers there are indexed log VOLUME x retention, and any
+  log-derived CUSTOM METRIC tagged by a high-cardinality attribute. Do not turn
+  the access log into a custom metric tagged by organizationID.
+
+
+================================================================================
+8. ROLLOUT ORDER
+================================================================================
+
+  Step 0  Verify Prometheus datasource reachability          no code    minutes
+          -> if it works, build Dashboards 1, 8, 9 immediately
+
+  Step 1  Verify organizationID is already a JSON field      no code    minutes
+          -> section 2 query. Determines how much of the rest you need.
+
+  Step 2  Structured 429 + counters at the gateway           small      1-2 days
+          -> unblocks Dashboard 5 and the 429 column of Dashboard 2.
+             Highest value per line of code. Includes the fail-open counter.
+
+  Step 3  Token-request failure logging                      small      half day
+          -> closes the failed-auth blind spot.
+
+  Step 4  Access log filter in external-api-server           medium     2-3 days
+          -> unblocks per-tenant latency and 5xx, and endpoint breakdown with
+             tenant attribution. Needs care on filter ordering and route
+             templating; budget time for the integration test.
+
+  Step 5  Rate-limit the token endpoint, or document its limits.
+          -> not a telemetry change, but it is the actual vulnerability the
+             dashboards were built to observe.
+
+  Step 6  Normalise legacy log lines                         trivial    opportunistic
+
+
+================================================================================
+9. HOW TO VERIFY EACH CHANGE LANDED
+================================================================================
+
+  After Step 2 (gateway 429):
+      {service_name="api-gateway", cluster=~"$cluster"}
+        |= "Rate limit exceeded" | json | organizationID != ""
+      -> should return rows with organizationID as a real field, not text.
+      Datadog: confirm @organizationID appears as a facet on those events.
+
+  After Step 3 (token failures):
+      sum by (reason) (count_over_time(
+        {service_name="external-api-server"} |= "Token request failed"
+        | json | line_format "{{.message}}"
+        | pattern `<_>reason=<reason>` [1h]))
+
+  After Step 4 (access log):
+      sum by (organizationID, status) (count_over_time(
+        {service_name="external-api-server"} |= "access route=" | json [5m]))
+      -> this is the query that finally answers
+         "which organization is receiving 429s", which is where this whole
+         investigation started.
+
+  Regression check for all of them: confirm no secret, token, client secret or
+  raw email has entered the log stream. Grep the new lines before merging.

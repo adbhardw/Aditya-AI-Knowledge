@@ -179,34 +179,66 @@ FOREBITT
 
 
 ================================================================================
-3. UNRESOLVED — THE LOG FORMAT QUESTION FROM THE PROMPT FILE
+3. RESOLVED — PRODUCTION LOGS ARE JSON
 ================================================================================
 
-external-api-server/src/main/resources/logback-spring.xml:
+Confirmed 2026-08-03 from live Grafana output. LOGBACK_APPENDER is set to "json"
+in the deployment (from a source outside this repository — it appears in no
+dyogram chart, values file or template).
 
-      <appender name="json"    ... net.logstash.logback.encoder.LogstashEncoder/>
-      <appender name="console" ... pattern>%cyan(%d{HH:mm:ss.SSS}) %yellow([%thread])
-                                    %highlight(%-5level) %magenta(%logger{36}) - %msg%n</pattern>
-      <root level="info">
-          <appender-ref ref="${LOGBACK_APPENDER:-console}"/>
-      </root>
+Actual production envelope (identifiers replaced with synthetic values):
 
-  So the output is JSON only if the environment variable LOGBACK_APPENDER is set
-  to "json". A repository-wide grep for LOGBACK_APPENDER found it ONLY in the
-  logback XML files themselves — it is set in no chart, no values file, no
-  deployment template in dyogram.
+  {"@timestamp":"2026-08-03T08:43:46.141Z",
+   "@version":"1",
+   "message":"Token request successful for clientID=AbCdEfGhIjKlMnOpQrStUvWxYz012345, userId=11111111-2222-3333-4444-555555555555, organizationID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+   "logger_name":"com.habu.api.external.service.auth0.Auth0Service",
+   "thread_name":"qtp1216198248-16742",
+   "level":"INFO",
+   "level_value":20000,
+   "requestId":"0f0f0f0f-1e1e-2d2d-3c3c-4b4b4b4b4b4b"}
 
-  That means either it is injected from a source outside this repository, or
-  production is emitting the plain coloured console pattern. This is exactly the
-  STEP 0 question in the dashboard prompt file and it is still open.
+WHAT THIS CHANGES:
 
-  RESOLVE IT WITH:
-      kubectl -n external-api-server get pods -l app=external-api-server \
-        -o jsonpath='{.items[0].spec.containers[0].env}' | tr ',' '\n' | grep -i logback
+  1. No | decolorize needed. The earlier concern about ANSI colour codes does
+     not apply.
 
-  If unset, the log lines contain ANSI colour escape codes, which is a further
-  reason your Loki queries may need | decolorize before parsing.
+  2. requestId is a TOP-LEVEL FIELD, not buried in the message. Every log line
+     produced while handling one HTTP request carries the same value, so you can
+     correlate a tenant's request across every class it touched. This is the same
+     correlation key identified independently in the hank platform-event design
+     work — it is genuinely the load-bearing identifier in this estate.
 
+  3. logger_name is a top-level field, so panels can filter by CLASS rather than
+     by message substring. More precise and cheaper:
+         | json | logger_name="com.habu.api.external.service.auth0.Auth0Service"
+     instead of
+         |= "Token request successful"
+     (keep the line filter too — it prunes before JSON decoding.)
+
+  4. level and level_value are top-level fields. An error/warning-rate-by-class
+     panel needs NO message parsing at all and costs nothing to add.
+
+  5. THE CATCH: clientID, userId and organizationID are NOT top-level fields.
+     They remain embedded in the "message" string, so extraction is two-stage:
+
+         | json
+         | logger_name="com.habu.api.external.service.auth0.Auth0Service"
+         | line_format "{{.message}}"
+         | pattern `<_>clientID=<clientID>, userId=<userId>, organizationID=<organizationID>`
+
+     Cheaper single-stage alternative, exploiting fixed-width identifiers —
+     works on the raw JSON line with no decode:
+
+         | regexp `organizationID=(?P<organizationID>[0-9a-f-]{36})`
+         | regexp `clientID=(?P<clientID>[A-Za-z0-9]{32})`
+
+  6. The four-incompatible-formats problem in section 2 is UNAFFECTED. The JSON
+     envelope wraps the message; it does not restructure what is inside it. The
+     22 log lines using "organizationID <value>" and "organizationID: <value>"
+     are still not key=value, and still need either a code change or a bespoke
+     regexp. Datadog's @organizationID facet works on the token line because
+     Datadog auto-extracts key=value pairs from the message attribute — which is
+     exactly why the other 22 lines produce no facet.
 
 ================================================================================
 4. WHAT CHANGES IN THE DASHBOARD PLAN

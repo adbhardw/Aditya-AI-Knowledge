@@ -47,35 +47,69 @@ leadership dashboard costs more credibility than a missing one.
 
 
 ================================================================================
-STEP 0 — DISCOVERY (paste this first, read the answer, then continue)
+STEP 0 — RESOLVED 2026-08-03. No discovery needed. Read this, then paste PART A.
 ================================================================================
 
-Using the Loki datasource grafanacloud-habu-logs, run this query over the last
-15 minutes and show me 5 raw log lines verbatim:
+Production external-api-server logs are JSON (Logstash encoder), confirmed from
+live Grafana output. LOGBACK_APPENDER=json is set in the deployment.
 
-{service_name="external-api-server", cluster=~"eks-admin-prod"} |= "Token request successful"
+Actual envelope (identifiers replaced with synthetic values):
 
-Then tell me exactly three things:
-1. Are these lines JSON-encoded, or plain text with a logging prefix?
-2. What is the exact text between the log level and "Token request successful"?
-3. List every label available on this stream (not fields — labels).
+  {"@timestamp":"2026-08-03T08:43:46.141Z",
+   "@version":"1",
+   "message":"Token request successful for clientID=AbCdEfGhIjKlMnOpQrStUvWxYz012345, userId=2b1f9b7a-..., organizationID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+   "logger_name":"com.habu.api.external.service.auth0.Auth0Service",
+   "thread_name":"qtp1216198248-16742",
+   "level":"INFO",
+   "level_value":20000,
+   "requestId":"0f0f0f0f-1e1e-2d2d-3c3c-4b4b4b4b4b4b"}
+
+FOUR CONSEQUENCES — all of them good:
+
+  1. Top-level JSON fields available for free after | json :
+         @timestamp   message   logger_name   thread_name
+         level        level_value             requestId
+  2. requestId is a first-class field. Every log line from one HTTP request
+     shares it, so you can correlate across lines and services.
+  3. logger_name lets you filter by CLASS instead of by substring. This is both
+     more precise and cheaper than |= "some text".
+  4. No ANSI colour codes, so | decolorize is NOT needed.
+
+ONE CATCH: clientID, userId and organizationID are NOT top-level JSON fields.
+They are embedded inside the "message" string. So parsing is two-stage — extract
+the message, then pattern-match it.
 
 --------------------------------------------------------------------------------
-Based on the answer, pick ONE parser line and use it in every query below.
-Everywhere you see  <<PARSER>>  substitute your chosen line.
+THE PARSER. Substitute this wherever you see  <<PARSER>>  below.
+--------------------------------------------------------------------------------
 
-  If the lines are PLAIN TEXT (most likely, Spring Boot default):
+    | json
+    | logger_name="com.habu.api.external.service.auth0.Auth0Service"
+    | line_format "{{.message}}"
     | pattern `<_>clientID=<clientID>, userId=<userId>, organizationID=<organizationID>`
 
-  If pattern fails to extract, fall back to regexp:
-    | regexp `clientID=(?P<clientID>[^,]+), userId=(?P<userId>[^,]+), organizationID=(?P<organizationID>\S+)`
+  Always keep the line filter |= "Token request successful" BEFORE | json.
+  Filtering the raw line first is far cheaper than JSON-decoding every line.
 
-  If the lines are JSON:
-    | json | line=~".*Token request successful.*" | pattern `<_>clientID=<clientID>, userId=<userId>, organizationID=<organizationID>`
+  CHEAPER ALTERNATIVE if you only need the organization and not the client —
+  UUIDs are fixed width, so this works on the raw line with no JSON decode:
+
+    | regexp `organizationID=(?P<organizationID>[0-9a-f-]{36})`
+
+  And for the client id (32 alphanumerics, Auth0 format):
+
+    | regexp `clientID=(?P<clientID>[A-Za-z0-9]{32})`
 
 Note on cost: organizationID and clientID are parsed FIELDS here, not stream
 labels. Aggregating by them does not create new Loki streams and does not
 increase cardinality on the index. Never promote them to labels.
+
+--------------------------------------------------------------------------------
+NEWLY POSSIBLE BECAUSE THE LOGS ARE JSON — see panels A12 and A13 at the end
+--------------------------------------------------------------------------------
+  - Error and warning rate by class, with zero code change (uses level +
+    logger_name, no message parsing at all).
+  - Cross-tenant authorization failures by caller organization.
 
 
 ================================================================================
@@ -288,6 +322,43 @@ Options: Show time = on, Wrap lines = on, Order = Newest first, Limit = 200.
 Description: "Set the Organization variable at the top of the dashboard to an
 organizationID from the tables above to see the raw requests, including exact
 timestamps and which credential was used."
+
+
+--------------------------------------------------------------------------------
+A12 — Time series: Error and warning rate by class  (NEW — JSON logs make this free)
+--------------------------------------------------------------------------------
+Add a Time series panel titled "Errors and Warnings by Class" using
+grafanacloud-habu-logs.
+
+Query:
+topk(10, sum by (logger_name, level) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} | json | level=~"WARN|ERROR" [5m])))
+
+Query options: Min interval = 5m
+Options: Draw style = Bars, Stacking = Normal. Unit = short. Legend = table, right.
+Description: "Service health by originating class. Requires no message parsing at
+all — level and logger_name are top-level fields in the JSON log envelope. A new
+class appearing here is usually the first visible sign of a regression."
+
+
+--------------------------------------------------------------------------------
+A13 — Time series: Cross-tenant authorization failures  (NEW — security signal)
+--------------------------------------------------------------------------------
+Add a Time series panel titled "Cross-Tenant Access Attempts (Org Mismatch)"
+using grafanacloud-habu-logs.
+
+Query:
+sum by (caller) (count_over_time({service_name="external-api-server", cluster=~"$cluster"} |= "Org mismatch" | json | line_format "{{.message}}" | pattern `<_>caller=<caller>, owner=<owner>, cr=<cr>` [1h]))
+
+Query options: Min interval = 1h
+Options:
+  - Draw style = Bars
+  - Unit = short
+  - Thresholds: green base, red at 1        (any sustained value is worth a look)
+  - Legend = table, right, showing Total
+Description: "Fires when one organization attempts to reach another
+organization's clean room, from IntelligenceService. This is an authorization
+failure, not a capacity signal — arguably the most important panel on this
+dashboard. Already emitted in key=value form; needs no code change."
 
 
 ================================================================================

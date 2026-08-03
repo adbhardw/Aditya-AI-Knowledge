@@ -5,8 +5,9 @@
 **Follows on from:** [`2026-08-02-aditya-loki-grafana-datadog-discussion`](../../2026-08-02/2026-08-02-aditya-loki-grafana-datadog-discussion/SUMMARY.md)
 
 **Files in this folder:**
-- [`2026-08-03_grafana-ai-dashboard-build-prompts.txt`](2026-08-03_grafana-ai-dashboard-build-prompts.txt) — paste-ready prompts for the Grafana AI chat window that construct 11 panels
+- [`2026-08-03_grafana-ai-dashboard-build-prompts.txt`](2026-08-03_grafana-ai-dashboard-build-prompts.txt) — paste-ready prompts for the Grafana AI chat window that construct 13 panels
 - [`2026-08-03_telemetry-inventory-what-else-is-emitted.txt`](2026-08-03_telemetry-inventory-what-else-is-emitted.txt) — what every service actually emits, searched across 5 repos + the deployment charts
+- [`2026-08-03_implementation-plan-429-5xx-latency-telemetry.txt`](2026-08-03_implementation-plan-429-5xx-latency-telemetry.txt) — the code changes that unblock the remaining panels, in rollout order with cardinality guardrails and per-step verification queries
 
 ---
 
@@ -91,31 +92,80 @@ Also present in `http/filters/`: `"Missing required internal headers for path: {
 
 ---
 
-## 5. Still-open question: is production logging JSON?
+## 5. Resolved: production logs are JSON
 
-```xml
-<!-- external-api-server/src/main/resources/logback-spring.xml -->
-<appender name="json"    class="...ConsoleAppender"><encoder class="net.logstash.logback.encoder.LogstashEncoder"/></appender>
-<appender name="console" class="...ConsoleAppender"><encoder><pattern>%cyan(...)%yellow(...)%highlight(...)- %msg%n</pattern></encoder></appender>
-<root level="info"><appender-ref ref="${LOGBACK_APPENDER:-console}"/></root>
+`logback-spring.xml` selects the encoder via `${LOGBACK_APPENDER:-console}`, and a repo-wide grep finds that variable **only inside the logback XML files themselves** — it appears in no chart, values file or template in `dyogram`. That left the format genuinely open. **Live Grafana output settled it: `LOGBACK_APPENDER=json` is set in the deployment**, injected from outside this repository.
+
+Envelope shape (all identifiers below are synthetic placeholders, not real values):
+
+```json
+{"@timestamp":"2026-08-03T08:43:46.141Z","@version":"1",
+ "message":"Token request successful for clientID=<32-char-auth0-id>, userId=<uuid>, organizationID=<uuid>",
+ "logger_name":"com.habu.api.external.service.auth0.Auth0Service",
+ "thread_name":"qtp1216198248-16742","level":"INFO","level_value":20000,
+ "requestId":"<uuid>"}
 ```
 
-Output is JSON **only** if `LOGBACK_APPENDER=json`. A repo-wide grep finds that variable **only inside the logback XML files themselves** — it is set in no chart, no values file, no deployment template in `dyogram`. So either it is injected from outside this repository, or production emits the plain **coloured** console pattern, in which case Loki queries need `| decolorize` before parsing.
+Five consequences:
 
-```
-kubectl -n external-api-server get pods -l app=external-api-server \
-  -o jsonpath='{.items[0].spec.containers[0].env}' | tr ',' '\n' | grep -i logback
+1. **No `| decolorize` needed** — the ANSI-escape concern does not apply.
+2. **`requestId` is a top-level field.** Every line produced while handling one HTTP request shares it, so a tenant's request can be correlated across every class it touched. This is the same correlation key identified independently in the [hank platform-event design](../2026-08-03-aditya-hank-platform-event-design/SUMMARY.md) — it is genuinely the load-bearing identifier in this estate.
+3. **`logger_name` is top-level**, so panels can filter by class rather than message substring — more precise and cheaper than `|= "…"` (keep the line filter as well; it prunes before JSON decoding).
+4. **`level` / `level_value` are top-level**, so an error-rate-by-class panel needs no message parsing at all.
+5. **The catch:** `clientID`, `userId` and `organizationID` are **not** top-level fields — they stay embedded in `message`, so extraction is two-stage:
+
+```logql
+| json
+| logger_name="com.habu.api.external.service.auth0.Auth0Service"
+| line_format "{{.message}}"
+| pattern `<_>clientID=<clientID>, userId=<userId>, organizationID=<organizationID>`
 ```
 
-This is STEP 0 of the prompt file and it remains unresolved.
+Cheaper single-stage alternative, exploiting fixed-width identifiers, with no JSON decode:
+
+```logql
+| regexp `organizationID=(?P<organizationID>[0-9a-f-]{36})`
+| regexp `clientID=(?P<clientID>[A-Za-z0-9]{32})`
+```
+
+The four-format problem in §4 is **unaffected** — the JSON envelope wraps the message, it does not restructure what is inside it. Datadog's `@organizationID` facet works on the token line because Datadog auto-extracts `key=value` pairs from the message attribute, which is precisely why the other 22 lines yield no facet.
+
+This resolution added two panels to the prompt file: **A12** (errors/warnings by class, zero parsing) and **A13** (cross-tenant access attempts).
 
 ---
 
-## 6. The dashboard prompt file
+## 6. The MDC finding: tenant attribution may already be solved
+
+`external-api-server` already puts the tenant into the logging MDC, and `LogstashEncoder` promotes every MDC entry to a **top-level JSON field**:
+
+| Code | Effect |
+|---|---|
+| `RequestIdFilter.java:37` — `MDC.put(MDC_REQUEST_ID, token)` | why `requestId` is a top-level field — **proof the mechanism works** |
+| `InternalJwtTokenFilter.java:47` — `MDC.put(ORGANIZATION_ID, organizationID)` | runs on non-internal (external API) paths |
+| `InternalAuthFilter.java:94` — `MDC.put(Constants.ORGANIZATION_ID, orgId)` | runs on `/internal/**` |
+| `Constants.java:22` — `ORGANIZATION_ID = "organizationID"` | the JSON field name |
+| `Constants.java:23` — `USER_EMAIL = "clientName"` | note the mismatch: the MDC key is `clientName`, not `userEmail` |
+
+So on any **authenticated** request, `organizationID` should already be a real JSON field requiring no message parsing at all.
+
+Why the pasted sample lacks it: that sample is from `Auth0Service`, i.e. `/v1/oauth/token` — the call that *mints* the token. There is no JWT to read yet, so the filter has nothing to put in MDC. **That endpoint is the one case where MDC is empty**, and it happens to be the only endpoint anyone has been looking at.
+
+Verify against an authenticated endpoint:
+
+```logql
+{service_name="external-api-server", cluster=~"eks-admin-prod"}
+  | json | logger_name=~"com.habu.api.external.service.cleanroom.*" | organizationID != ""
+```
+
+If rows return, the four-format problem in §4 stops mattering for aggregation — you group on the MDC-derived field and never parse the message.
+
+---
+
+## 7. The dashboard prompt file
 
 Structured for how the Grafana assistant actually behaves — one panel per turn, so blocks are pasted individually.
 
-**Part A — 11 panels buildable today** from the token log: total requests stat, active-organizations stat, org × client table, requests/hour bars, requests/hour by org (stacked), traffic-concentration pie, top-10 org and top-10 client bar gauges, growth-factor spike detection, org activity status-history, total log volume (ingestion sanity check), and a per-org logs drill-down driven by a textbox variable.
+**Part A — 13 panels buildable today** from the token log: total requests stat, active-organizations stat, org × client table, requests/hour bars, requests/hour by org (stacked), traffic-concentration pie, top-10 org and top-10 client bar gauges, growth-factor spike detection, org activity status-history, total log volume (ingestion sanity check), a per-org logs drill-down driven by a textbox variable, plus two panels added once the JSON format was confirmed: errors/warnings by class (A12) and cross-tenant access attempts (A13).
 
 Two worth building first:
 - **Traffic concentration pie** — one tenant above ~40% of all traffic is the single most actionable abuse signal available.
@@ -135,24 +185,22 @@ Two worth building first:
 
 ---
 
-## 7. Recommendations, in priority order
+## 8. Recommendations, in priority order
 
-1. **Resolve `LOGBACK_APPENDER`** — one kubectl command, and it determines every parser in the prompt file.
-2. **Confirm the Prometheus datasource**, then build Dashboard 1, 8 and 9 from metrics. This is the largest amount of dashboard for the least work and requires no code change.
-3. **Add the structured 429 log at the gateway** — the single change that unblocks everything still blocked:
+1. **Confirm the Prometheus datasource**, then build Dashboard 1, 8 and 9 from metrics. This is the largest amount of dashboard for the least work and requires no code change.
+2. **Add the structured 429 log at the gateway** — the single change that unblocks everything still blocked:
    ```
    Rate limit exceeded organizationID=<id>, clientID=<id>, route=<path>,
    method=<verb>, status=429, limitPerSec=<n>, retryAfterSec=<n>
    ```
-4. **Build a cross-tenant authorization-failure panel** from the `Org mismatch` warnings. Free, already parseable, and a security signal rather than a capacity one.
-5. **Normalise the 22 non-`key=value` org log lines** in `external-api-server` to `organizationID=<value>`. Mechanical change; makes two dozen existing business-operation logs aggregatable per tenant for free.
-6. **Log token-request failures** in `Auth0Service` (the `ForbiddenException` path at line 63 and Auth0 rejections) — a client flooding with a bad secret is still invisible.
+3. **Build a cross-tenant authorization-failure panel** from the `Org mismatch` warnings. Free, already parseable, and a security signal rather than a capacity one.
+4. **Normalise the 22 non-`key=value` org log lines** in `external-api-server` to `organizationID=<value>`. Mechanical change; makes two dozen existing business-operation logs aggregatable per tenant for free.
+5. **Log token-request failures** in `Auth0Service` (the `ForbiddenException` path at line 63 and Auth0 rejections) — a client flooding with a bad secret is still invisible.
 
 ---
 
-## 8. Open questions
+## 9. Open questions
 
-- Is `LOGBACK_APPENDER` set in production? (blocks parser choice)
 - Which Grafana datasource fronts Prometheus/Mimir, and what is the service-identifying label?
 - Is the production `api-gateway` (image `deklared/api-gateway`) a Spring Cloud Gateway? If so, `spring_cloud_gateway_requests_seconds_count{routeId, outcome, status}` is also available.
 - The production gateway repository is **not** checked out locally — `aditya-external-api-api-gateway` is a study project with no git remote. Its rate-limit values are illustrative, not authoritative.

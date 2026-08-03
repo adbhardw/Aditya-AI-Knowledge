@@ -8,15 +8,16 @@ to feed it.
 
 - **[SUMMARY.md](SUMMARY.md)** — the headline finding (the estate already exports
   Prometheus metrics, which the prior session missed), the four incompatible
-  organizationID log formats, the unresolved log-format question, and the
-  prioritised recommendations.
+  organizationID log formats, the confirmed JSON log envelope and its parser, and
+  the prioritised recommendations.
 
 ## Files
 
 | File | Contents |
 |---|---|
-| [`2026-08-03_grafana-ai-dashboard-build-prompts.txt`](2026-08-03_grafana-ai-dashboard-build-prompts.txt) | Paste into the Grafana AI chat window. STEP 0 discovery query, 11 buildable panels (Part A), pre-written queries for blocked panels (Part B), and a panel-rules appendix that prevents the `rate()*3600` and unit-mismatch defects recurring. |
+| [`2026-08-03_grafana-ai-dashboard-build-prompts.txt`](2026-08-03_grafana-ai-dashboard-build-prompts.txt) | Paste into the Grafana AI chat window. Resolved STEP 0 parser, 13 buildable panels (Part A), pre-written queries for blocked panels (Part B), and a panel-rules appendix that prevents the `rate()*3600` and unit-mismatch defects recurring. |
 | [`2026-08-03_telemetry-inventory-what-else-is-emitted.txt`](2026-08-03_telemetry-inventory-what-else-is-emitted.txt) | What every service emits, searched across external-api-server, forebitt, hank, moonraker and the dyogram deployment charts. Logs and metrics, with file and line references. |
+| [`2026-08-03_implementation-plan-429-5xx-latency-telemetry.txt`](2026-08-03_implementation-plan-429-5xx-latency-telemetry.txt) | What to actually build to unblock 429 / 5xx / latency / route panels: the access-log filter (with the filter-ordering and route-templating traps), the structured gateway 429, token-failure logging, cardinality guardrails, rollout order with effort estimates, and a verification query per step. |
 
 ## Headline findings
 
@@ -31,8 +32,13 @@ to feed it.
   different key name.
 - Two **cross-tenant authorization failure** warnings (`IntelligenceService.java:50,121`)
   are already parseable and dashboarded nowhere.
-- Whether production logs as JSON is **still unresolved** — `LOGBACK_APPENDER` is set in
-  no chart in the repo.
+- **`organizationID` is already put into the logging MDC** by the auth filters, and
+  LogstashEncoder promotes MDC entries to top-level JSON fields — so tenant attribution
+  may already be solved for authenticated requests. The token endpoint is the one place
+  MDC is empty, and it is the only endpoint anyone had looked at.
+- Production logs **are JSON** (confirmed from live Grafana output). `requestId`, `logger_name`
+  and `level` are top-level fields; `organizationID`/`clientID` are not — they stay inside
+  `message`, so extraction is two-stage.
 
 ## Related
 
