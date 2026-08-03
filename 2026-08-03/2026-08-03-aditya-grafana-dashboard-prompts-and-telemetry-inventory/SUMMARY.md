@@ -4,6 +4,24 @@
 **Session type:** Dashboard authoring + multi-repo telemetry audit
 **Follows on from:** [`2026-08-02-aditya-loki-grafana-datadog-discussion`](../../2026-08-02/2026-08-02-aditya-loki-grafana-datadog-discussion/SUMMARY.md)
 
+> ### ⚠️ Corrections applied 2026-08-03 (later the same day)
+> The production API gateway (`deklareddotcom/api-gateway`) was read after this was
+> first written; the earlier analysis had reasoned from a local study project. Three
+> claims were wrong or overstated and are corrected in
+> [`2026-08-03_CORRECTIONS-and-gateway-change-spec.txt`](2026-08-03_CORRECTIONS-and-gateway-change-spec.txt):
+>
+> 1. **"Per-org 429 cannot be built"** — false. For **quota** rejections it was already
+>    fully available, in both the metric (`rate_limit_exceeded{source="QUOTA", key=<orgId>}`)
+>    and the log. Only the **path** filter lacked org attribution. Fixed in
+>    [api-gateway PR #95](https://github.com/deklareddotcom/api-gateway/pull/95).
+> 2. **"Half the blocked panels are buildable from Prometheus"** — overstated. App metrics
+>    are exposed and scrape-configured, but the collection path that reaches Grafana Cloud
+>    sets `prometheusOperatorObjects.enabled: false` and the apps carry no
+>    `prometheus.io/scrape` annotation. **Unproven until `http_server_requests_seconds_count`
+>    returns rows.** Cluster metrics are unaffected and *are* shipping.
+> 3. **Implementation-plan §4** was written against the wrong codebase — superseded.
+
+
 **Files in this folder:**
 - [`2026-08-03_grafana-ai-dashboard-build-prompts.txt`](2026-08-03_grafana-ai-dashboard-build-prompts.txt) — paste-ready prompts for the Grafana AI chat window that construct 13 panels
 - [`2026-08-03_telemetry-inventory-what-else-is-emitted.txt`](2026-08-03_telemetry-inventory-what-else-is-emitted.txt) — what every service actually emits, searched across 5 repos + the deployment charts
@@ -37,9 +55,11 @@ The prior session treated **logs as the only telemetry source**. That was wrong,
 | 15 charts ship a ServiceMonitor with metrics enabled | api-gateway, armorica, bucolix, cronos, external-api-server, forebitt, identity-bridge, janus, moonraker, pegleg, picanmix, postaldistrix, primage, unhygienix (kedge has one, disabled) |
 | Hand-rolled Go metrics: `http_requests_total{path}`, `http_response_time_seconds{method,path,code}`, `requests_in_flight{method,path}` | `hank/metrics/prometheus.go:12-34` |
 
-**What this unblocks with no code change** — previously filed as blocked: requests/sec, errors/sec, 5xx rate, total 429 rate, P95 latency, endpoint breakdown by `uri`, and CPU/memory for the correlation overlay. All from standard Micrometer `http_server_requests_seconds_*{uri, method, status, outcome}`.
+**What this would unblock** — requests/sec, errors/sec, 5xx rate, total 429 rate, P95 latency, endpoint breakdown by `uri`, CPU/memory for the correlation overlay, from standard Micrometer `http_server_requests_seconds_*{uri, method, status, outcome}`.
 
-**Unverified, and stated as such:** whether those series are actually reachable in their Grafana, and under which datasource name. What is verified is that the exporter dependency, the exposure config and the scrape config are all in place. Confirm with `http_server_requests_seconds_count{service="external-api-server"}` in Explore (the label may be `job`/`app`/`kubernetes_name`).
+**⚠️ But the collection path is unproven.** `monitoring-k8s/values.yaml` — the chart that demonstrably remote-writes to Grafana Cloud Prometheus — sets `prometheusOperatorObjects.enabled: false`, so it does **not** consume ServiceMonitor objects; it uses `annotationAutodiscovery`, and neither app chart carries a `prometheus.io/*` annotation. A separate `monitoring` chart deploys `kube-prometheus-stack`, which would honour the ServiceMonitors, but whether that Prometheus is queryable from `habu.grafana.net` cannot be determined from the repo.
+
+**Treat app metrics as unavailable until `http_server_requests_seconds_count` returns rows.** If it is empty, the fix is configuration, not code. **Cluster metrics are unaffected** (`clusterMetrics.enabled: true`) — CPU, memory, restarts, OOMKills, replicas and HPA saturation are shipping regardless.
 
 ---
 

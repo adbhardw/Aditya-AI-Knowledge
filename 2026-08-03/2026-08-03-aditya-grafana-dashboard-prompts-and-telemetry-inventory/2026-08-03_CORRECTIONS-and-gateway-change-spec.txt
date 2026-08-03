@@ -1,0 +1,254 @@
+================================================================================
+CORRECTIONS + GATEWAY CHANGE SPEC
+Supersedes section 4 of 2026-08-03_implementation-plan-429-5xx-latency-telemetry.txt
+Date: 2026-08-03
+================================================================================
+
+Why this file exists: the earlier analysis reasoned about the API gateway from
+aditya-external-api-api-gateway, a local study project with no git remote. The
+real gateway (deklareddotcom/api-gateway) has since been read. Three published
+claims were wrong or overstated. They are corrected below, with evidence.
+
+
+================================================================================
+CORRECTION 1 — "the 429 log is unstructured so top-orgs-by-429 cannot be built"
+================================================================================
+
+PUBLISHED CLAIM (2026-08-02 SUMMARY, and repeated 2026-08-03)
+    The gateway's 429 log is a plain string with "org=", therefore per-org 429
+    aggregation is impossible without a code change.
+
+WHAT IS ACTUALLY TRUE
+    Wrong twice over.
+
+    a) The premise was invented. There is no log line reading
+       "Rate limit EXCEEDED for POST /v1/exports org=abc-123" anywhere in the
+       production gateway. That was extrapolated from the study project.
+       AbstractRateLimitFilter.handleRateLimitExceeded() sets 429 and returns —
+       it logs nothing at all.
+
+    b) The conclusion was wrong independently of the premise. A plain-text log
+       line is perfectly aggregatable in Loki via | pattern or | regexp. "Not
+       key=value" was never a reason it could not be built. In Datadog it would
+       still auto-facet, because "org=abc" IS key=value form.
+
+    c) Most importantly: for QUOTA rejections it was ALREADY fully solved before
+       any change. QuotaRateLimitFilter emitted both
+           metric: rate_limit_exceeded{source="QUOTA", key=<orgId>}
+           log:    log.warn("Quota exceeded. organizationId={}", orgId)
+       Org-level 429 attribution was available from either, with no code change.
+
+    The real gap was narrower than published: only the PATH filter lacked org
+    attribution, and only in its log and metric — the value was in scope the
+    whole time, used to build the Redis bucket key.
+
+
+================================================================================
+CORRECTION 2 — "roughly half the blocked panels are buildable from Prometheus"
+================================================================================
+
+PUBLISHED CLAIM
+    15 charts ship a ServiceMonitor with metrics enabled, therefore requests/sec,
+    5xx, P95 latency and endpoint breakdown are buildable today.
+
+WHAT IS VERIFIED
+    - external-api-server and api-gateway DO expose /actuator/prometheus
+      (spring-boot-starter-actuator + micrometer-registry-prometheus, exposure
+      includes "prometheus").
+    - 15 dyogram charts DO ship a ServiceMonitor with metrics.enabled: true.
+    - Metrics DO reach Grafana Cloud Prometheus at
+      https://prometheus-prod-13-prod-us-east-0.grafana.net
+
+WHAT WAS NOT VERIFIED, AND UNDERCUTS THE CLAIM
+    dyogram/charts/monitoring-k8s/values.yaml:
+        prometheusOperatorObjects:
+          enabled: false        <- ServiceMonitor objects are NOT consumed
+        annotationAutodiscovery:
+          enabled: true         <- needs prometheus.io/scrape annotations
+
+    Neither charts/api-gateway/ nor charts/external-api-server/ carries any
+    prometheus.io/* annotation.
+
+    So the collection path that demonstrably reaches Grafana Cloud does not read
+    ServiceMonitors, and the apps are not annotated for the mechanism it does
+    read. A separate "monitoring" chart deploys kube-prometheus-stack, which
+    WOULD honour the ServiceMonitors — but whether that Prometheus is queryable
+    from habu.grafana.net is unknown from the repository.
+
+CORRECTED STATEMENT
+    Application HTTP metrics are exposed and scrape-configured, but the
+    collection path to Grafana is UNPROVEN. Treat as unavailable until this
+    returns rows:
+
+        http_server_requests_seconds_count
+
+    Cluster metrics (kube-state-metrics, node exporter, opencost) ARE shipping
+    and are unaffected by the ServiceMonitor gap — clusterMetrics.enabled: true.
+    So CPU, memory, restarts, OOMKills, replica counts and HPA saturation are
+    available regardless.
+
+    If the app-metrics query is empty, the fix is config not code: either
+    annotate the pods, or set prometheusOperatorObjects.enabled: true.
+
+
+================================================================================
+CORRECTION 3 — "add the structured 429 log at the gateway" as the primary fix
+================================================================================
+
+The implementation plan section 4 proposed a log line and a counter against the
+study project's RateLimitFilter, which does not exist in production. The real
+change is smaller and is described below. Section 4 should be read as superseded.
+
+
+================================================================================
+HOW PathRateLimitFilter ACTUALLY WORKS
+================================================================================
+
+Answering "is it per path like /v1/cleanrooms or /v1/exports?" — partly, and the
+detail matters.
+
+CONFIG RESOLUTION (RateLimiterConfig.createPathRateLimiter, in order)
+    Step 1  Exact API match:   strategy=PATH, type=api, key=<exact path>,
+                               method, organization
+    Step 2  REGEX rules scoped to this organizationId. config.key is a regex,
+            matched as path.matches("(?i)" + config.getKey()).
+            Longest pattern wins (max by key length).
+    Step 3  REGEX rules with organization="ALL" — the explicit default bucket.
+            Deliberately does NOT fall back to "any matching rule regardless of
+            org"; that previously caused orgs to inherit another org's limits
+            depending on non-deterministic Redis SCAN ordering.
+    Step 4  No match -> null.
+
+    NOTE A CONTRADICTION: createPathRateLimiter's own comment says "If no ALL
+    rule exists, return null and let the request pass through unlimited". But the
+    caller, pathRateLimiter(api, method, organizationId), does
+        return pathRateLimiter != null ? pathRateLimiter : buildLimiter(50, 50);
+    so an unmatched request is limited at 50 replenish / 50 burst, NOT unlimited.
+    The comment and the behaviour disagree. Raised as a follow-up on the PR;
+    not changed, because it alters enforcement.
+
+SO: CONFIGURATION is per route pattern. You write a regex like ^/v1/exports.*
+and it applies to every path under it. That part matches the intuition.
+
+THE BUCKET IS NOT. The Redis key is:
+    pathRateLimiter.isAllowed("api_path_method_organization",
+                              path + ":" + method + ":" + organizationId)
+where path is the RAW URI path. So
+
+    /v1/cleanrooms/AAA/questions/111   -> bucket 1
+    /v1/cleanrooms/BBB/questions/222   -> bucket 2
+
+are SEPARATE buckets even though one config governs both.
+
+CONSEQUENCE, AND IT IS SECURITY-RELEVANT
+    A client that enumerates resource IDs gets a fresh token bucket per ID. Path
+    rate limiting is therefore much weaker than it appears for any ID-bearing
+    route. What actually constrains such a client is the ORG QUOTA filter, which
+    buckets on orgId alone ("quota_organization", orgId).
+
+    This is worth stating to leadership: for the flooding scenario that started
+    this work, quota limits are the real control, and path limits are close to
+    decorative on parameterised routes.
+
+ORG RESOLUTION (both filters, getOrganizationIdFromRequest)
+    1. Authorization header -> jwtDecoder.getOrganizationFromJwt(token, isInternal)
+    2. Fall back to the LR-Org-ID header (LiveRamp tokens carry no Auth0 org claim)
+    3. If still empty -> organizationId = "ALL"   (bounded fallback, good)
+    Also logs: "Organization ID is missing for path: {} method: {}" — itself a
+    usable signal for unauthenticated traffic.
+
+
+================================================================================
+THE CHANGE THAT WAS MADE — PR #95
+================================================================================
+
+deklareddotcom/api-gateway PR #95
+branch: DV-observability/path-ratelimit-org-attribution
+
+PathRateLimitFilter
+  - Log organizationID, route, method, status=429 on rejection, key=value form.
+    organizationId was already in scope (it builds the bucket key) and simply
+    was not emitted.
+  - Tag rate_limit_exceeded with the matched route predicate
+    (GATEWAY_PREDICATE_MATCHED_PATH_ATTR, NOT_FOUND fallback) instead of the raw
+    path. Mirrors the existing RouteIdWebFluxTagContributor so the route value
+    agrees with the one already on http_server_requests observations.
+  - Added method as a bounded tag.
+
+  organizationID is LOGGED, NOT TAGGED. As a metric tag it multiplies with
+  route x method. Logs carry no cardinality cost. Metrics answer "how much",
+  logs answer "who".
+
+QuotaRateLimitFilter
+  - Message aligned to the same shape, field renamed organizationId ->
+    organizationID to match Constants.ORGANIZATION_ID in external-api-server, so
+    one Datadog facet and one Grafana variable cover both services.
+  - Its counter already tags by org and is left alone: quota is org-level by
+    definition, has no route dimension, and only breaching orgs create a series.
+
+Tests
+  - New PathRateLimitFilterTelemetryTest (there was none for this filter):
+    route tag uses the matched pattern and never the raw path; NOT_FOUND
+    fallback; an allowed request records no rejection.
+  - Full suite green: 12 tests.
+
+Behaviour: unchanged. No limits, buckets, thresholds or request outcomes touched.
+
+BREAKING FOR CONSUMERS: the key tag on rate_limit_exceeded is replaced by route
+for the PATH filter only. Anything selecting rate_limit_exceeded{key=...} with
+source="Path" must be updated. Given the raw-path cardinality it is unlikely
+anything queried it usefully. The quota filter's key tag is unchanged.
+
+A CARDINALITY BUG WAS FIXED IN PASSING, AND IT MATTERED MORE THAN THE GAP
+    key = raw URI path meant every cleanroom / question / export UUID created a
+    permanent new Prometheus series. It grew with resource count, not route
+    count. This was live in production.
+
+
+================================================================================
+QUERIES AVAILABLE AFTER THE PR SHIPS
+================================================================================
+
+Top organizations being throttled (both filters, one query):
+    topk(10, sum by (organizationID) (count_over_time(
+      {service_name="api-gateway", cluster=~"$cluster"}
+        |= "Rate limit exceeded"
+        | json | line_format "{{.message}}"
+        | pattern `<_>organizationID=<organizationID>,<_>` [$__range])))
+
+Split by which limiter fired:
+    sum by (organizationID, limitType) (count_over_time(
+      {service_name="api-gateway", cluster=~"$cluster"}
+        |= "Rate limit exceeded"
+        | json | line_format "{{.message}}"
+        | pattern `<_>limitType=<limitType>, organizationID=<organizationID>,<_>` [1h]))
+
+Rejection rate by route (bounded metric, for alerting):
+    sum by (route, method, source) (rate(rate_limit_exceeded_total[5m]))
+
+Available TODAY without the PR, quota only:
+    topk(10, sum by (key) (rate(rate_limit_exceeded_total{source="QUOTA"}[5m])))
+
+
+================================================================================
+WHAT IS STILL GENUINELY MISSING
+================================================================================
+
+  - Latency and numeric status per organization. Needs the access-log filter in
+    external-api-server (implementation plan section 3, still valid — that
+    section was written against the correct codebase).
+  - 5xx by organization. Same.
+  - Top IPs. Not logged anywhere.
+  - Token endpoint throttling. /v1/oauth/token exemption should be re-checked
+    against the real gateway's route config; the earlier claim came from the
+    study project and has not been re-verified.
+
+WHAT WAS RIGHT AND STANDS
+  - Metrics carry status without tenant; logs carry tenant without status. That
+    framing survives, and the PR closes the gap on the rejection path only.
+  - organizationID is already in the MDC in external-api-server and reaches the
+    JSON envelope as a top-level field. NOTE: this does NOT transfer to the
+    gateway — RequestIdPreFilter carries the comment "FIXME MDC doesn't work for
+    Reactive". The gateway is WebFlux; MDC is thread-bound and does not propagate
+    across reactive operators. Org must be passed as an explicit log argument
+    there, which is what the PR does.
