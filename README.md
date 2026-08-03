@@ -35,6 +35,12 @@ Diagrams are Mermaid, inline in the Markdown, so they render directly on GitHub.
 
 Reverse chronological — newest first.
 
+### 2026-08-02
+
+| Folder | Summary |
+|---|---|
+| [2026-08-02-aditya-loki-grafana-datadog-discussion](2026-08-02/2026-08-02-aditya-loki-grafana-datadog-discussion/) — [SUMMARY](2026-08-02/2026-08-02-aditya-loki-grafana-datadog-discussion/SUMMARY.md) | Making **API abuse by organization** visible in Grafana and Datadog for `external-api-server`, so a flooding tenant can be identified and quarantined. Documents the verified queries behind the "Cleanroom Auth Token Abuse Monitor" (Datadog) and "Token Requests by Organization" (Grafana/Loki) dashboards, and resolves an apparent **12× disagreement** between the platforms: root cause is the Grafana panel's `rate(...[$__auto]) * 3600` extrapolating micro-bursts plus a `reqpm` unit on an hourly expression — there is **no** ingestion gap (~73/hr Loki vs ~62/hr Datadog). Also surfaces three structural gaps: `/v1/oauth/token` is **exempt** from gateway rate limiting, the gateway's 429 log is unstructured so "top orgs by 429" cannot be built, and `Auth0Service.java:75` logs only *successful* token requests — failed-auth floods are invisible. Covers Loki-label-vs-Datadog-facet cardinality, when blacklisting is actually justified, and why enforcement must stay outside both tools. |
+
 ### 2026-07-31
 
 | Folder | Summary |
