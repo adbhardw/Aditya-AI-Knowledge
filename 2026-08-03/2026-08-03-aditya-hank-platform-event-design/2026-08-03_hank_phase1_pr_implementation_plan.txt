@@ -1,0 +1,513 @@
+HANK - PHASE 1 PR IMPLEMENTATION PLAN
+Platform-level change event emission
+Aditya Bhardwaj - 2026-08-03
+================================================================================
+SCOPE OF THIS PR
+  Add change-event emission to hank, as an OPT-IN, ADDITIVE capability.
+
+  After this PR merges, hank CAN emit events. Nothing emits events until a
+  service opts in (Phase 2, forebitt). Every existing behaviour is unchanged.
+
+  Companion: 2026-08-03_create_data_connection_end_to_end_flow_for_architect.txt
+  explains the mechanism and the end-to-end flow. This document is the code.
+
+THE ONE-SENTENCE DESIGN
+  On every row write, the existing hdb.Audit hooks additionally write a row to
+  a transactional OUTBOX in the same database and the same transaction; a relay
+  goroutine then groups those rows by aggregate root + request id and publishes
+  exactly one event per user action.
+
+NON-GOALS FOR PHASE 1
+  - No forebitt changes         (Phase 2)
+  - No orinix changes           (Phase 3 - unchanged from existing plan)
+  - No infrastructure           (Phase 4 - SNS topic, SQS, IAM)
+  - No change to any existing audit LOG LINE (deliberate - see Guardrail 2)
+  - No before/after values      (agreed dropped 2026-07-30)
+
+GUARDRAILS - THE PR MUST SATISFY ALL FIVE
+  G1  A service that does not opt in has BYTE-IDENTICAL behaviour, including
+      the exact JSON of its `Audit Log:` lines. hank is shared by unhygienix,
+      forebitt, primage, picanmix and pegleg (constraint C5).
+  G2  No existing audit log line changes shape in this PR. The audit-log claims
+      gate is a real bug but it is a SEPARATE ticket with Josh.
+  G3  Nothing in the emit path may perform network I/O inside a transaction.
+  G4  A bug in our code must never fail a customer write. Reflection is wrapped
+      in recover(); genuine DB errors still propagate (atomicity matters more).
+  G5  Every new field is omitempty, every new behaviour is behind config.
+
+
+================================================================================
+1. FILES CHANGED / ADDED
+================================================================================
+
+  MODIFIED
+    hank/db/audit.go            AuditLog struct additions; hook call-out
+  ADDED
+    hank/db/event.go            EventScoped, tag reflection, event building
+    hank/db/outbox.go           outbox model + writer + config
+    hank/db/relay.go            polling relay, grouping, publish, mark
+    hank/db/migrations/         outbox DDL (or documented for the service)
+    hank/db/event_test.go
+    hank/db/outbox_test.go
+    hank/db/relay_test.go
+
+  NOT MODIFIED (worth stating explicitly in the PR description)
+    hank/db/service.go          applyEmbeddedHooks needs NO change - the
+                                After* hooks are found by gorm's stock
+                                callbacks via method promotion. Only the
+                                non-standard Before*Hook names need the
+                                existing shims.
+    hank/aws/sns/service.go     already takes `message any` (:34), so the
+                                relay can publish without touching it.
+
+
+================================================================================
+2. hank/db/audit.go - STRUCT ADDITIONS
+================================================================================
+
+    type AuditLog struct {
+        // ---------- unchanged ----------
+        ObjectID            string
+        ObjectName          string
+        ObjectType          string
+        Action              string
+        ActionByID          string
+        ActionByEmail       string
+        ActionAt            time.Time
+        Method              interface{}
+        OrgID               interface{}
+        RequestID           interface{}      // REUSED as the grouping key
+        ImpersonatedByID    string
+        ImpersonatedByEmail string
+
+        // ---------- NEW: optional, omitempty ----------
+        RootObjectType string            `json:"rootObjectType,omitempty"`
+        RootObjectID   string            `json:"rootObjectID,omitempty"`
+        State          map[string]string `json:"state,omitempty"`
+        ChangedFields  []string          `json:"changedFields,omitempty"`
+        EventID        string            `json:"eventID,omitempty"`
+        SchemaVersion  string            `json:"schemaVersion,omitempty"`
+    }
+
+  WHY THIS SATISFIES G1
+    formatAuditLogToJSON (audit.go:269-275) uses json.MarshalIndent. With
+    omitempty and zero values, the emitted JSON is character-for-character what
+    it is today for any model that has not opted in. Add a golden-file test
+    that asserts exactly this.
+
+
+================================================================================
+3. hank/db/audit.go - HOOK CALL-OUT
+================================================================================
+
+  The emit path is placed BEFORE the existing claims gate and is INDEPENDENT of
+  it. That is what lets background writes emit events without changing any
+  existing audit-log behaviour (G2).
+
+    func (a *Audit) AfterCreate(scope *gorm.Scope) error {
+        if err := recordChangeEvent(scope, ActionCreate); err != nil {
+            return err                     // genuine DB error -> roll back
+        }
+
+        // ---- everything below is UNCHANGED ----
+        tokenClaims, ctx, parsed := claims(scope)
+        if !parsed {
+            return nil
+        }
+        ...
+    }
+
+  Identical one-line insertion in AfterUpdate (:183) and AfterDelete (:199).
+
+  NOTE ON THE RETURN: returning an error here rolls the transaction back
+  (verified: callback_create.go:166 -> scope.go:450-451 -> scope.go:414-426).
+  That is intentional and is the atomicity guarantee. recordChangeEvent only
+  ever returns an error for a real DB failure - see G4 handling in section 5.
+
+
+================================================================================
+4. hank/db/event.go - ROOT, STATE, CHANGED FIELDS
+================================================================================
+
+  4.1 THE OPT-IN INTERFACE
+
+    // EventScoped is implemented by models that participate in change events.
+    // It answers: which BUSINESS RESOURCE does this row belong to?
+    // A root returns itself; a child returns its parent.
+    // Models that do not implement it emit nothing.
+    type EventScoped interface {
+        EventRoot() (objectType string, objectID string)
+    }
+
+  4.2 THE STATE TAG
+
+    Fields tagged `event:"state"` are collected into State. Everything else is
+    invisible. The tag list IS the security allow-list - this is how the
+    Credential.Value concern (primage/models/models.go:219-226) is answered by
+    construction rather than by review.
+
+        func extractState(scope *gorm.Scope, changed map[string]interface{}) map[string]string
+
+    RULES
+      a. Reflect over the model's fields; select those with event:"state".
+      b. On UPDATE, include a field ONLY if it is present in `changed`
+         (gorm:update_attrs). gorm v1 drops zero-valued fields from a struct
+         update, so a field absent from update_attrs was NOT written - emitting
+         it would ship `"stage": ""` to a partner. Not noise: WRONG.
+      c. On CREATE, include tagged fields that are non-zero.
+      d. Values are stringified. Never include an untagged field, ever.
+
+  4.3 CHANGED FIELDS - FREE, NO BEFORE-IMAGE
+
+    gorm v1 stores the update map at scope.InstanceGet("gorm:update_attrs")
+    (verified: gorm callback_update.go:27). So:
+
+        func changedFields(scope *gorm.Scope) ([]string, map[string]interface{})
+
+    returns column NAMES ONLY. No values, no extra SELECT, no security review.
+    On CREATE this is the set of populated columns; on DELETE it is empty.
+
+  4.4 BUILDING THE EVENT
+
+    func buildChangeEvent(scope *gorm.Scope, action string) (*ChangeEvent, bool)
+
+    Returns ok=false (skip silently, with a metric) when:
+      - the model does not implement EventScoped
+      - EventRoot() returns an empty objectID   <-- the empty-struct delete,
+        see section 8. Increments a dedicated counter and logs a WARNING,
+        because this is exactly the job.go:185 defect and we want it visible.
+
+    Populates: RootObjectType, RootObjectID, ObjectType, ObjectID, Action,
+    State, ChangedFields, actor, OrgID, RequestID, OccurredAt, EventID.
+
+  4.5 THE IDEMPOTENCY KEY
+
+        EventID = sha256(rootObjectType + "|" + rootObjectID + "|" + requestID)
+
+    Deterministic, so a relay restart recomputes the same key; identical for
+    every row of one user action; different across requests. This is what
+    collapses the V1 route's two transactions into one event.
+
+  4.6 ACTOR RESOLUTION - AND THE REQUEST-ID TRAP
+
+    func resolveActor(scope *gorm.Scope) (id, email, actorType string)
+        - claims present            -> USER (existing impersonation +
+                                       IsAuthorizedServiceUser logic reused)
+        - claims absent             -> SYSTEM, id = HABU_PLATFORM_SUPERUSER
+                                       (same precedent as GetAuditDetails,
+                                       audit.go:91-123)
+
+    func resolveRequestID(ctx context.Context) (string, bool)
+        MUST read ctx.Value(contexts.ContextKeyReqID) DIRECTLY.
+        MUST NOT call contexts.GetReqIdCtx.
+
+        WHY (verified, contexts.go:22-34): GetReqIdCtx's third branch is
+            return uuid.New().String()
+        It MINTS A FRESH UUID when it finds nothing and does not cache it. Call
+        it once per row write on a context with no request id and the 4 rows of
+        one action get 4 different grouping keys - silently fanning ONE action
+        out into FOUR events. This is the single easiest way to get this PR
+        subtly wrong, and it needs a comment in the code saying so.
+
+        No request id -> return ok=false -> skip the event, increment a
+        counter, log WARNING. Absent is detectable; fabricated is not.
+
+
+================================================================================
+5. hank/db/outbox.go - THE TRANSACTIONAL OUTBOX
+================================================================================
+
+  5.1 SCHEMA
+
+    CREATE TABLE change_outbox (
+        id                 uuid         PRIMARY KEY,
+        event_id           varchar(64)  NOT NULL,
+        root_object_type   varchar(100) NOT NULL,
+        root_object_id     varchar(40)  NOT NULL,
+        object_type        varchar(100) NOT NULL,
+        object_id          varchar(40),
+        action             varchar(20)  NOT NULL,
+        state              jsonb,
+        changed_fields     jsonb,
+        actor_id           varchar(40),
+        actor_email        varchar(255),
+        actor_type         varchar(20),
+        organization_id    varchar(40),
+        request_id         varchar(64),
+        occurred_at        timestamptz  NOT NULL,
+        published_at       timestamptz,
+        attempts           int          NOT NULL DEFAULT 0,
+        last_error         text
+    );
+
+    -- the relay's only query path; partial index keeps it small as the table
+    -- is dominated by already-published rows awaiting pruning
+    CREATE INDEX idx_change_outbox_unpublished
+        ON change_outbox (occurred_at)
+        WHERE published_at IS NULL;
+
+    CREATE INDEX idx_change_outbox_group
+        ON change_outbox (root_object_type, root_object_id, request_id);
+
+  5.2 THE WRITE
+
+    func writeOutbox(scope *gorm.Scope, ev *ChangeEvent) error
+
+    Uses scope.NewDB() so the INSERT joins THE SAME TRANSACTION as the business
+    write. This is the entire atomicity guarantee - do not take a fresh
+    connection here. A reviewer should check this line specifically.
+
+  5.3 ERROR HANDLING (G4)
+
+    func recordChangeEvent(scope *gorm.Scope, action string) (err error) {
+        if !outboxEnabled(scope) {
+            return nil                    // G1: opt-in only
+        }
+        defer func() {
+            if r := recover(); r != nil {
+                metrics.EventEmitPanics.Inc()
+                log.Errorf("change event emit panicked, skipping: %v", r)
+                err = nil                 // never fail the customer write
+            }
+        }()
+
+        ev, ok := buildChangeEvent(scope, action)
+        if !ok {
+            return nil                    // skipped, already counted
+        }
+        return writeOutbox(scope, ev)     // real DB error DOES propagate
+    }
+
+    The asymmetry is deliberate: OUR bug degrades to a missing event; a
+    DATABASE failure fails the transaction, because at that point the business
+    write was failing anyway and atomicity is what we are buying.
+
+  5.4 CONFIG
+
+    type EventConfig struct {
+        Enabled       bool
+        OutboxTable   string        // default "change_outbox"
+        TopicARN      string        // empty ARN guard: relay no-ops if unset
+        RelayInterval time.Duration // default 5s
+        RelayBatch    int           // default 500
+        SchemaVersion string        // default "1.0"
+    }
+
+    Disabled by default. A service that sets nothing behaves exactly as today.
+
+
+================================================================================
+6. hank/db/relay.go - PUBLISHING
+================================================================================
+
+  6.1 CLAIM
+
+    SELECT * FROM change_outbox
+     WHERE published_at IS NULL
+     ORDER BY occurred_at
+     LIMIT :batch
+       FOR UPDATE SKIP LOCKED;
+
+    SKIP LOCKED is what makes multiple pods safe with no leader election and
+    no new deployment.
+
+  6.2 GROUP
+
+    Group the claimed rows by (root_object_type, root_object_id, request_id).
+
+    Per group:
+      - merge State (later occurred_at wins per key)
+      - union ChangedFields
+      - action precedence: CREATE > DELETE > UPDATE
+        (a create-then-update inside one request - the V1 route - is a CREATE
+        from the user's point of view)
+      - eventTime = max(occurred_at)
+
+    Completeness is NOT a timer. Every row of one transaction became visible at
+    the same COMMIT, so if the relay sees one it sees them all. This is the
+    property that makes the whole approach correct, and it is worth a comment
+    in the code.
+
+  6.3 PUBLISH AND MARK
+
+    publish -> hank/aws/sns (already accepts `message any`, service.go:34)
+    then    -> UPDATE change_outbox SET published_at = now() WHERE id IN (...)
+
+    Order matters: publish first, mark second. A crash between the two causes a
+    REPUBLISH, which orinix drops via ON CONFLICT (event_id) DO NOTHING.
+    The reverse order would LOSE the event. At-least-once producer, idempotent
+    consumer.
+
+    On failure: attempts++, last_error, exponential backoff by occurred_at.
+
+  6.4 PRUNE
+
+    Delete published rows older than N days (default 7). Keeps the table small
+    and preserves a short forensic window.
+
+  6.5 METRICS (non-negotiable - answers "how would we know?")
+
+    outbox_unpublished_rows          gauge
+    outbox_oldest_unpublished_secs   gauge   <-- ALERT ON THIS ONE
+    outbox_publish_failures_total    counter
+    change_events_published_total    counter
+    change_events_skipped_total{reason="no_root"|"no_request_id"|"not_scoped"}
+    change_event_emit_panics_total   counter
+
+    The oldest-unpublished-age gauge is the single most valuable signal: it
+    goes up if the relay dies, if SNS is down, or if a row is poisoned.
+
+
+================================================================================
+7. TESTS
+================================================================================
+
+  UNIT
+    - EventRoot on a root model            -> (type, own id)
+    - EventRoot on a child model           -> (type, parent id)
+    - model without EventScoped            -> skipped, counter incremented
+    - EventRoot returning an empty id      -> skipped + WARNING logged
+    - state tags: only tagged fields appear
+    - state tags: an untagged secret-like field NEVER appears  (security test)
+    - update: a tagged field absent from update_attrs is OMITTED, not ""
+    - changedFields returns names only, never values
+    - EventID is deterministic and identical across rows of one action
+    - EventID differs across request ids
+    - resolveActor falls back to SYSTEM when claims are absent
+    - resolveRequestID returns ok=false rather than fabricating a uuid
+      (regression test for the GetReqIdCtx trap - reference the line)
+
+  GOLDEN FILE (guards G1)
+    - AuditLog JSON for a NON-opted-in model is byte-identical to the current
+      output. This test is the contract with the other four services.
+
+  INTEGRATION (sqlite or a test postgres)
+    - create with 3 children in one tx -> 4 outbox rows, one event_id, ALL
+      committed together
+    - transaction rolled back          -> ZERO outbox rows (no phantom events)
+    - relay groups 4 rows              -> exactly 1 published message
+    - relay crash before marking       -> republish; same event_id
+    - two transactions, one request id -> grouped into one event
+    - outbox INSERT failure            -> transaction rolls back
+    - panic in reflection              -> write SUCCEEDS, event skipped, metric
+
+  THE TWO TESTS I MOST WANT A REVIEWER TO LOOK AT
+    1. rollback -> zero outbox rows.  Proves we can never announce something
+       that did not happen.
+    2. golden file.  Proves we did not disturb four other services.
+
+
+================================================================================
+8. THE TWO PRE-EXISTING DEFECTS THIS PR SURFACES
+================================================================================
+
+  8.1 DELETE CARRIES NO ID - MUST FIX IN PHASE 2
+
+    forebitt/db/job.go:185
+        tx.Scopes(IDScope(id)).Delete(&models.DataImportJob{})
+
+    A pointer is passed so the hook DOES fire, but the struct is EMPTY - the id
+    is only in the WHERE clause. So ObjectID is "" and EventRoot() returns "".
+    Consequences:
+      - our shipped compliance audit log cannot say WHICH connection was deleted
+      - DELETE events are impossible until fixed
+
+    Phase 1 detects it (skip + WARNING + counter). Phase 2 fixes the call site
+    by populating the primary key on the struct passed to Delete. Worth its own
+    ticket on its own merits.
+
+  8.2 THE PARAMETER DELETE FIRES NO HOOK AT ALL
+
+    forebitt/db/job_parameters.go:81
+        Delete(models.OrganizationJobParameter{})        <-- BY VALUE
+
+    hdb.Audit's hooks have POINTER receivers. gorm resolves hooks by
+    reflection (scope.go:432-459) and only takes .Addr() when the value is
+    addressable; a struct passed by value into an interface is not. So the
+    pointer-receiver hook is not in the method set and is never called.
+    Verified with a standalone program reproducing gorm's exact logic:
+
+        Delete(Model{})   -> CanAddr=false  hook found = false
+        Delete(&Model{})  -> CanAddr=true   hook found = true
+
+    GOOD: no phantom DELETE record to filter on a create.
+    BAD:  a settings-only removal is invisible. If a change removes the last
+          parameter and adds none, nothing emits. In practice the job row is
+          updated in the same transaction and that does emit.
+
+    Accepted for M1. Escape hatch if we need it: expose
+        hdb.TouchRoot(tx, "DATA_CONNECTION", jobID, actor)
+    and call it once inside SetOrganizationJobParametersInTransaction - ONE
+    call site, not per handler, so it does not reintroduce the per-function
+    problem we are avoiding.
+
+    NOTE: this CORRECTS my earlier documents, which claimed a create produces
+    5 hook firings including a phantom DELETE with an empty ObjectID. The real
+    numbers are 4 firings for the V2 route and 8 for the V1 route.
+
+
+================================================================================
+9. ROLLOUT
+================================================================================
+
+  Step 1  Merge hank with Enabled=false everywhere.
+          Nothing changes anywhere. Version bump is safe to pick up.
+  Step 2  Other services bump hank at their own pace. No behaviour change,
+          verified by the golden-file test.
+  Step 3  forebitt (Phase 2) adds EventRoot() on the two models, event:"state"
+          tags, the outbox migration, and fixes the delete call site.
+  Step 4  Enable in STAGE with TopicARN empty. The outbox fills and the relay
+          no-ops. Inspect change_outbox directly and confirm: exactly one
+          event_id per user action, correct root, correct state, and 4 rows per
+          create. THIS IS THE CHEAPEST PLACE TO VALIDATE THE WHOLE DESIGN -
+          no SNS, no orinix, no XMI needed.
+  Step 5  Set TopicARN in stage. Relay publishes; orinix consumes.
+  Step 6  QE verification, then prod.
+
+  ROLLBACK
+    Set Enabled=false. The hook call-out returns immediately. No migration
+    needs reverting; the outbox table can stay.
+
+
+================================================================================
+10. REVIEW CHECKLIST FOR THE PR DESCRIPTION
+================================================================================
+
+  [ ] No network I/O anywhere inside a hook            (G3)
+  [ ] writeOutbox uses scope.NewDB(), joining the SAME transaction
+  [ ] Golden-file test proves non-opted-in log lines are byte-identical  (G1)
+  [ ] No existing audit log line changes shape          (G2)
+  [ ] resolveRequestID does NOT call contexts.GetReqIdCtx, with a comment
+      explaining the uuid-minting trap
+  [ ] Untagged fields can never reach State - covered by an explicit test
+  [ ] Rollback test proves zero outbox rows
+  [ ] Panic in reflection cannot fail a write           (G4)
+  [ ] Everything off by default                         (G5)
+  [ ] Metrics registered, especially oldest_unpublished_secs
+  [ ] Empty root id is skipped, counted and logged as WARNING
+
+
+================================================================================
+11. ESTIMATE AND SEQUENCING
+================================================================================
+
+  hank event.go + tests                 ~2 days
+  hank outbox.go + migration + tests    ~1.5 days
+  hank relay.go + tests                 ~2 days
+  golden-file + integration harness     ~1 day
+  PR review cycles (shared library)     ~2 days
+                                        ---------
+                                        ~8.5 days
+
+  Phase 2 (forebitt) is ~2 days on top and is where it becomes observable end
+  to end in stage.
+
+  DEPENDENCY: none of this is blocked on infrastructure. The empty-ARN guard
+  means the whole producer side can be built, merged and validated in stage
+  before the SNS topic exists (Phase 4 lives in orinjade/fiddley, owned by
+  another team, with an unknown lead time).
+
+  BLOCKERS TO AGREE FIRST (they change the design, not the estimate)
+    - the outbox approach itself (vs publishing from the hook)
+    - Level 1 state via tags (vs action-only)
+    - the delete-id fix being in scope for Phase 2

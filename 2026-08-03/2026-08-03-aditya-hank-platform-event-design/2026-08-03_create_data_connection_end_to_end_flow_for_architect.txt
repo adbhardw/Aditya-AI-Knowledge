@@ -1,0 +1,1013 @@
+CREATE DATA CONNECTION - END-TO-END EVENT FLOW
+Walkthrough for architect review (Anil, Josh)
+Aditya Bhardwaj - 2026-08-03
+================================================================================
+PURPOSE
+  This document walks one real user action - "customer creates a data
+  connection" - from the button click to XMI receiving a notification, under
+  the Hank/platform-level approach agreed on 2026-07-30.
+
+  It exists so that we agree on the mechanism BEFORE any code is written.
+
+EVIDENCE STANDARD
+  Every [VERIFIED] claim was read in source on 2026-08-03 at the file:line
+  given. Versions: hank v1.23.1-0.20250813161745-c53aa6f6741a,
+  github.com/jinzhu/gorm v1.9.11 (hank) / v1.9.16 (forebitt).
+  Where something is NOT yet confirmed it is marked [TO CONFIRM] and never
+  stated as fact. Three findings in this document CORRECT earlier documents of
+  mine; they are marked [CORRECTION] and explained.
+
+READING ORDER
+  Part 1 - Questions and answers (start here, ~27 Q&A)
+  Part 2 - The end-to-end walkthrough, stage by stage
+  Part 3 - Exactly what changes in the AuditLog struct
+  Part 4 - Failure scenarios and the no-lost-event guarantee
+  Part 5 - Open items, decisions needed, references
+
+
+================================================================================
+PART 1 - QUESTIONS AND ANSWERS
+================================================================================
+
+--- A. THE MECHANISM ---------------------------------------------------------
+
+Q1. A create involves 3 operations: insert the job, delete the org parameters,
+    insert 3 parameter rows. How many events does that produce?
+
+A1. ONE event. But the intermediate numbers are worth being precise about,
+    because they are the whole reason this design needs discussing:
+
+        5  SQL statements
+        4  GORM hook firings          <-- not 5, see Q2
+        4  outbox rows
+        1  published event
+        1  row in orinix object_events
+        1  notification to XMI
+
+Q2. [CORRECTION] Why 4 hook firings and not 5?
+
+A2. The DELETE does not fire a hook at all. This corrects my earlier documents,
+    which said the phantom DELETE produces a 5th audit record with an empty
+    ObjectID.
+
+    The reason is a Go method-set subtlety, verified empirically:
+
+      forebitt/db/job_parameters.go:81  [VERIFIED]
+          Delete(models.OrganizationJobParameter{})     <-- BY VALUE
+
+      forebitt/db/job.go:185            [VERIFIED]
+          Delete(&models.DataImportJob{})               <-- BY POINTER
+
+    hdb.Audit's hooks have POINTER receivers (func (a *Audit) AfterDelete).
+    GORM resolves hooks by reflection (gorm scope.go:432-459):
+
+        if reflectValue.CanAddr() && reflectValue.Kind() != reflect.Ptr {
+            reflectValue = reflectValue.Addr()          // :434-436
+        }
+        if mv := reflectValue.MethodByName(methodName); mv.IsValid() { ... }
+
+    A struct passed BY VALUE into an interface is NOT addressable, so .Addr()
+    is never taken, so the pointer-receiver method is not in the method set,
+    so the hook is never found. I confirmed this with a standalone Go program
+    reproducing gorm's exact logic:
+
+        Delete(Model{})   -> CanAddr=false  hook found = false
+        Delete(&Model{})  -> CanAddr=true   hook found = true
+
+    CONSEQUENCE (good): no phantom delete record to filter out.
+    CONSEQUENCE (bad): a genuine settings DELETE is also invisible - see Q12.
+
+Q3. If Hank is a library running inside forebitt, who actually "publishes"?
+
+A3. Nobody publishes from inside the transaction. The hook writes a row to an
+    OUTBOX TABLE IN FOREBITT'S OWN DATABASE, in the same transaction as the
+    business write. A relay then reads that table after commit and publishes.
+
+    This matters because "Hank publishes" is misleading: Hank is compiled into
+    forebitt, so it is forebitt's process, forebitt's DB connection and
+    forebitt's transaction. The only thing Hank can do atomically with the
+    business write is write to the same database.
+
+Q4. Why can the hook not just publish to SNS directly?
+
+A4. Two verified reasons, and the second is severe.
+
+    (a) GORM v1 hooks run INSIDE the transaction. [VERIFIED]
+        gorm callback_create.go:10-18 registers, in order:
+            gorm:create
+            gorm:after_create                    <-- our hook
+            gorm:commit_or_rollback_transaction  <-- commit is AFTER
+        So an SNS call would sit inside an open transaction, holding row locks
+        for the duration of a network round trip.
+
+    (b) A hook error ROLLS BACK the user's write. [VERIFIED]
+        callback_create.go:166  scope.CallMethod("AfterCreate")
+        scope.go:450-451        case func(*Scope) error: scope.Err(method(scope))
+        scope.go:414-426        CommitOrRollback -> if scope.HasError() { Rollback() }
+        So an SNS outage would start failing customer writes. We would have
+        given the notification system the power to break the product.
+
+    A local INSERT into a table in the same transaction has neither problem.
+
+Q5. Who turns 4 rows into 1 event, and how do we know all 4 have arrived?
+
+A5. The RELAY does it, and completeness is guaranteed by the COMMIT, not by a
+    timer.
+
+    All 4 outbox rows are written inside the same transaction as the business
+    rows. They become visible to the relay atomically, at commit. So when the
+    relay sees any of them, it sees all of them. It groups by
+
+        (root_object_type, root_object_id, request_id)
+
+    and publishes one message per group.
+
+    This is the single most important property of the design, and it is what
+    changed my mind about the hook approach. My earlier objection was "an
+    assembler cannot know when all the row records have arrived, so it needs a
+    timer, and a slow record produces a WRONG event". With an outbox that
+    objection dies: the transaction boundary IS the completeness signal.
+
+Q6. Where does request_id come from, and is it really the same for all 4 rows?
+
+A6. Yes. [VERIFIED]
+      - hank/http/middleware/tracing.go:25-31 WithTracing reads the
+        X-Request-Id header and GENERATES a uuid if absent, then
+        contexts.SetReqIdCtx(ctx, reqId).
+      - hank/http/middleware/logging.go:104 WithContextLogger copies it into
+        the logrus fields as "requestId".
+      - hank/http/middleware/chain.go:10-22 - BOTH DefaultHttpHandlerChain and
+        DefaultGrpcHandlerChain start with WithTracing then WithContextLogger,
+        and forebitt serves through both (server.go:423 ->
+        hank/server/service.go:185). So it is established once per request,
+        before any handler runs, for REST and gRPC alike.
+      - hank/db/audit.go:70 AuditLog.RequestID = requestInfo["requestId"].
+
+    All 4 row writes happen under one ctx inside one request, so all 4 carry
+    the identical request_id.
+
+Q7. The V1 route calls CreateImportJobV2 twice (job_service.go:1418 and :1425).
+    Two transactions. Does that give two events?
+
+A7. No - one event, and this is exactly why request_id is the right grouping
+    key rather than a transaction id.
+
+    [VERIFIED] Both calls are passed THE SAME ctx variable, and neither
+    CreateDataConnection nor CreateImportJobV2 derives a new context. So both
+    transactions carry one request_id.
+
+        TX1 (IsDraft=true)  INSERT job + 3 INSERT params  = 4 hook firings
+        TX2 (IsDraft=false) UPDATE job + 3 INSERT params  = 4 hook firings
+        ------------------------------------------------------------------
+        8 hook firings, 2 transactions, 1 request_id, 1 event
+
+    The idempotency key is derived from (root_type, root_id, request_id), so
+    even if the relay runs between the two commits and publishes twice, orinix
+    collapses them with ON CONFLICT DO NOTHING. Two safety nets, no timer.
+
+Q8. What is the idempotency key exactly?
+
+A8.     event_id = sha256(root_object_type + "|" + root_object_id + "|" + request_id)
+
+    Properties:
+      - deterministic, so the relay can recompute it after a crash
+      - identical for all rows of one user action
+      - different for a different request against the same resource
+      - a client RETRY gets a new request_id, so it is a new event - correct,
+        because a retry is a new attempt and XMI reads current state anyway
+
+--- B. THE AUDITLOG STRUCT ---------------------------------------------------
+
+Q9. Are we changing the AuditLog struct? Exactly what?
+
+A9. Yes, ADDITIVELY ONLY, and with a deliberate constraint: NO EXISTING AUDIT
+    LOG LINE CHANGES SHAPE. Full detail in Part 3. Summary:
+
+      ADD:  RootObjectType  string             `json:",omitempty"`
+            RootObjectID    string             `json:",omitempty"`
+            State           map[string]string  `json:",omitempty"`
+            ChangedFields   []string           `json:",omitempty"`
+            EventID         string             `json:",omitempty"`
+            SchemaVersion   string             `json:",omitempty"`
+
+      REUSE (no change): RequestID, ActionByID, ActionByEmail, ActionAt,
+            OrgID, ObjectType, ObjectID, Action
+
+      REMOVE: nothing.
+
+    Because every new field is omitempty and is only populated for models that
+    opt in, a service that has not opted in serializes to a BYTE-IDENTICAL log
+    line. That keeps the blast radius on the other four services at zero and
+    de-risks V6 (whether anything parses those lines today).
+
+Q10. Why not a brand-new struct instead of extending AuditLog?
+
+A10. Anil's instruction was "extend AuditLog or create a new one". Extending is
+     better here for one reason: Josh's audit-log expansion wants the same
+     data ("who changed what, when"). One struct, one source of truth, one
+     place to version. A parallel struct would immediately drift.
+
+     We do introduce a separate ChangeEvent shape for the OUTBOX ROW, but it is
+     derived from AuditLog rather than competing with it.
+
+Q11. We agreed to drop from/to. Does that mean the event carries no values?
+
+A11. No, and this is the one point I want to push back on gently.
+
+       Level 0  "data connection X was updated"          <- action only
+       Level 1  "X is now at stage CONFIGURATION_COMPLETE" <- CURRENT state
+       Level 2  "stage went MAPPING_REQUIRED -> CONFIG..."  <- from/to
+
+     from/to (Level 2) was the expensive part: it needs a before-image read
+     before every UPDATE in every service, plus a security review of values.
+     Dropping it is right.
+
+     Level 1 costs nothing extra - the value is already in the struct being
+     written. And without it, Hank carries Action (CREATE/UPDATE/DELETE) but
+     NOT Status/Stage, so the event can say "the flow run was updated" but
+     never "the flow run COMPLETED" - which is the exact event XMI is blocked
+     on (DV-15621, use cases 2-4).
+
+     Mechanism: an `event:"state"` struct tag. See Part 3.
+     The tag list also IS the security allow-list - a field without the tag can
+     never leave the building, which is how we satisfy the Credential.Value
+     concern (primage/models/models.go:219-226) by construction.
+
+--- C. GETTING THE EVENT TO XMI ----------------------------------------------
+
+Q12. Does a DELETE of a data connection produce an event today?
+
+A12. NO, and this is a blocker that must be fixed. [VERIFIED]
+
+       forebitt/db/job.go:185
+           tx.Scopes(IDScope(id)).Delete(&models.DataImportJob{})
+
+     A pointer is passed, so the hook DOES fire - but the struct is EMPTY. The
+     id lives in the WHERE clause. So:
+       - ObjectID resolves to ""      (getObjectDetails, audit.go:241-267)
+       - our root resolution gives "" too
+       - we would skip the row, and XMI would never learn about deletes
+
+     This is already a live defect in the audit log we ship: our compliance log
+     literally cannot say WHICH data connection was deleted.
+
+     Fix: populate the primary key on the struct passed to Delete, so both the
+     audit record and the event carry the id. Small, and worth its own ticket
+     regardless of orinix.
+
+     Same shape of problem, second instance: a settings-only removal. The
+     parameter DELETE fires no hook at all (Q2), so "remove the last parameter
+     and add none" would emit nothing. In practice the job row is usually
+     updated in the same transaction, which does emit. Documented as a known
+     gap with a targeted escape hatch in Part 5.
+
+Q13. Hank is a library. How does the event actually reach orinix?
+
+A13. Five hops. Only hop 1 is inside the transaction.
+
+       1. hook writes outbox row      (forebitt DB, INSIDE the tx)   ATOMIC
+       2. relay reads outbox, groups, publishes to SNS               AFTER commit
+       3. SNS -> SQS                                                 AWS
+       4. orinix consumes SQS, writes object_events                  dedup here
+       5. orinix delivers to XMI (webhook / GCP Pub/Sub / pull API)
+
+     The relay is a goroutine started at forebitt boot, polling the outbox on
+     an interval. It is NOT a new service and needs no new deployment. Multiple
+     forebitt pods are safe because the relay claims rows with
+     SELECT ... FOR UPDATE SKIP LOCKED.
+
+     Hank ships the relay as a reusable component, so unhygienix and picanmix
+     get it for free later.
+
+Q14. Could we skip orinix and publish to XMI's GCP Pub/Sub directly?
+
+A14. Technically yes; I recommend no. Being explicit about the trade-off:
+
+     Direct-to-PubSub would mean:
+       - Google Cloud credentials in forebitt, and eventually in 10+ services
+       - adding a SECOND consumer (Microsoft, SafeHaven) becomes a code change
+         in every producer instead of a config row
+       - no replay, no history, no cursor API - if XMI is down, the event is
+         gone
+       - a cross-cloud network call on the producer side
+
+     With orinix in the middle, adding a consumer is a row in a table. That is
+     the single strongest architectural argument for orinix existing at all,
+     and it holds regardless of how we produce events.
+
+     Note we can still use Pub/Sub - orinix publishes to XMI's Pub/Sub topic as
+     one of its delivery channels. The question is only WHO publishes, not
+     whether Pub/Sub is used.
+
+Q15. Are we still using the object_events table?
+
+A15. Yes, and it is a DIFFERENT table from the outbox. This distinction matters
+     and I want to be explicit because they are easy to conflate:
+
+       forebitt.change_outbox            orinix.object_events
+       ----------------------            --------------------
+       producer side                     consumer side
+       forebitt's database               orinix's database
+       written INSIDE the business tx    written on SQS consume
+       purpose: never lose an event      purpose: history, replay, fan-out
+       short-lived; pruned after publish  90-day retention
+       one row per ROW WRITE              one row per EVENT
+       nobody reads it but the relay     serves GetCleanroomEvents to XMI
+
+     You cannot collapse them into one. The outbox must be in forebitt's
+     database because that is the only database in the transaction. object_events
+     must be in orinix because it aggregates multiple producers and serves the
+     partner-facing read API.
+
+Q16. Is object_events consistent with the snapshot / replay discussion?
+
+A16. Yes, with one honest caveat.
+
+     Fowler's Event Sourcing article (see references) makes the point that you
+     do not replay from the beginning of time - you keep SNAPSHOTS and replay
+     only events after them. Our equivalent:
+
+       snapshot = the current row in data_import_jobs (always available)
+       event log = object_events (90 days)
+
+     So "what happens on day 91" has a clean answer: you do not replay, you
+     re-read current state. That is the snapshot pattern, not a workaround.
+
+     THE CAVEAT: with thin events we are NOT doing event sourcing. In Fowler's
+     taxonomy this is EVENT NOTIFICATION. Event sourcing requires events
+     sufficient to REBUILD state, and "X was updated" cannot rebuild anything.
+     We should not describe it as event sourcing, and Josh's audit tier must
+     not assume it can reconstruct history from these events. If we ever want
+     that, we need Level 2 payloads.
+
+--- D. NOT LOSING EVENTS -----------------------------------------------------
+
+Q17. The transaction commits, then the pod is killed before the event is
+     published. What happens?
+
+A17. Nothing is lost. This is the whole reason for the outbox.
+
+     The outbox row was written INSIDE the transaction, so it committed
+     atomically with the business rows. Either both exist or neither does.
+     After the pod dies, the row is still sitting there with published_at NULL.
+     Any other forebitt pod's relay picks it up on its next poll and publishes
+     it. Late, but not lost.
+
+     Contrast with today's behaviour [VERIFIED] job_service.go:1602-1605: the
+     publish happens after commit and the error is logged and swallowed. The
+     row exists, no event was ever sent, and nobody knows. That is exactly the
+     failure this design removes.
+
+Q18. Your instinct was "create an entry in the table at the time the
+     transaction commits, so we can always match missing events later". Is that
+     what we are doing?
+
+A18. Yes - that instinct is correct and it is the transactional outbox pattern
+     (Fowler, patterns of enterprise integration; see references). One
+     refinement: the entry goes in the OUTBOX (forebitt's DB), not directly in
+     object_events (orinix's DB), because only the former can be in the same
+     transaction.
+
+     And you get the "matching" property twice over:
+       - published_at IS NULL on an outbox row = an event that has not gone out
+         yet. Alert on age, and you have a direct, queryable answer to "is
+         anything stuck?"
+       - a periodic reconciliation sweep can compare data_import_jobs.updated_at
+         against object_events to catch systematic gaps.
+
+Q19. What if the relay publishes and then dies before marking the row as
+     published?
+
+A19. It republishes on restart. orinix's INSERT ... ON CONFLICT (event_id) DO
+     NOTHING drops the duplicate. This is deliberate: the relay is
+     at-least-once, and the consumer is idempotent. That is the standard and
+     correct split - trying to make the relay exactly-once is not solvable.
+
+Q20. What if the outbox INSERT itself fails?
+
+A20. The transaction rolls back, and the user's write fails.
+
+     That sounds alarming, so consider when it can actually happen: the outbox
+     INSERT is a local insert into a table in the same database and the same
+     transaction as the business write. It fails only if the database is
+     failing - in which case the business write was going to fail anyway.
+
+     We do guard against our own bugs: the reflection code that builds the
+     event is wrapped in a recover(), and a panic there logs, increments a
+     metric and SKIPS the event rather than killing the write. So a bug in our
+     code degrades to a missing event, never a failed customer request. A
+     genuine DB error still propagates, because at that point atomicity is the
+     thing we care about most.
+
+Q21. How would we ever know an event was missed?
+
+A21. Three layers, in increasing cost:
+       1. outbox depth and oldest-unpublished-age metric + alert. Catches a
+          stuck or dead relay within minutes.
+       2. publish failure counter + alert on the relay.
+       3. a nightly reconciliation job comparing recently-updated source rows
+          against object_events, reporting resources with no corresponding
+          event. This is the backstop that catches classes of bug we have not
+          thought of.
+
+     Today we have none of these, which is why the honest answer to "how many
+     events have we lost" is currently "we cannot tell".
+
+--- E. THINGS I WAS NOT ASKED BUT WE SHOULD DECIDE ---------------------------
+
+Q22. The Snowflake block at dataConnections_v2.go:362-371 can fail AFTER the
+     transaction committed. Do we emit an event for a request the user was
+     told failed?
+
+A22. Yes, we do - and this is a genuine behaviour change from my earlier
+     service-layer proposal, so I want it on the record.
+
+     In the service-layer design I emitted at line :378, deliberately after
+     that block, so a post-commit failure suppressed the event. With hooks we
+     emit at commit, which is before it.
+
+     I think emitting is actually defensible: the transaction committed, so the
+     rows genuinely exist in the database. The connection WAS created. The
+     user-facing error is a separate pre-existing problem (a partial failure
+     that leaves committed rows behind). And XMI reads back current state
+     anyway, so it will see a real resource.
+
+     But it is a real difference and the architect should agree to it rather
+     than discover it.
+
+Q23. Do we change any existing audit log line in this phase?
+
+A23. No. Deliberately not.
+
+     The hooks keep their current claims gate for the LOG LINE. The event path
+     gets its own actor resolution. So Phase 1 changes zero existing log output
+     for forebitt or the other four services, which makes the PR far easier to
+     review and removes the V6 risk (whether Datadog monitors or the pegleg
+     audit feed parse those lines) from the critical path.
+
+     Fixing the claims gate for the AUDIT LOG is a real bug fix - background
+     operations produce no audit record at all today - but it is a separate
+     ticket with Josh, not this PR.
+
+Q24. What about background workers - flow run completion, XMI's most important
+     event?
+
+A24. This is the biggest open risk, and it affects the event path directly.
+
+     [VERIFIED] every hook opens with
+         tokenClaims, ctx, parsed := claims(scope)
+         if !parsed { return nil }
+     and claims() (audit.go:33-41) requires a context that was attached by
+     BeginDB/BeginTxDB (audit.go:215-225). A background worker has no HTTP
+     request, so no middleware ran, so there is no request_id and probably no
+     auth claims.
+
+     Two things must therefore be true before flow-run events can work:
+       (a) the event path resolves a SYSTEM actor instead of bailing out.
+           The precedent already exists 40 lines away - GetAuditDetails
+           (audit.go:91-123) degrades gracefully via HABU_PLATFORM_SUPERUSER
+           and IsAuthorizedServiceUser.
+       (b) the worker sets a request id ONCE at the start of its unit of work:
+               ctx = contexts.SetReqIdCtx(ctx, uuid.New().String())
+
+     (b) is not optional, and here is the trap [VERIFIED]
+     contexts.go:22-34: GetReqIdCtx GENERATES A FRESH UUID when it finds none,
+     and does not cache it. Call it per row write on a context with no request
+     id and you get a different id every time - silently fanning ONE action out
+     into N events. Exactly the problem we are trying to eliminate.
+
+     Rule: read ctx.Value(contexts.ContextKeyReqID) and treat ABSENT as absent
+     (detectable), never let the generate-branch fabricate a grouping key.
+
+Q25. Can XMI act on the event without calling us back?
+
+A25. For the four M1 use cases, yes - if we ship Level 1 (Q11). All four act on
+     the NEW state and none asks what the value was before.
+
+     If we ship Level 0, XMI must call back on every update, including renames
+     and the ~15 other fields on DataImportJob they do not care about. That is
+     polling with extra steps, and DV-15621 records polling as the problem we
+     are solving.
+
+Q26. Can events arrive out of order?
+
+A26. Yes, and the design tolerates it. The topic is Standard (not FIFO)
+     deliberately: [VERIFIED] hank/aws/sns/service.go:48 sets
+     MessageGroupId to the request id, and FIFO only orders WITHIN a group, so
+     two updates to the same object from different requests are ALREADY
+     unordered on the existing topic. Nothing is lost by moving to Standard.
+
+     Mitigation: events carry a producer-stamped occurred_at, and XMI's
+     consumers are last-state-wins. Because they read back current state, an
+     out-of-order notification converges to the right answer.
+
+Q27. If orinix replays events - catch-up, DLQ redrive, backfill - and XMI
+     triggers Flow 2 on "Flow 1 completed", could a replay re-trigger flows?
+
+A27. Yes, unless we design for it. This is Fowler's EXTERNAL UPDATE hazard from
+     the Event Sourcing article Josh shared, and I do not think it has been
+     written down yet.
+
+     Options: mark replayed deliveries explicitly, agree XMI dedupes on
+     event_id, or agree that triggering is idempotent on their side. Any of
+     the three works; picking none is the risk. Worth a decision before M1.
+
+Q28. What is the blast radius on the other services using hank?
+
+A28. Designed to be zero:
+       - the AuditLog additions are all omitempty and only populated for models
+         that opt in, so the log line is byte-identical for a service that has
+         not opted in
+       - the outbox write is skipped entirely unless the service configures an
+         outbox
+       - the aggregate root is an OPT-IN interface; a model that does not
+         implement it produces no event
+       - no existing hook behaviour changes
+
+     A service that does nothing sees no change at all. That is the property
+     that makes this safe to ship into a shared library used by unhygienix,
+     forebitt, primage, picanmix and pegleg.
+
+
+================================================================================
+PART 2 - THE END-TO-END WALKTHROUGH
+================================================================================
+
+THE EXAMPLE
+  A user at Adidas creates a data connection "Adidas EMEA CRM Data" on data
+  source CLIENT_AWS, dataset type CRM, with three settings:
+      DataLocation   = s3://adidas-emea-cleanroom/crm/customers/
+      SampleFilePath = s3://adidas-emea-cleanroom/crm/schema/sample_2026_06.csv
+      FieldDelimiter = ,
+
+--------------------------------------------------------------------------------
+STAGE 0 - the click
+--------------------------------------------------------------------------------
+  User clicks Save in the Cleanroom UI.
+
+--------------------------------------------------------------------------------
+STAGE 1 - request id is born
+--------------------------------------------------------------------------------
+  hank/http/middleware/tracing.go:25-31   WithTracing
+      reqId = X-Request-Id header, or uuid.New() if absent   -> "abc-123"
+      ctx = contexts.SetReqIdCtx(ctx, "abc-123")
+
+  hank/http/middleware/logging.go:104     WithContextLogger
+      hlog.AddFieldsContext(ctx, {"requestId": "abc-123"})
+
+  Both are in DefaultGrpcHandlerChain AND DefaultHttpHandlerChain
+  (chain.go:10-22), so this happens for REST and gRPC alike, before any
+  handler runs.
+
+  STATE: ctx carries request id "abc-123".
+
+--------------------------------------------------------------------------------
+STAGE 2 - the handler
+--------------------------------------------------------------------------------
+  forebitt/api/server/dataConnections_v2.go:309  CreateDataConnectionV2
+      :313  authUser := getAuthUser(ctx)        -> WHO
+      :323  dataType   resolved                 -> "CRM"
+      :328  dataSource resolved                 -> "Client AWS S3"
+      :333  jobModel built (not yet persisted)
+      :343  dbParameters built - 3 objects
+      :356  db.InsertJobV2(ctx, s.DB, &jobModel, dbParameters)
+
+--------------------------------------------------------------------------------
+STAGE 3 - the transaction opens
+--------------------------------------------------------------------------------
+  forebitt/db/job_v2.go:19
+      tx := hdb.BeginTxDB(ctx, db, &sql.TxOptions{})
+
+  hank/db/audit.go:221-225
+      tx.InstantSet("context", ctx)     <-- THIS is how hooks later see ctx
+
+  STATE: transaction open; ctx (with request id + auth claims) attached to tx.
+
+--------------------------------------------------------------------------------
+STAGE 4 - write 1 of 5: INSERT the job    -> HOOK FIRES
+--------------------------------------------------------------------------------
+  job_v2.go:20    tx.Create(&job)                         POINTER
+
+  GORM: gorm:create -> gorm:after_create (callback_create.go:17)
+        afterCreateCallback -> scope.CallMethod("AfterCreate")
+        reflection finds hdb.Audit.AfterCreate PROMOTED onto *DataImportJob
+
+  NEW CODE runs (all inside the transaction, all local):
+      root  = EventRoot()          -> ("DATA_CONNECTION", "d56ada74-...")
+      state = event:"state" tags   -> {name: "Adidas EMEA CRM Data",
+                                       status: "ACTIVE",
+                                       stage:  "CONFIGURATION_COMPLETE"}
+      actor = authUser             -> aditya@..., type USER
+      req   = "abc-123"
+      event_id = sha256("DATA_CONNECTION|d56ada74-...|abc-123")
+
+      INSERT INTO change_outbox (...)      <-- OUTBOX ROW 1, same tx
+
+--------------------------------------------------------------------------------
+STAGE 5 - write 2 of 5: DELETE the parameters   -> NO HOOK
+--------------------------------------------------------------------------------
+  job_parameters.go:81
+      Delete(models.OrganizationJobParameter{})           BY VALUE
+
+  Matches ZERO rows on a create (there are no settings yet), and - per Q2 -
+  fires NO hook at all, because the value is not addressable so the
+  pointer-receiver hook is not found.
+
+  STATE: no outbox row. Nothing to filter, nothing to discard.
+
+--------------------------------------------------------------------------------
+STAGE 6 - writes 3,4,5: INSERT 3 parameters    -> HOOK FIRES x3
+--------------------------------------------------------------------------------
+  job_parameters.go:149   inParamObj.DataImportJobID = importJobID   [VERIFIED]
+  job_parameters.go:154   tx.Create(inParamObj)                      POINTER
+
+  Note :149 runs BEFORE :154, so the child row already knows its parent when
+  the hook fires. This is what makes root resolution work:
+
+      OrganizationJobParameter.EventRoot()
+          -> ("DATA_CONNECTION", p.DataImportJobID)
+          -> ("DATA_CONNECTION", "d56ada74-...")     <-- SAME ROOT as stage 4
+
+  Three more outbox rows, same root, same request id, same event_id.
+
+  STATE: 4 outbox rows, all carrying the identical event_id.
+
+--------------------------------------------------------------------------------
+STAGE 7 - COMMIT    <-- THE ATOMICITY BOUNDARY
+--------------------------------------------------------------------------------
+  job_v2.go:31   tx.Commit()
+
+  Committed atomically:
+      data_import_jobs               1 row
+      organization_job_parameters    3 rows
+      change_outbox                  4 rows (published_at NULL)
+
+  This is the guarantee. From this instant, the event WILL be delivered - the
+  intent to publish is durable. If the pod dies here, nothing is lost.
+
+--------------------------------------------------------------------------------
+STAGE 8 - post-commit handler work
+--------------------------------------------------------------------------------
+  dataConnections_v2.go:362-371   optional Snowflake setup; can return an error
+                                  even though the rows are committed  (see Q22)
+  :372-378                        response assembled
+  :379                            201 returned to the user
+
+--------------------------------------------------------------------------------
+STAGE 9 - the relay (asynchronous, outside the request)
+--------------------------------------------------------------------------------
+  A goroutine in forebitt, every N seconds:
+
+      SELECT * FROM change_outbox
+       WHERE published_at IS NULL
+       ORDER BY occurred_at
+       LIMIT 500
+         FOR UPDATE SKIP LOCKED        <-- multiple pods safe
+
+  Groups the 4 rows by (root_object_type, root_object_id, request_id) -> 1 group
+  Merges state, unions changed_fields, picks the strongest action
+  (CREATE > DELETE > UPDATE)
+  Publishes ONE message to SNS habu-observability-events
+  Marks all 4 rows published_at = now()
+
+  Completeness is not a guess: all 4 rows became visible at the same commit.
+
+--------------------------------------------------------------------------------
+STAGE 10 - transport
+--------------------------------------------------------------------------------
+  SNS habu-observability-events (Standard, NEW topic)  ->  SQS orinix ingest
+  New topic because pegleg's subscription filter already matches
+  "dataImportJob" (orinjade .../pegleg.tf:17), so reusing the existing FIFO
+  topic would deliver our messages into pegleg's queue.
+
+--------------------------------------------------------------------------------
+STAGE 11 - orinix
+--------------------------------------------------------------------------------
+      INSERT INTO object_events (...)
+      ON CONFLICT (event_id) DO NOTHING
+
+  Idempotent: SQS redelivery, relay republish after a crash, and the V1 route's
+  two transactions all collapse here.
+
+--------------------------------------------------------------------------------
+STAGE 12 - delivery to XMI
+--------------------------------------------------------------------------------
+  webhook (HMAC-signed HTTPS)  and/or  GCP Pub/Sub
+  plus GetCleanroomEvents cursor API for catch-up.
+
+  What XMI receives:
+
+      {
+        "eventId":        "9f2c...",
+        "eventTime":      "2026-08-03T09:14:02Z",
+        "schemaVersion":  "1.0",
+        "objectType":     "DATA_CONNECTION",
+        "objectId":       "d56ada74-...",
+        "action":         "CREATED",
+        "state":          { "stage":  "CONFIGURATION_COMPLETE",
+                            "status": "ACTIVE",
+                            "name":   "Adidas EMEA CRM Data" },
+        "changedFields":  ["name","status","stage"],
+        "actor":          { "id": "...", "email": "aditya@...", "type": "USER" },
+        "organizationId": "org-adidas-emea",
+        "requestId":      "abc-123"
+      }
+
+  No from/to anywhere. XMI acts on stage directly, or calls back with objectId
+  for the full resource.
+
+--------------------------------------------------------------------------------
+THE WHOLE THING ON ONE PAGE
+--------------------------------------------------------------------------------
+  click
+    |
+    v  WithTracing / WithContextLogger        request_id = abc-123
+  CreateDataConnectionV2
+    |
+    v  BeginTxDB(ctx)                          ctx attached to tx
+  +-- TRANSACTION ------------------------------------------------+
+  |  INSERT job          -> hook -> outbox row 1                   |
+  |  DELETE params (0)   -> NO HOOK (by-value)                     |
+  |  INSERT param x3     -> hook -> outbox rows 2,3,4              |
+  |  COMMIT   <=== 4 business rows + 4 outbox rows, ATOMIC         |
+  +----------------------------------------------------------------+
+    |
+    v  relay (async, any pod)   group by (root, request_id) -> 1 msg
+  SNS -> SQS -> orinix -> object_events (ON CONFLICT DO NOTHING)
+    |
+    v
+  XMI   webhook | GCP Pub/Sub | GetCleanroomEvents
+
+
+================================================================================
+PART 3 - EXACTLY WHAT CHANGES IN THE AUDITLOG STRUCT
+================================================================================
+
+BEFORE (hank/db/audit.go:43-56, unchanged fields)
+
+    type AuditLog struct {
+        ObjectID            string
+        ObjectName          string
+        ObjectType          string
+        Action              string
+        ActionByID          string
+        ActionByEmail       string
+        ActionAt            time.Time
+        Method              interface{}
+        OrgID               interface{}
+        RequestID           interface{}
+        ImpersonatedByID    string
+        ImpersonatedByEmail string
+    }
+
+AFTER
+
+    type AuditLog struct {
+        // ---- unchanged ----
+        ObjectID            string
+        ObjectName          string
+        ObjectType          string
+        Action              string
+        ActionByID          string
+        ActionByEmail       string
+        ActionAt            time.Time
+        Method              interface{}
+        OrgID               interface{}
+        RequestID           interface{}          // REUSED as the grouping key
+        ImpersonatedByID    string
+        ImpersonatedByEmail string
+
+        // ---- NEW: all optional, all omitempty ----
+        RootObjectType string            `json:"rootObjectType,omitempty"`
+        RootObjectID   string            `json:"rootObjectID,omitempty"`
+        State          map[string]string `json:"state,omitempty"`
+        ChangedFields  []string          `json:"changedFields,omitempty"`
+        EventID        string            `json:"eventID,omitempty"`
+        SchemaVersion  string            `json:"schemaVersion,omitempty"`
+    }
+
+WHY EACH NEW FIELD EXISTS
+
+  RootObjectType / RootObjectID
+      The aggregate root - Josh's "root node". This is the ONLY thing that
+      cannot be derived from what AuditLog already has, because ObjectID and
+      ObjectType are per-ROW, not per-RESOURCE. Without these, four records
+      about one data connection are indistinguishable from four records about
+      four unrelated rows.
+
+  State
+      Current values of fields tagged event:"state". Gives Level 1. Costs no
+      extra query - the values are already in the struct being written.
+
+  ChangedFields
+      Field NAMES only, never values. Free: gorm stores the update map at
+      scope.InstanceGet("gorm:update_attrs") (callback_update.go:27), so no
+      before-image and no extra SELECT. Lets XMI filter without any of the
+      from/to cost.
+
+  EventID
+      Deterministic idempotency key, so the relay can recompute it after a
+      crash and orinix can dedupe on it.
+
+  SchemaVersion
+      This becomes an external partner contract. Version it from day one; it is
+      free now and expensive to retrofit.
+
+WHAT WE DELIBERATELY DO NOT ADD
+
+  TxID           - request_id is the correct grouping key (Q7); a transaction
+                   id would SPLIT the V1 route's one action into two.
+  Before/after   - agreed dropped.
+  Raw field maps - would defeat the allow-list and reopen the secrets question.
+
+HOW STATE IS DECLARED - the struct tag
+
+    forebitt/models/data_import_job.go
+
+        type DataImportJob struct {
+            UUID
+            hdb.Audit
+            ...
+            Name   string `gorm:"type:varchar(255);not null"        event:"state"`
+            Status string `gorm:"type:varchar(20);not null"         event:"state"`
+            Stage  string `gorm:"...;default:'STAGE_UNKNOWN'"       event:"state"`
+            // every other field: no tag -> never leaves the building
+        }
+
+  Three properties worth stating to the architect:
+    - SECURITY BY CONSTRUCTION. primage's Credential.Value simply never gets
+      the tag. The tag list IS the allow-list, so "platform-level emission
+      might leak a secret" is answered structurally, not by review.
+    - ADDITIVE. A new tagged field flows automatically. An untagged field is
+      invisible. Nothing to remember per write path.
+    - CHEAP. No before-image, no extra query.
+
+  ONE CAVEAT [VERIFIED]: UpdateJobV2 (job_v2.go:45) uses Updates(*job), and
+  gorm v1 drops zero-valued fields. So only emit a tagged field if it appears
+  in gorm:update_attrs. Otherwise we would ship "stage": "" to a partner - not
+  noise, WRONG, and XMI's stage consumer would act on it.
+
+HOW THE ROOT IS DECLARED - the opt-in interface
+
+    hank/db
+        type EventScoped interface {
+            EventRoot() (objectType string, objectID string)
+        }
+
+    forebitt/models
+        func (j DataImportJob) EventRoot() (string, string) {
+            return "DATA_CONNECTION", j.ID
+        }
+        func (p OrganizationJobParameter) EventRoot() (string, string) {
+            return "DATA_CONNECTION", p.DataImportJobID
+        }
+
+  Two lines of forebitt code cover the entire data connection resource, on
+  every write path that exists today and every write path anyone adds later.
+  A model that does not implement EventScoped produces no event - so the
+  other four services are untouched until they opt in.
+
+  Note this also gives us the BUSINESS name "DATA_CONNECTION" rather than the
+  model name "DataImportJob", so our schema stays private and we can rename
+  tables without breaking a partner.
+
+
+================================================================================
+PART 4 - FAILURE SCENARIOS
+================================================================================
+
+  #  Scenario                          What happens                    Lost?
+  -- --------------------------------- ------------------------------- -----
+  1  Pod dies after COMMIT, before     outbox row committed with       NO
+     the relay publishes               published_at NULL; another
+                                       pod's relay picks it up
+  2  Relay publishes, dies before      republishes on restart; orinix  NO
+     marking published_at              ON CONFLICT DO NOTHING drops
+                                       the duplicate
+  3  SNS unavailable                   relay retries with backoff,     NO
+                                       attempts++, rows accumulate;
+                                       alert on oldest-unpublished-age
+  4  orinix down                       SQS buffers                     NO
+  5  XMI endpoint down                 orinix retries, then DLQ; XMI   NO
+                                       catches up via GetCleanroomEvents
+  6  Transaction rolls back            outbox row rolled back with it  N/A
+                                       - no phantom event, ever
+  7  Outbox INSERT fails               transaction rolls back; the     N/A
+                                       business write fails too. Only
+                                       possible if the DB is failing.
+  8  Bug in our reflection code        recover(), log, metric, SKIP    YES,
+                                       the event. Write still succeeds  1 event
+  9  Post-commit Snowflake failure     event IS emitted; rows exist    NO
+     (dataConnections_v2.go:362-371)   (see Q22 - agree this)
+  10 Same request updates the          same event_id -> orinix keeps   N/A
+     resource twice (V1 route)         one event
+  11 Client retries the whole request  new request_id -> new event.    N/A
+                                       Correct: it is a new attempt,
+                                       and XMI reads current state
+  12 Background worker, no request id  IF unfixed: GetReqIdCtx mints   YES -
+                                       a fresh uuid per call -> N       MUST
+                                       events instead of 1              FIX
+                                       (see Q24)
+
+  THE ONE-LINE VERSION FOR THE ARCHITECT:
+      Today  - publish after commit, error swallowed -> silent loss, unmeasured.
+      Design - intent to publish is committed with the data -> loss is
+               impossible; the worst case is late delivery, which is visible
+               as outbox age.
+
+
+================================================================================
+PART 5 - OPEN ITEMS, DECISIONS NEEDED, REFERENCES
+================================================================================
+
+DECISIONS I NEED FROM THIS MEETING
+  D-A  Approve the outbox: hook writes to forebitt.change_outbox inside the
+       transaction; a relay publishes. (The alternative - publishing from the
+       hook - can roll back customer writes. Q4.)
+  D-B  Approve Level 1 (current state via event:"state" tags), not Level 0.
+       "No from/to" should not become "no state". (Q11)
+  D-C  Approve reusing RequestID as the grouping key and ADDING
+       RootObjectType/RootObjectID. (Q8, Part 3)
+  D-D  Agree the post-commit-failure behaviour in Q22.
+  D-E  Agree orinix keeps object_events and remains the fan-out point, rather
+       than producers publishing to XMI's Pub/Sub directly. (Q14, Q15)
+  D-F  Agree replay semantics with XMI so a redrive cannot re-trigger flows.
+       (Q27)
+
+BLOCKERS TO FUND BEFORE OR WITH PHASE 1
+  B-1  Delete carries no id (job.go:185) - without this, DELETE events are
+       impossible and our compliance audit log stays broken. (Q12)
+  B-2  Background paths: system-actor resolution + an explicit request id at
+       the start of the unit of work. Without this, flow-run completion - the
+       event XMI most needs - either emits nothing or fans out into N events.
+       (Q24)
+
+KNOWN GAPS ACCEPTED FOR M1
+  G-1  A settings-only change that removes the last parameter and adds none
+       emits nothing, because the parameter DELETE fires no hook (Q2) and there
+       are no INSERTs. In practice the job row is updated in the same
+       transaction, which does emit. Escape hatch if we need it: one explicit
+       hdb.TouchRoot(tx, "DATA_CONNECTION", jobID) call inside
+       SetOrganizationJobParametersInTransaction - one call site, not per
+       handler.
+  G-2  Cross-service resources (Dataset -> DataImportJob in forebitt ->
+       Credential in primage) cannot be assembled by any model-layer mechanism.
+       Three services, three databases. Not an M1 problem.
+  G-3  Read-access auditing (Jon's ask) has NO emit point here - reads do not
+       write rows, so no model-layer or database-level mechanism can ever see
+       them. Only service-layer code can. Worth saying now rather than in M3.
+
+TO CONFIRM (cheap, does not block the design)
+  C-1  Pull `Audit Log:` lines in Loki for one data connection create and
+       confirm all records share one non-null requestId. Validates Stage 1-6
+       against production rather than against my reading.
+  C-2  Confirm on the V1 route that all 8 records share one requestId.
+  C-3  Confirm with gorm query logging that UpdateJobV2's
+       Model(&DataImportJob{}).Updates(*job) really does scope the WHERE by id.
+       Code reading says yes - updatedAttrsWithValues (gorm scope.go:919) calls
+       field.Set, which populates scope.Value's primary key before whereSQL
+       (scope.go:723) builds the condition - but this is worth seeing once.
+  C-4  V6: does anything parse the `Audit Log:` stdout lines today (Datadog
+       monitors, the audit feed to pegleg)? Phase 1 changes no log line, so
+       this is no longer blocking, but Josh should confirm before Phase 2.
+
+REFERENCES
+  Transactional Outbox
+      The pattern behind Q17-Q20: write the message in the same transaction as
+      the state change, relay it afterwards. Chris Richardson,
+      https://microservices.io/patterns/data/transactional-outbox.html
+  Event Sourcing - Martin Fowler
+      https://martinfowler.com/eaaDev/EventSourcing.html
+      Used here for: snapshots (Q16) and the External Update replay hazard
+      (Q27). NOTE we are not doing event sourcing - see below.
+  What do you mean by "Event-Driven"? - Martin Fowler
+      https://martinfowler.com/articles/201701-event-driven.html
+      The taxonomy that names what we ARE building: EVENT NOTIFICATION (thin
+      event, receiver reads back), as distinct from Event-Carried State
+      Transfer, Event Sourcing and CQRS.
+  Aggregate / Aggregate Root - Eric Evans, Domain-Driven Design
+      Josh's "root node". One consistency boundary, one entry point; children
+      are not independently addressable. This is what turns 4 row events into
+      1 resource event. https://martinfowler.com/bliki/DDD_Aggregate.html
+  Idempotent Receiver
+      Why orinix dedupes rather than the relay trying to be exactly-once.
+      Hohpe & Woolf, Enterprise Integration Patterns.
+
+COMPANION DOCUMENTS
+  2026-08-03_hank_phase1_pr_implementation_plan.txt
+      The concrete PR: files, functions, schema, tests, rollout.
+  2026-07-31_hank_platform_event_design_after_anil_josh.txt
+      Why we chose Hank over the service layer; the full options analysis.
+  2026-08-03_requestid_correlation_key_trace.txt
+      Line-level trace of request id, and how the hook is invoked at all.
+
+CORRECTIONS THIS DOCUMENT MAKES TO EARLIER ONES
+  1. A create produces 4 hook firings, not 5. The parameter DELETE is passed
+     BY VALUE and therefore fires no hook (Q2). Earlier documents described a
+     phantom DELETE record with an empty ObjectID; that record does not exist.
+  2. The V1 route produces 8 hook firings, not 10. Same reason, twice.
+  3. The empty-identity problem is real but lives on the JOB delete
+     (job.go:185, by pointer with an empty struct) and NOT on the parameter
+     delete. The earlier docs attributed it to the wrong statement.
+  The underlying conclusions - one action must become one event, and the audit
+  log cannot say which object was deleted - are unchanged.

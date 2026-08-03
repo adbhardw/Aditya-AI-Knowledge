@@ -5,6 +5,8 @@
 **Decision meeting:** 2026-07-30 with Anil and Josh Wo (Principal Architects)
 **Tickets:** DV-13856 (platform), DV-15090 / DV-15091 (M1), DV-15496 (epic), DV-15621 (XMI polling)
 **Detail documents:**
+- [`2026-08-03_create_data_connection_end_to_end_flow_for_architect.txt`](2026-08-03_create_data_connection_end_to_end_flow_for_architect.txt) — **the architect walkthrough.** 28 Q&A up front, then one create traced stage by stage (click → request id → transaction → outbox → relay → SNS → orinix → XMI), the exact `AuditLog` diff, a 12-row failure-scenario table, and references
+- [`2026-08-03_hank_phase1_pr_implementation_plan.txt`](2026-08-03_hank_phase1_pr_implementation_plan.txt) — the Phase 1 PR: files, schema, tests, metrics, rollout, review checklist
 - [`2026-07-31_hank_platform_event_design_after_anil_josh.txt`](2026-07-31_hank_platform_event_design_after_anil_josh.txt) — the design
 - [`2026-08-03_requestid_correlation_key_trace.txt`](2026-08-03_requestid_correlation_key_trace.txt) — full source trace of the correlation key: which `AuditLog` field can serve as it, where `requestId` is set, why `job_service.go:1418` and `:1425` share one, **how the audit hook is invoked at all when nothing calls it**, and the `GetReqIdCtx` UUID-minting trap
 
@@ -99,6 +101,35 @@ So the roll-up key is:
 → **Correlation: reuse existing `RequestID`. Identity: must add `RootObjectType` +
 `RootObjectID`** — these cannot be derived, because `ObjectID`/`ObjectType` are
 per-row.
+
+### ⚠️ Correction (2026-08-03): 4 hook firings per create, not 5
+
+The **5 row writes** above are SQL statements and remain correct. The **hook firing**
+count does not: the parameter DELETE fires **no hook at all**.
+
+`forebitt/db/job_parameters.go:81` passes the model **by value**
+(`Delete(models.OrganizationJobParameter{})`), while `forebitt/db/job.go:185` passes a
+**pointer** (`Delete(&models.DataImportJob{})`). `hdb.Audit`'s hooks have **pointer
+receivers**, and GORM only takes `.Addr()` when the value is addressable
+(`scope.go:434-436`) — a struct passed by value into an interface is not. Verified
+with a standalone program reproducing GORM's exact logic:
+
+```
+Delete(Model{})   -> CanAddr=false  hook found = false
+Delete(&Model{})  -> CanAddr=true   hook found = true
+```
+
+| | SQL writes | Hook firings | Events |
+|---|---|---|---|
+| V2 route (Door A) create | 5 | **4** | 1 |
+| V1 route (Door B) create | 10 | **8** | 1 |
+
+**Good:** there is no phantom DELETE record to filter — earlier documents (including
+`2026-07-31/2026-07-30-aditya-architect-followup/`) described one, and it does not
+exist. **Bad:** a settings-only removal is invisible at the hook layer. The
+empty-identity defect is real but lives on the **job** delete (`job.go:185`), not the
+parameter delete. Both underlying conclusions are unchanged: one action must become
+one event, and the audit log cannot say which object was deleted.
 
 ### How the audit hook runs when nothing calls it
 
