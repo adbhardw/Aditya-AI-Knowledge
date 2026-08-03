@@ -231,7 +231,8 @@ three blocks, no security review, no infrastructure, and it proves the path with
 | Document | Level | Contents |
 |---|---|---|
 | [01-system-context.md](01-system-context.md) | L1 Context | Actors, systems, boundary crossings, the six constraints C1–C6 |
-| [02-containers.md](02-containers.md) | L2 Container | Deployable pieces, protocols, reliability boundary, multi-consumer fan-out |
+| **[02-containers_updated.md](02-containers_updated.md)** ⭐ | L2 Container | **Current.** Rewritten for the Hank/outbox decision: `change_outbox` + relay containers, the transaction-boundary diagram, why the hook must not publish, relay code and lifecycle, the exact hook diff, all five parameter write paths, corrected `changedFields`, and at-least-once end to end |
+| [02-containers.md](02-containers.md) | *superseded* | Pre-decision version, kept for the decision trail |
 | [03-components-orinix.md](03-components-orinix.md) | L3 Component | Ingest/store/read/deliver, idempotency, two-tier retention |
 | [04-components-producer.md](04-components-producer.md) | L3 Component | Three doors, five candidate emission points, the update trap, the suppression flag |
 | [05-runtime-flows.md](05-runtime-flows.md) | Dynamic | Six sequences: happy path, flow-run completion, retry/DLQ, replay, the rejected alternative, publish loss |

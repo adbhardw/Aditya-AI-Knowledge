@@ -31,7 +31,8 @@ a customer-facing change-history UI, and compliance audit logging.
 | # | Document | C4 level | Answers |
 |---|---|---|---|
 | 1 | [01-system-context.md](01-system-context.md) | **L1 — Context** | Who are the actors and systems, and why does this platform exist? |
-| 2 | [02-containers.md](02-containers.md) | **L2 — Container** | What are the deployable/runnable pieces and the protocols between them? |
+| 2 | **[02-containers_updated.md](02-containers_updated.md)** ⭐ | **L2 — Container** | **Read this instead of `02`.** The deployable pieces and protocols, updated for the Hank/outbox decision: `change_outbox`, the relay (code + lifecycle + polling cost), the exact hook diff, all five parameter write paths, and corrected `changedFields` semantics. |
+| — | [02-containers.md](02-containers.md) | *superseded* | The pre-decision version, kept for the decision trail only. |
 | 3 | [03-components-orinix.md](03-components-orinix.md) | **L3 — Component** | What is inside Orinix — ingest, store, pull API, delivery? |
 | 4 | [04-components-producer.md](04-components-producer.md) | **L3 — Component** | What is inside the producer, and **where exactly does the event get born?** This is the open decision. |
 | 5 | [05-runtime-flows.md](05-runtime-flows.md) | **Dynamic** | Five end-to-end sequences, including the failure paths and the rejected alternative. |
