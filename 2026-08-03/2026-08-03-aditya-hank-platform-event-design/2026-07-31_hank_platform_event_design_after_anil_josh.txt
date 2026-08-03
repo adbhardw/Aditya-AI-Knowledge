@@ -1,0 +1,472 @@
+2026-07-31 — Platform-level change events in Hank
+Design response to Anil & Josh's direction from the 2026-07-30 meeting
+======================================================================
+
+MEETING OUTCOME (as I understood it)
+------------------------------------
+1. Start with Hank. It is already integrated into multiple microservices. A
+   function-by-function approach does not scale: new methods will be added and
+   engineers will forget to emit. Think at the PLATFORM level.
+2. DB triggers and CDC are stashed. Triggers are costly; CDC gives roughly the
+   same output as Hank without the extra cost of running and maintaining a CDC
+   pipeline.
+3. Drop from/to (the before-and-after values) from the event we send XMI. That
+   was the hardest part for Hank, and XMI can query by the resource id in the
+   event to get the final state.
+4. Extend the AuditLog struct (or add a sibling) rather than build something new.
+5. Josh: a "root node" based approach, and Fowler's Event Sourcing article.
+6. Josh is fine using orinix once the Hank piece is resolved.
+
+WHERE I NOW AGREE WITH THEM — AND WHY MY EARLIER OBJECTIONS DIE
+---------------------------------------------------------------
+I should say this plainly, because it changes my recommendation.
+
+(a) The "forgetting" argument is correct and it is decisive.
+    My approach put the emit in each handler. Their approach puts it in the
+    model layer. The real difference is the UNIT OF FORGETTING:
+
+        my approach   -> forget once per NEW WRITE PATH   (many, and growing)
+        their approach-> forget once per NEW RESOURCE TYPE (few, and reviewable)
+
+    Every model already embeds hdb.Audit. That is the platform seam, it already
+    exists, and it is already deployed everywhere. Adding a field to
+    DataImportJob needs zero new code to appear in events. Adding a new write
+    path needs zero new code. That is a genuinely better property and I did not
+    weight it highly enough.
+
+(b) Dropping from/to kills my two strongest objections against hooks.
+    My case against Hank hooks rested on: "the record has no field values" and
+    "an assembler cannot know when all 5 row-records have arrived, so a timer
+    turns a slow message into a WRONG event."
+      - "No values" is moot once we are not sending values.
+      - "Wrong event" was conditional on FAT events. With a thin event, a
+        straggler produces a DUPLICATE NOTIFICATION, not a wrong one. XMI reads
+        back current state either way, so a duplicate is harmless.
+    So the failure mode I was most worried about does not exist in their design.
+    I was right about the mechanism and wrong about the consequence, because I
+    was assuming a payload they have now removed.
+
+(c) Stashing CDC and triggers matches my own analysis, so no disagreement there.
+
+WHAT THIS ACTUALLY IS, IN FOWLER'S VOCABULARY
+----------------------------------------------
+Worth naming precisely, because it prevents a category error later.
+
+Fowler's four event patterns ("What do you mean by Event-Driven?", 2017):
+  1. EVENT NOTIFICATION — thin event ("resource X changed"); the receiver calls
+     back for detail. Low coupling. Hard to see the end-to-end flow.
+  2. EVENT-CARRIED STATE TRANSFER — the event carries the data; no call back.
+  3. EVENT SOURCING — the event log is the SOURCE OF TRUTH; current state is a
+     derived fold of the log.
+  4. CQRS — separate read and write models.
+
+What we agreed on Wednesday is (1) EVENT NOTIFICATION. That is a perfectly good,
+well-established choice and it is the right first step.
+
+It is NOT event sourcing, and that distinction matters for one reason: event
+sourcing REQUIRES that the events be sufficient to rebuild state. "DataImportJob
+X was updated" cannot rebuild anything. So we should not describe what we build
+as event sourcing, and we should not let the audit-log workstream assume it can
+later reconstruct history from these events. It cannot, unless we add state.
+
+WHAT FOWLER'S EVENT SOURCING ARTICLE ACTUALLY SAYS
+---------------------------------------------------
+https://martinfowler.com/eaaDev/EventSourcing.html
+
+Core idea: "Capture all changes to an application state as a sequence of
+events." The event log is the book of record. Current state is a cache you can
+always rebuild by replaying the log. His running example is ship/port/cargo
+movements.
+
+The concepts in the article, and whether each one lands on us:
+
+* Application State vs Event Log. State is derived; the log is authoritative.
+  -> RELEVANT LATER. If object_events ever becomes the audit book of record
+     (Josh's expansion), this is the mental model. Today object_events is a
+     delivery buffer, not a book of record.
+
+* Rebuilding state by replay.
+  -> NOT ACHIEVABLE with thin events. Flagging it so nobody promises it.
+
+* SNAPSHOTS. Replaying from the beginning is impractical, so you store periodic
+  state snapshots and replay only events after them.
+  -> DIRECTLY RELEVANT to our 90-day delete on object_events. "Current state in
+     the source table + recent events" IS the snapshot pattern. It is the honest
+     answer to "what happens to the replay window on day 91": you re-read
+     current state, you do not replay from the start.
+
+* EXTERNAL SYSTEMS / GATEWAYS. The most practically important section. Two
+  hazards when replaying:
+    - External Query: replaying re-queries an outside system and gets TODAY's
+      answer, not the answer at the time. Wrap it so the original response can
+      be replayed.
+    - External Update: replay must NOT re-fire real-world side effects. You do
+      not want to re-send the email or re-charge the card.
+  -> THIS IS A REAL DESIGN ITEM FOR US, and I do not think it has been raised.
+     XMI's use case 3 is "when Flow 1 completes, TRIGGER Flow 2". If orinix
+     replays events to XMI — for catch-up, DLQ redrive, or a backfill — XMI
+     could RE-TRIGGER FLOWS. That is an external update being replayed. We need
+     an explicit answer: a replay/redelivery marker on the event, a stable event
+     id that XMI dedupes on, or an agreement that triggering is idempotent.
+     Worth raising with Josh, since he shared the article.
+
+* Reversal / compensating events: to undo, add a reversing event rather than
+  deleting one.
+  -> Relevant to our soft-delete-then-undelete edge case.
+
+* Events as first-class domain objects with meaning ("Ship arrived"), not
+  anonymous row diffs.
+  -> This is the same instinct as the "root node" point below: name the business
+     event, not the table mutation.
+
+* Costs he warns about: complexity, event schema versioning over time, and
+  unfamiliarity to most developers.
+
+"ROOT NODE" = AGGREGATE ROOT, AND IT IS THE MISSING PIECE
+----------------------------------------------------------
+Josh's "root node based approach" is, I am fairly confident, the DDD Aggregate
+Root: a cluster of objects treated as one unit, with one entry point. Children
+are not independently addressable from outside.
+
+This is exactly the fix for the problem I have been banging on about:
+
+    a Data Connection is ONE business resource stored as
+        data_import_jobs                 (1 row)
+      + organization_job_parameters      (1 row PER SETTING)
+
+    -> one user action = 5 row writes = 5 hook firings (10 via the V1 route)
+
+If Hank knows that OrganizationJobParameter's ROOT is the DataImportJob, then
+5 row events roll up to 1 resource event automatically, at the platform layer,
+for every resource type, forever. That is the thing that makes their approach
+work, and it is the piece my design was solving by hand in each function.
+
+THE DESIGN
+==========
+Five changes. Two are blockers, three are the actual feature.
+
+--- CHANGE 1 (BLOCKER) — fix the claims gate -------------------------------
+hank/db/audit.go:33-41 and every hook:
+
+    func claims(scope *gorm.Scope) (*token.AuthClaims, context.Context, bool) {
+        dbContext, _ := scope.DB().Get("context")
+        if dbContext == nil { return nil, nil, false }   // <-- no context at all
+        ...
+    }
+
+    func (a *Audit) AfterCreate(scope *gorm.Scope) error {
+        tokenClaims, ctx, parsed := claims(scope)
+        if !parsed { return nil }        // <-- SILENTLY EMITS NOTHING
+        ...
+    }
+
+VERIFIED consequence: the context is only present if the write went through
+BeginDB/BeginTxDB (audit.go:215-225, which do tx.InstantSet("context", ctx)).
+Any write that does not, or any request without parsed auth claims, produces
+NO AUDIT RECORD AT ALL — today, silently.
+
+Why this is now the #1 risk: a Flow Run completing is almost certainly a
+BACKGROUND WORKER, not a user request. That is XMI's most important event
+(use cases 2, 3 and 4 all hang off it). If the claims gate swallows it, the
+whole platform approach produces nothing for the case we care about most.
+
+The fix is cheap and the precedent is 40 lines away in the same file.
+GetAuditDetails (audit.go:91-123) already degrades gracefully and already has a
+system-actor concept:
+
+    habuPlatformSuperuser := getHabuPlatformSuperUser()   // HABU_PLATFORM_SUPERUSER
+    if user.ID == "" && token.IsAuthorizedServiceUser(tokenClaims) {
+        user.ID = habuPlatformSuperuser
+    }
+
+So: make the hooks fall back to the platform superuser / a "system" actor
+instead of returning nil, and handle the no-context case with
+context.Background(). Do NOT ship the platform approach before this is fixed.
+
+ACTION: this is verification item V2 from the earlier pack. It must be closed
+first, and the fix belongs in Hank, not forebitt.
+
+--- CHANGE 2 (BLOCKER) — fix the empty ObjectID on delete ------------------
+getObjectDetails (audit.go:241-267) marshals scope.Value and reads "ID".
+forebitt/db/job.go:185 deletes with an EMPTY struct:
+
+    tx.Scopes(IDScope(id)).Delete(&models.DataImportJob{})
+
+The id is in the WHERE clause, not in the struct. So the delete record is:
+
+    { "ObjectType": "DataImportJob", "ObjectID": "", "Action": "DELETE" }
+
+"Somebody deleted a data connection. We are not saying which one."
+
+This is already a defect in the audit log we ship today, independent of orinix.
+Under the platform approach it becomes fatal, because DELETE events would be
+useless to XMI.
+
+Two options:
+  (a) caller-side: Delete(&models.DataImportJob{UUID: UUID{ID: id}}) — one line
+      per delete site. Deletes are few. Reliable.
+  (b) platform-side: recover the id from the scope's where conditions in
+      AfterDelete. In gorm v1 this means poking at scope.Search.whereConditions,
+      which is fragile.
+Recommend (a) plus a loud platform-side warning log when ObjectID is empty, so
+the next occurrence is caught rather than shipped.
+
+--- CHANGE 3 — declare the aggregate root (the "root node" approach) -------
+Add an optional interface in hank/db. Opt-in: models that do not implement it
+behave exactly as today, so the blast radius across the other services is zero.
+
+    // EventScoped is implemented by models that participate in change events.
+    // It answers: "which business resource does this row belong to?"
+    type EventScoped interface {
+        EventRoot() (objectType string, objectID string)
+    }
+
+In forebitt:
+
+    func (j DataImportJob) EventRoot() (string, string) {
+        return "DATA_CONNECTION", j.ID
+    }
+
+    func (p OrganizationJobParameter) EventRoot() (string, string) {
+        return "DATA_CONNECTION", p.ImportJobID     // child points at its root
+    }
+
+Now the 5 row writes all report the same root, and roll-up is mechanical.
+Note this also gives us the BUSINESS name ("DATA_CONNECTION") instead of the
+table/model name ("DataImportJob"), so our schema stays private — which was one
+of the seven requirements I was worried we would lose by going platform-level.
+We do not lose it.
+
+--- CHANGE 4 — declare event-visible state via struct tags ------------------
+This is the one place I want to push back on the meeting outcome, and I think
+it is a small ask.
+
+"No from/to" is right. "No state at all" is a different and more expensive
+decision, and I do not think it was the one being made.
+
+    Level 0  "X was updated"                          <- action only
+    Level 1  "X is now at stage CONFIGURATION_COMPLETE" <- CURRENT state, no before
+    Level 2  "X went from MAPPING_REQUIRED to CONFIG..." <- from/to
+
+The expensive thing was Level 2: it needs a before-image, which means an extra
+SELECT before every UPDATE across every service, plus a security review of field
+values. Dropping it is correct.
+
+Level 1 costs NOTHING extra. The value is already in the struct being written.
+And the difference between Level 0 and Level 1 is large:
+  - Level 0: XMI must call back on EVERY update, including renames and the ~15
+    other fields on DataImportJob they do not care about. They cannot filter.
+  - Level 1: XMI acts directly on stage/state changes, and calls back only when
+    they want the full resource.
+  - Hank's record carries Action (CREATE/UPDATE/DELETE), NOT Status or Stage.
+    So at Level 0 we can say "the run was updated" but never "the run
+    COMPLETED" — which is literally the event XMI is blocked on.
+
+Mechanism — struct tags, so it stays platform-level and nobody has to remember
+anything per-function:
+
+    type DataImportJob struct {
+        UUID
+        hdb.Audit
+        ...
+        Status string `gorm:"type:varchar(20);not null"          event:"state"`
+        Stage  string `gorm:"...;default:'STAGE_UNKNOWN'"        event:"state"`
+        Name   string `gorm:"type:varchar(255);not null"         event:"state"`
+        // everything else: no tag, never leaves the building
+    }
+
+The hook reflects over fields tagged event:"state" and puts them in the record.
+Three properties worth noting:
+  - Security by construction. primage's Credential.Value simply never gets the
+    tag, so the "we might leak a secret" objection to platform-level emission
+    disappears. The tag list IS the allow-list.
+  - Additive. A new field with the tag flows automatically. A new field without
+    it is invisible. Nothing to forget.
+  - It is opt-in per FIELD, which is a much smaller surface than a security
+    review of 91 tables.
+
+BONUS, verified in gorm v1.9.11: on updates, gorm stores the update map at
+scope.InstanceGet("gorm:update_attrs") (callback_update.go:27). So we can emit
+    changedFields: ["stage"]                  <- NAMES ONLY, no values
+with ZERO extra queries and zero before-image. That gives XMI filtering without
+any of the from/to cost. Worth confirming it is populated on the Updates() paths
+we use, but the mechanism is there.
+
+CAVEAT to verify: forebitt's UpdateJobV2 uses Updates(*job), and gorm v1 drops
+zero-valued fields. So on an update, scope.Value may carry Stage="" even though
+the row's stage is unchanged. RULE: only emit a tagged field if it is present in
+gorm:update_attrs (i.e. it was actually written). Otherwise omit it. Do not emit
+empty strings — that is how you ship "stage is now ''" to a partner.
+
+--- CHANGE 5 — do NOT publish from the hook. Write an outbox row. ----------
+This is the most important implementation constraint and it is not obvious.
+
+VERIFIED in gorm v1.9.11 (callback_create.go:10-18) — the create callback chain:
+
+    gorm:begin_transaction
+    gorm:before_create
+    gorm:create
+    ...
+    gorm:after_create                    <-- our AfterCreate runs HERE
+    gorm:commit_or_rollback_transaction  <-- commit happens AFTER
+
+and afterCreateCallback (callback_create.go:166) calls the method through
+scope.CallMethod, so a returned error lands on the scope; CommitOrRollback
+(scope.go:414-426) then ROLLS BACK if scope.HasError().
+
+Consequences if we publish to SNS from inside AfterCreate:
+  - SNS network latency sits INSIDE a database transaction, holding row locks.
+  - An SNS failure returns an error -> THE USER'S WRITE IS ROLLED BACK.
+    We would have made the notification system able to break the product.
+  - If the transaction rolls back later for its own reasons, we have already
+    published -> PHANTOM EVENT for something that never happened. Today that is
+    impossible (the existing publish is after COMMIT) and we should not lose it.
+
+So the hook must do a cheap, local, transactional thing: INSERT A ROW INTO AN
+OUTBOX TABLE ON THE SAME tx. A separate relay publishes after commit.
+
+    handler -> tx: INSERT job
+                   INSERT param x3
+               hook: INSERT outbox row per write (same tx, same root)
+               COMMIT                       <-- atomic: rows + intent to publish
+    relay   -> read outbox, GROUP BY (root_type, root_id, tx_id)
+            -> publish ONE event per root per transaction
+            -> mark sent
+
+What this buys, and it is a lot:
+  - ATOMIC. No phantom events, no lost events. This is a real at-least-once
+    guarantee, which answers decision D4 properly instead of "best effort and
+    we would not know how many we lost".
+  - COMPLETENESS BECOMES DETERMINISTIC. This is the big one. My whole objection
+    to hooks was "you cannot know when all 5 records have arrived, so you need a
+    timer". With an outbox, all 5 rows COMMIT TOGETHER. The transaction boundary
+    IS the completeness signal. No timer, no guessing, no wrong events.
+  - SNS stays out of the transaction. Writes do not get slower and cannot be
+    broken by the messaging layer.
+  - It is the same shape as the transactional outbox pattern, so it is a known
+    quantity in review.
+
+Note that this is where their platform approach and my rejected "Option 5"
+(collect during the request, flush once at the end) actually converge. They were
+right that it belongs at the platform layer; the outbox is the platform-level
+version of the same idea, and it is strictly better because it is atomic.
+
+WHAT THE EVENT LOOKS LIKE
+-------------------------
+    {
+      "eventId":        "b4f1...",              // idempotency key for XMI + orinix
+      "eventTime":      "2026-07-31T09:14:02Z",
+      "schemaVersion":  "1.0",
+      "objectType":     "DATA_CONNECTION",       // business name, not table name
+      "objectId":       "d56ada74-...",          // XMI reads back with this
+      "action":         "UPDATED",
+      "state":          { "stage": "CONFIGURATION_COMPLETE",
+                          "status": "ACTIVE" },  // Level 1, current only
+      "changedFields":  ["stage"],               // names only, no values
+      "actor":          { "id": "...", "email": "aditya@...", "type": "USER" },
+      "organizationId": "...",
+      "requestId":      "..."
+    }
+
+No from/to anywhere. XMI can act on state directly, filter on changedFields, and
+call back with objectId when they want the whole resource.
+
+EXTENDING AuditLog VS A SIBLING STRUCT
+--------------------------------------
+Anil's instruction was to extend AuditLog or add a new one. I would ADD FIELDS
+TO AuditLog rather than fork, because the fork immediately drifts. Additive
+only, all optional, so the log line for the other four services is unchanged
+unless they opt in:
+
+    type AuditLog struct {
+        // existing - unchanged
+        ObjectID, ObjectName, ObjectType, Action string
+        ActionByID, ActionByEmail                string
+        ActionAt                                 time.Time
+        Method, OrgID, RequestID                 interface{}
+        ImpersonatedByID, ImpersonatedByEmail    string
+
+        // NEW - all optional
+        RootObjectType string            `json:",omitempty"` // aggregate root
+        RootObjectID   string            `json:",omitempty"`
+        State          map[string]string `json:",omitempty"` // event:"state" fields
+        ChangedFields  []string          `json:",omitempty"` // names only
+        TxID           string            `json:",omitempty"` // roll-up key
+        EventID        string            `json:",omitempty"` // idempotency
+        SchemaVersion  string            `json:",omitempty"`
+    }
+
+One caution on C5 (hank is shared by unhygienix, forebitt, primage, picanmix,
+pegleg): every one of them picks this up on the next version bump. Keep it
+additive, keep it opt-in via EventRoot()/tags, and make the outbox write
+conditional on the service having configured an outbox table. A service that
+does nothing should see zero behaviour change. Also confirm V6 first — whether
+anything (Datadog monitors, the audit log delivered to pegleg) parses the
+"Audit Log:" stdout lines today, because we are changing that JSON shape.
+
+WHAT STILL DOES NOT WORK, AND MUST BE SAID
+-------------------------------------------
+1. Door B still double-saves (job_service.go:1418 then :1425), so a single V1
+   create is TWO transactions -> two events (CREATED then UPDATED). With thin
+   events this is a harmless duplicate notification, not a wrong event. Optional
+   dedupe in orinix on (root, short window). Worth confirming V1 first: if the
+   V1 doors are dead we can ignore this entirely.
+2. Roll-up key. TxID is deterministic but does not span Door B's two
+   transactions. RequestID would, but V3 (is requestId reliably populated?) is
+   still open, and it comes from hlog.LogEntryCtx(ctx).Data["requestId"], so it
+   depends on logging middleware being in the path.
+3. Cross-service resources. A Dataset depends on a DataImportJob (forebitt)
+   which depends on a Credential (primage) — three services, three databases.
+   The aggregate root approach works WITHIN a service. It cannot compose a
+   resource that spans services. Not an M1 problem; will be one later.
+4. Read-access auditing (Jon's ask) still has no emit point, because reads do
+   not write rows. No model-layer or database-level mechanism can ever capture
+   them. That one genuinely needs service-layer code, and it is worth saying so
+   now rather than discovering it in M3.
+
+ORDER OF WORK
+-------------
+Phase 0 — verify, before writing anything:
+  V2  do flow-run state changes reach the hooks with parsed claims?  (BLOCKER)
+  V1  are the V1 doors live?  (decides whether Door B's double event matters)
+  V6  does anything parse the "Audit Log:" stdout lines today?  (blast radius)
+  V3  is requestId reliably populated?  (decides the roll-up key)
+
+Phase 1 — Hank, additive and opt-in:
+  - claims-gate fallback to system actor            (Change 1)
+  - EventScoped interface + root resolution         (Change 3)
+  - event:"state" tag reflection + changedFields    (Change 4)
+  - AuditLog field additions
+  - outbox writer, conditional on configuration     (Change 5)
+  - empty-ObjectID guard + loud warning             (Change 2)
+
+Phase 2 — forebitt:
+  - EventRoot() on DataImportJob and OrganizationJobParameter
+  - event:"state" tags on Status, Stage, Name
+  - fix the delete call site to carry the id
+  - outbox table migration + relay wiring
+
+Phase 3 — orinix: unchanged from the existing plan. SQS listener, insert into
+object_events with ON CONFLICT DO NOTHING. Josh is fine with orinix once the
+Hank piece is resolved, so this is not blocked on further design.
+
+WHAT I WANT TO PUT BACK TO ANIL AND JOSH
+-----------------------------------------
+1. Agreed on platform-level via Hank. The forgetting argument is right and my
+   function-level design loses on it. I will not re-litigate it.
+2. Agreed on dropping from/to. That was the expensive part and M1 does not need
+   it.
+3. One ask: let "no from/to" mean Level 1, not Level 0. Current state via struct
+   tags costs no extra query and no security review, and without it the hook can
+   only say "the flow run was updated", never "the flow run COMPLETED" — which
+   is the event we are building this for. Tags also give us the field allow-list
+   for free.
+4. One correction to my own earlier position: with thin events plus an outbox,
+   the "assembler produces a WRONG event" failure I argued against does not
+   exist. The transaction boundary gives us completeness deterministically.
+5. Two blockers to fund before anything else: the claims gate (or background
+   events silently do not exist) and the empty ObjectID on delete.
+6. One question back to Josh on the Fowler article: if orinix replays events —
+   catch-up, DLQ redrive, backfill — and XMI triggers Flow 2 on "Flow 1
+   completed", what stops a replay from re-triggering flows? That is Fowler's
+   External Update hazard and I would like it written down before M1 ships.

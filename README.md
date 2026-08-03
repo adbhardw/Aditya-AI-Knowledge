@@ -35,6 +35,13 @@ Diagrams are Mermaid, inline in the Markdown, so they render directly on GitHub.
 
 Reverse chronological — newest first.
 
+### 2026-08-03
+
+| Folder | Summary |
+|---|---|
+| [2026-08-03-aditya-hank-platform-event-design](2026-08-03/2026-08-03-aditya-hank-platform-event-design/) — [SUMMARY](2026-08-03/2026-08-03-aditya-hank-platform-event-design/SUMMARY.md) | **Supersedes the service-layer recommendation.** Anil and Josh decided orinix change events are produced from **Hank's model-layer GORM hooks** (platform-level), not per-handler emit blocks — because the unit of forgetting moves from "every new write path" to "every new resource type". CDC and DB triggers stashed; **from/to dropped** (XMI reads back by resource id). Answers the correlation-key question from source: **`RequestID` already exists and is the only `AuditLog` field stable across the insert/delete/insert of one create** — and beats a transaction id, since the V1 route runs two transactions per request; but `RootObjectType`/`RootObjectID` must be **added**, as identity cannot be derived from per-row fields. Verified blockers: the `if !parsed { return nil }` claims gate silently drops **background-worker events** (i.e. flow-run completion, XMI's main use case), and `gorm:after_create` runs **inside** the transaction with a hook error triggering ROLLBACK — so emit to a transactional **outbox**, never SNS. Explains Fowler's Event Sourcing article, why this is **Event Notification** not event sourcing, and the **replay-re-triggers-flows** hazard. |
+| [2026-07-31-aditya-c4-architecture-orinix](2026-08-03/2026-07-31-aditya-c4-architecture-orinix/) — [SUMMARY](2026-08-03/2026-07-31-aditya-c4-architecture-orinix/SUMMARY.md) | Review-ready **C4 architecture package** for the orinix change-event platform: 21 validated Mermaid diagrams across L1 context, L2 containers, L3 components (Orinix internals *and* the producer), six runtime flows, and deployment/trust boundaries — plus a **Structurizr DSL** `workspace.dsl` (validated with the Structurizr CLI) for the L2 view. Every element is status-tagged 🟩 built / 🟦 agreed / 🟧 proposed / 🟥 open, so the one undecided arrow is visible at a glance. Note: its **producer-side recommendation predates the 2026-07-30 decision** above; the traced runtime flows, constraints C1–C6 and risk register remain valid. |
+
 ### 2026-08-02
 
 | Folder | Summary |
