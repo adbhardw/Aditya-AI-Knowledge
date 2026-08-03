@@ -1,0 +1,465 @@
+2026-08-03 — RequestID as the event correlation key: full source trace
+=======================================================================
+Companion to 2026-07-31_hank_platform_event_design_after_anil_josh.txt
+
+THE QUESTION
+------------
+For platform-level change events produced from Hank, one business action must
+produce ONE event. A "create data connection" is 5 row writes (10 on the V1
+route), so each row-level audit record needs a key that says "these belong to
+the same user action".
+
+Two parts:
+  (a) Can an EXISTING field on AuditLog serve as that key, or must we add one?
+  (b) forebitt's V1 route calls CreateImportJobV2 twice, at
+      job_service.go:1418 and :1425 — where does requestId come from on each,
+      and why are they the same?
+
+Everything below was read in source on 2026-08-03. Versions:
+  hank    v1.23.1-0.20250813161745-c53aa6f6741a
+  gorm    github.com/jinzhu/gorm v1.9.11 (hank) / v1.9.16 (forebitt)
+
+
+PART A — WHICH EXISTING FIELD CAN BE THE KEY
+=============================================
+    type AuditLog struct {
+        ObjectID            string
+        ObjectName          string
+        ObjectType          string
+        Action              string
+        ActionByID          string
+        ActionByEmail       string
+        ActionAt            time.Time
+        Method              interface{}
+        OrgID               interface{}
+        RequestID           interface{}
+        ImpersonatedByID    string
+        ImpersonatedByEmail string
+    }
+
+Test each field against two requirements:
+  R1  identical across all 5 row writes of ONE createJob
+  R2  distinct from any OTHER createJob (so events do not merge)
+
+  Field                    R1 same?   R2 unique?   Verdict
+  -----------------------  ---------  -----------  ----------------------------
+  ObjectID                 NO         -            differs per row
+  ObjectName               NO         -            "Adidas EMEA CRM" vs
+                                                   "DataLocation" etc
+  ObjectType               NO         -            DataImportJob vs
+                                                   OrganizationJobParameter
+  Action                   NO         -            CREATE / DELETE / CREATE
+  ActionByID               YES        NO           same for every action that
+  ActionByEmail            YES        NO           user ever performs
+  ActionAt                 ~          NO           time.Now().UTC().Truncate(
+                                                   time.Second) - audit.go:67.
+                                                   Two actions in the same
+                                                   second collide, and a slow
+                                                   transaction can straddle a
+                                                   second boundary so the 5
+                                                   records disagree.
+  Method                   YES        NO           identifies the operation
+                                                   TYPE, not the instance
+  OrgID                    YES        NO           same for the whole org
+  ImpersonatedBy*          YES        NO           usually empty
+  RequestID                YES        YES          <-- THE ONLY ONE THAT WORKS
+
+CONCLUSION (a): RequestID. It already exists. No new correlation field needed.
+
+BUT IT IS ONLY HALF THE KEY
+----------------------------
+RequestID says WHICH ROWS BELONG TOGETHER. It does not say WHICH BUSINESS
+RESOURCE CHANGED. One request can touch several resources (and a bulk endpoint
+certainly will). ObjectID/ObjectType are per-row, so resource identity cannot be
+recovered from what AuditLog has today.
+
+    roll-up key = (RootObjectType, RootObjectID, RequestID)
+                   \______ MUST ADD ______/   \__ REUSE __/
+
+So: correlation = free, identity = must add. That is the whole answer to
+"can I reuse an attribute or do I need a new one" — one of each.
+
+WHY RequestID BEATS A TRANSACTION ID
+-------------------------------------
+My earlier draft suggested grouping by transaction. That is WORSE here, and
+Part B is the reason: the V1 route performs TWO transactions inside ONE request.
+Grouping by transaction gives 2 events for 1 user action. Grouping by RequestID
+gives 1. Request scope is the correct business boundary.
+
+
+PART B — WHERE requestId COMES FROM, AND WHY :1418 AND :1425 MATCH
+===================================================================
+
+B1. THE CODE IN QUESTION
+-------------------------
+forebitt/api/server/job_service.go:1396 CreateDataConnection
+
+    func (s *Server) CreateDataConnection(
+        ctx context.Context,                                     // <-- ONE ctx
+        in *proto.CreateUpdateDataConnection_Request,
+    ) (*proto.CreateImportJobV2_Response, error) {
+        orgJobParams, err := buildOrganizationJobParameters(ctx, in, s, ...)
+        ...
+        importJobV2 := proto.CreateImportJobV2_Request{ ..., IsDraft: true }
+
+        dataConnection, err := s.CreateImportJobV2(ctx, &importJobV2)   // :1418
+        ...
+        importJobV2.IsDraft = false
+        in.Job.Id = dataConnection.Job.Id
+        dataConnection, err = s.CreateImportJobV2(ctx, &importJobV2)    // :1425
+        ...
+    }
+
+The answer is visible right there, and it is almost boring: BOTH CALLS PASS THE
+SAME ctx VARIABLE. There is no context.WithValue, no WithCancel, no new
+context between :1418 and :1425. The ctx at :1425 is the identical object that
+was passed in at :1396.
+
+And CreateImportJobV2 (job_service.go:1293) does not rederive it either - it
+takes ctx and threads it straight down to SetOrganizationJobParameters(ctx, ...)
+and ultimately to hdb.BeginTxDB(ctx, ...).
+
+So whatever requestId was resolved for the HTTP request is the same for both
+passes. Two transactions, one requestId.
+
+B2. WHERE THE VALUE IS ACTUALLY SET
+------------------------------------
+forebitt serves gRPC and REST on ONE port:
+
+  forebitt/api/server/server.go:423
+      return hserver.ListenAndServe(s.Options.Server, addr, g, mux)
+
+  hank/server/service.go:185
+      return http.ListenAndServe(addr, grpcHandlerFunc(
+          hhmid.DefaultGrpcHandlerChain(grpcServer),
+          hhmid.DefaultHttpHandlerChain(httpServer)))
+
+  hank/http/middleware/chain.go:10-22
+      func DefaultHttpHandlerChain(next http.Handler) http.Handler {
+          return WithTracing(WithContextLogger(WithResponseLogging(
+              metrics.PrometheusMiddleware(next))))
+      }
+      func DefaultGrpcHandlerChain(next http.Handler) http.Handler {
+          return WithTracing(WithContextLogger(
+              metrics.PrometheusMiddleware(next)))
+      }
+
+NOTE: BOTH chains begin with WithTracing then WithContextLogger. So it does not
+matter whether the call arrives as native gRPC or through grpc-gateway REST -
+requestId is established either way, before any handler runs.
+
+Step 1 - hank/http/middleware/tracing.go:25-31, WithTracing
+
+    if reqId = r.Header.Get(HTTPHeaderNameRequestID); reqId == "" {
+        reqId = uuid.New().String()          // generated if the caller sent none
+    }
+    ctx = contexts.SetReqIdCtx(ctx, reqId)   // context.WithValue(ContextKeyReqID)
+
+Step 2 - hank/http/middleware/logging.go:93-105, WithContextLogger
+
+    reqId := GetReqIdReq(r)                  // -> contexts.GetReqIdCtx(r.Context())
+    l, ok := hlog.FromContext(ctx)
+    if !ok || l == nil { ctx = hlog.ToContext(ctx) }
+    hlog.AddFieldsContext(ctx, logrus.Fields{"requestId": reqId})
+
+Step 3 - the handler runs with that ctx. CreateDataConnection receives it.
+
+Step 4 - hank/db/audit.go:58-71, on every row write
+
+    requestInfo := hlog.LogEntryCtx(ctx).Data
+    auditLog := AuditLog{ ..., RequestID: requestInfo["requestId"] }
+
+B3. THE TWO CARRIERS, AND WHY BOTH ARE STABLE
+----------------------------------------------
+There are actually TWO independent copies of the same value in the context, and
+it is worth knowing which one you are reading.
+
+  CARRIER 1 - the context value (canonical)
+      contexts.SetReqIdCtx -> context.WithValue(ctx, ContextKeyReqID, reqId)
+      contexts.go:36-38
+      Immutable and inherited by every derived context. Read with
+      contexts.GetReqIdCtx(ctx). This is what hank/aws/sns/service.go:37 uses.
+
+  CARRIER 2 - the logrus field map (what AuditLog reads)
+      hlog.AddFieldsContext(ctx, {"requestId": reqId})
+      logging.go:63-71
+
+      This one is interesting. ToContext stores a POINTER:
+
+          func ToContext(ctx context.Context) context.Context {
+              fields := log.Fields{}
+              l := &ctxLogger{ logger: ..., fields: fields }    // <-- pointer
+              return context.WithValue(ctx, ctxLoggerKey, l)
+          }
+
+      and AddFieldsContext MUTATES that shared map in place:
+
+          l, ok := FromContext(ctx)
+          for k, v := range fields { l.fields[k] = v }
+
+      so every context descending from the one created by WithContextLogger
+      shares ONE fields map. fromContextEntry (logging.go:102-115) copies that
+      map into the logrus Entry, which is what .Data exposes.
+
+Both carriers therefore yield the identical value at :1418 and at :1425,
+because both calls sit under the same request context.
+
+B4. THE PICTURE
+----------------
+  HTTP request  (X-Request-Id: abc-123, or none -> uuid generated)
+        |
+        v
+  WithTracing            ctx = WithValue(ContextKeyReqID, "abc-123")   [carrier 1]
+        |
+        v
+  WithContextLogger      ctxLogger.fields["requestId"] = "abc-123"     [carrier 2]
+        |
+        v
+  CreateDataConnection(ctx, in)                job_service.go:1396
+        |
+        +--> CreateImportJobV2(ctx, ...)       :1418   IsDraft=true
+        |         BeginTxDB(ctx) -> TX #1
+        |           INSERT data_import_jobs         -> AuditLog.RequestID=abc-123
+        |           DELETE org_job_parameters (0)   -> AuditLog.RequestID=abc-123
+        |           INSERT org_job_parameters x3    -> AuditLog.RequestID=abc-123
+        |         COMMIT
+        |
+        +--> CreateImportJobV2(ctx, ...)       :1425   IsDraft=false
+                  BeginTxDB(ctx) -> TX #2
+                    UPDATE data_import_jobs        -> AuditLog.RequestID=abc-123
+                    DELETE org_job_parameters (3)  -> AuditLog.RequestID=abc-123
+                    INSERT org_job_parameters x3   -> AuditLog.RequestID=abc-123
+                  COMMIT
+
+  10 audit records. 2 transactions. 1 requestId. 1 event.
+
+  Group by (RootObjectType, RootObjectID, RequestID)
+        = ("DATA_CONNECTION", "d56ada74-...", "abc-123")
+        -> exactly one DATA_CONNECTION CREATED event.
+
+
+PART C - WHO ACTUALLY CALLS AuditLog? NOBODY. IT IS REFLECTION.
+================================================================
+Fair challenge: there is no call to the audit code anywhere in forebitt. No db
+method invokes it, no handler references it. So how does audit.go:70 ever run?
+
+Answer: Go STRUCT EMBEDDING + GORM's REFLECTION-BY-METHOD-NAME. It is entirely
+implicit. Here is the full chain, verified end to end.
+
+STEP 1 - the model embeds the struct
+    forebitt/models/data_import_job.go:15-19
+        type DataImportJob struct {
+            UUID
+            hdb.Audit          // <-- this line is the entire subscription
+            UserAudit
+            TimeAudit
+            ...
+        }
+
+STEP 2 - Go promotes the methods
+    hank/db/audit.go defines, on *Audit:
+        func (a *Audit) AfterCreate(scope *gorm.Scope) error   // :150
+        func (a *Audit) AfterUpdate(scope *gorm.Scope) error   // :183
+        func (a *Audit) AfterDelete(scope *gorm.Scope) error   // :199
+
+    Because Audit is embedded, Go's method promotion means *DataImportJob now
+    HAS a method named AfterCreate. Nobody wrote it on DataImportJob. It is
+    inherited by embedding. This is the "platform seam" - one line of embedding
+    subscribes the model to auditing.
+
+STEP 3 - forebitt writes the row like any other row
+    forebitt/db/job_v2.go:20
+        tx.Create(&job)          // &job is *DataImportJob
+
+STEP 4 - GORM's DEFAULT callback chain includes after_create
+    gorm v1.9.11 callback_create.go:10-18 (registered in package init())
+        DefaultCallback.Create().Register("gorm:begin_transaction", ...)
+        DefaultCallback.Create().Register("gorm:create", createCallback)
+        DefaultCallback.Create().Register("gorm:after_create", afterCreateCallback)
+        DefaultCallback.Create().Register("gorm:commit_or_rollback_transaction", ...)
+
+    This is stock GORM. No hank code, no forebitt code, no registration needed.
+
+STEP 5 - afterCreateCallback asks for a method BY NAME
+    gorm v1.9.11 callback_create.go:166-172
+        func afterCreateCallback(scope *Scope) {
+            if !scope.HasError() { scope.CallMethod("AfterCreate") }
+            if !scope.HasError() { scope.CallMethod("AfterSave") }
+        }
+
+STEP 6 - CallMethod resolves it by reflection
+    gorm v1.9.11 scope.go:432-459
+        func (scope *Scope) callMethod(methodName string, reflectValue reflect.Value) {
+            // Only get address from non-pointer
+            if reflectValue.CanAddr() && reflectValue.Kind() != reflect.Ptr {
+                reflectValue = reflectValue.Addr()          // :434-436
+            }
+            if methodValue := reflectValue.MethodByName(methodName);
+               methodValue.IsValid() {                      // :438  <-- BY NAME
+                switch method := methodValue.Interface().(type) {
+                ...
+                case func(*Scope) error:
+                    scope.Err(method(scope))                // :450-451 <-- ours
+                ...
+                }
+            }
+        }
+
+    Two details that matter:
+      - :434-436 takes the ADDRESS of the value, which is why the POINTER
+        receiver (a *Audit) is found at all.
+      - :450-451 matches our exact signature func(*Scope) error, and pushes any
+        returned error onto the scope. That error then reaches CommitOrRollback
+        (scope.go:414-426) and ROLLS THE TRANSACTION BACK. This is the verified
+        basis for "never publish to SNS from inside the hook".
+
+STEP 7 - the hook body runs, and builds the record
+    hank/db/audit.go:150-164 AfterCreate
+        requestInfo := hlog.LogEntryCtx(ctx).Data
+        auditLog := NewAuditLogFromAudit(scope, user, impersonator, requestInfo, ActionCreate)
+    -> hank/db/audit.go:58-71 NewAuditLogFromAudit
+        RequestID: requestInfo["requestId"],                // :70
+    -> logged as `Audit Log: {...}`
+
+SO THE ANSWER IS:
+    tx.Create(&job)
+        -> gorm's stock gorm:after_create callback
+        -> scope.CallMethod("AfterCreate")
+        -> reflect MethodByName on *DataImportJob
+        -> finds the method PROMOTED from the embedded hdb.Audit
+        -> audit.go:70 runs
+
+    The only thing forebitt "did" was write `hdb.Audit` inside the struct.
+
+THE ASYMMETRY WORTH KNOWING
+----------------------------
+hank/db/service.go applyEmbeddedHooks registers only TWO callbacks:
+
+        beforeCreateCallback.Register("gorm:audit_before_create", auditBeforeCreate)
+        beforeUpdateCallback.Register("gorm:audit_before_update", auditBeforeUpdate)
+
+    func auditBeforeCreate(scope *gorm.Scope) {
+        if !scope.HasError() { scope.CallMethod("BeforeCreateHook") }
+    }
+
+Why register those but not the After* ones? Because the names are NON-STANDARD.
+GORM looks for "BeforeCreate"; hank's method is called "BeforeCreateHook"
+(audit.go:125) - presumably to avoid colliding with models that define their
+own BeforeCreate. So hank must register a shim to call it by its custom name.
+
+The After* methods use GORM's STANDARD names, so gorm's built-in callbacks find
+them with no registration at all. That is why you see no wiring for them.
+
+WHY THIS MATTERS FOR THE DESIGN
+--------------------------------
+This is exactly the property Anil and Josh are pointing at, and it is worth
+stating precisely because it is the whole argument for the platform approach:
+
+    Every model that embeds hdb.Audit is ALREADY subscribed. There is no
+    per-function, per-handler or per-write-path registration to forget. A new
+    write path against an existing model is covered automatically. A new field
+    on an existing model is covered automatically.
+
+    The ONLY way to not be covered is to define a brand new model and forget to
+    embed hdb.Audit - which is one line, in one place, visible in review.
+
+It also tells us where our extensions belong. Changes 3 and 4 from the design
+doc (the EventScoped root interface, and the event:"state" struct tags) hang off
+this SAME reflection seam - scope.Value is the model, so the hook can reflect
+over its tags and type-assert it for an EventRoot() method. No new plumbing.
+
+
+THE TRAP - GetReqIdCtx MINTS A NEW UUID WHEN IT FINDS NOTHING
+==============================================================
+This corrects advice I gave earlier ("just read contexts.GetReqIdCtx(ctx)
+directly instead of going through the log fields"). As stated that is DANGEROUS.
+
+hank/contexts/contexts.go:22-34
+
+    func GetReqIdCtx(ctx context.Context) string {
+        reqID := ctx.Value(ContextKeyReqID)                 // 1. direct key
+        if ret, ok := reqID.(string); ok { return ret }
+        if md, ok := metadata.FromIncomingContext(ctx);     // 2. grpc metadata
+           ok && len(md.Get(GrpcHeaderNameRequestID)) > 0 {
+            return md.Get(GrpcHeaderNameRequestID)[0]
+        }
+        return uuid.New().String()                          // 3. !! GENERATE !!
+    }
+
+Branch 3 generates a fresh UUID and DOES NOT CACHE IT. Call it five times on a
+context with no request id and you get FIVE DIFFERENT IDS.
+
+Consequence for the event design: if a code path has no request id - a
+background worker, a cron job, a migration, an internal call that did not come
+through the middleware - and we call GetReqIdCtx once per row write, then the
+5 rows of one action each get a different key and we emit 5 SEPARATE EVENTS
+instead of 1. Silently. This is precisely the fan-out we are trying to prevent.
+
+RULE:
+  - Do NOT call GetReqIdCtx per row write.
+  - Read ctx.Value(contexts.ContextKeyReqID) and treat ABSENT as absent
+    (explicit, detectable) rather than letting branch 3 fabricate a value.
+  - For background work, resolve ONE id at the start of the unit of work and
+    put it on the context:
+        ctx = contexts.SetReqIdCtx(ctx, uuid.New().String())
+    Then every row write underneath shares it. This also repairs the audit log
+    for background operations generally, which is worth doing on its own merit.
+
+Same root cause, unrelated symptom: hank/aws/sns/service.go:37-48 calls
+GetReqIdCtx and uses the result as the FIFO MessageGroupId. Any publish outside
+a request context therefore gets a random group id per message - which is
+another reason the existing FIFO topic's ordering guarantee is weaker than it
+looks.
+
+
+WHAT ABOUT AuditLog.RequestID BEING nil?
+-----------------------------------------
+AuditLog.RequestID is interface{} and is populated from a map lookup
+(requestInfo["requestId"], audit.go:70). If WithContextLogger never ran, the key
+is simply absent and the field is nil. That is SAFER than the GetReqIdCtx
+behaviour above - nil is detectable, a fabricated UUID is not - but it still
+means no correlation key.
+
+So the honest position for the design review is:
+  - On any path that goes through the server middleware chain (all gRPC and all
+    REST traffic to forebitt), RequestID is present and stable. Verified above.
+  - On background paths it is absent, and that must be fixed explicitly at the
+    start of the unit of work rather than papered over.
+  - Emitting an event with no correlation key should be treated as a bug and
+    alerted on, not silently allowed to fan out.
+
+Note this is the SAME shape of problem as the claims gate
+(if !parsed { return nil }, audit.go:151-154): both fail for background work,
+both fail silently, and both need the same style of fix - an explicit, declared
+system context at the entry point of the worker.
+
+
+CHECKS WORTH RUNNING BEFORE COMMITTING TO THIS
+-----------------------------------------------
+  1. In Loki, pull `Audit Log:` lines for a single data connection create and
+     confirm all records carry the same non-null requestId. This validates the
+     whole trace above against production rather than against my reading.
+  2. Confirm on the V1 route specifically that all 10 records share one
+     requestId (the two-transaction case).
+  3. Check whether ANY audit lines in prod have a null/missing requestId, and
+     which code paths they come from. Those are the background paths that need
+     the explicit system context.
+  4. Confirm the gateway/ALB in front of forebitt either forwards a client
+     X-Request-Id or lets WithTracing generate one - and that it does not
+     generate a NEW one per retry in a way that would split a retried request.
+
+
+SUMMARY
+-------
+  - Reuse RequestID as the correlation key. It exists, it is stable across the
+    whole request, and it is the only AuditLog field that satisfies both
+    "same across the 5 writes" and "unique to this action".
+  - Add RootObjectType + RootObjectID for resource identity. These cannot be
+    derived from existing fields.
+  - job_service.go:1418 and :1425 share a requestId for the simple reason that
+    they are passed the same ctx, and requestId is established once per HTTP
+    request by WithTracing/WithContextLogger before any handler runs. Two
+    transactions, one request, one event - which is exactly why request scope
+    is the right roll-up boundary and transaction scope is not.
+  - Do not call GetReqIdCtx per row write; its no-value branch fabricates a new
+    UUID each time and would silently fan one action out into N events.

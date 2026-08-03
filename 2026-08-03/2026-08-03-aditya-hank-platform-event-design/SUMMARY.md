@@ -4,7 +4,9 @@
 **Author:** Aditya Bhardwaj
 **Decision meeting:** 2026-07-30 with Anil and Josh Wo (Principal Architects)
 **Tickets:** DV-13856 (platform), DV-15090 / DV-15091 (M1), DV-15496 (epic), DV-15621 (XMI polling)
-**Detail document:** [`2026-07-31_hank_platform_event_design_after_anil_josh.txt`](2026-07-31_hank_platform_event_design_after_anil_josh.txt)
+**Detail documents:**
+- [`2026-07-31_hank_platform_event_design_after_anil_josh.txt`](2026-07-31_hank_platform_event_design_after_anil_josh.txt) — the design
+- [`2026-08-03_requestid_correlation_key_trace.txt`](2026-08-03_requestid_correlation_key_trace.txt) — full source trace of the correlation key: which `AuditLog` field can serve as it, where `requestId` is set, why `job_service.go:1418` and `:1425` share one, **how the audit hook is invoked at all when nothing calls it**, and the `GetReqIdCtx` UUID-minting trap
 
 > **This supersedes the recommendation in
 > [`../2026-07-31-aditya-c4-architecture-orinix/`](../2026-07-31-aditya-c4-architecture-orinix/)
@@ -97,6 +99,42 @@ So the roll-up key is:
 → **Correlation: reuse existing `RequestID`. Identity: must add `RootObjectType` +
 `RootObjectID`** — these cannot be derived, because `ObjectID`/`ObjectType` are
 per-row.
+
+### How the audit hook runs when nothing calls it
+
+Nothing in forebitt invokes the audit code — no handler, no db method. It is
+**Go struct embedding + GORM reflection by method name**:
+
+1. `forebitt/models/data_import_job.go:17` embeds `hdb.Audit`. **That one line is the
+   entire subscription.**
+2. Go **method promotion** gives `*DataImportJob` the `AfterCreate` / `AfterUpdate` /
+   `AfterDelete` methods defined on `*hdb.Audit` (`hank/db/audit.go:150, 183, 199`).
+3. `forebitt/db/job_v2.go:20` calls `tx.Create(&job)` like any other write.
+4. GORM's **stock** callback chain (`callback_create.go:10-18`, registered in package
+   `init()`) includes `gorm:after_create` — no hank or forebitt registration involved.
+5. `afterCreateCallback` (`callback_create.go:166-169`) calls
+   `scope.CallMethod("AfterCreate")`.
+6. `scope.callMethod` (`scope.go:432-459`) takes the **address** of the value
+   (`:434-436`, which is why the pointer receiver resolves), looks the method up by
+   **name** via `reflectValue.MethodByName` (`:438`), matches the
+   `func(*Scope) error` case (`:450-451`) — and pushes any returned error onto the
+   scope, which `CommitOrRollback` (`scope.go:414-426`) turns into a **ROLLBACK**.
+7. The hook body then builds the record, including
+   `RequestID: requestInfo["requestId"]` (`audit.go:70`).
+
+**The asymmetry:** `applyEmbeddedHooks` (`hank/db/service.go`) explicitly registers
+only `BeforeCreateHook` / `BeforeUpdateHook`, because those names are *non-standard* —
+GORM looks for `BeforeCreate`. The `After*` methods use GORM's standard names, so the
+built-in callbacks find them with **no wiring at all**. That is why you see no
+registration for them anywhere.
+
+**Why this is the whole platform argument:** every model embedding `hdb.Audit` is
+*already* subscribed. A new write path against an existing model is covered
+automatically; a new field is covered automatically. The only way to miss coverage is
+to define a brand-new model and forget the embed — one line, in one place, visible in
+review. It is also where the proposed extensions belong: `scope.Value` **is** the
+model, so the hook can reflect over `event:"state"` tags and type-assert `EventRoot()`
+on the same seam, with no new plumbing.
 
 ### Verified mechanics of `RequestID`
 
