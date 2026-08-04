@@ -1,0 +1,150 @@
+================================================================================
+HABU API GATEWAY RATE LIMITING — HOW IT WORKS AND WHAT PROD ACTUALLY DOES
+Source: deklareddotcom/api-gateway  ·  Prod config read 2026-08-04
+================================================================================
+
+1. TWO INDEPENDENT LIMITERS RUN ON EVERY REQUEST
+------------------------------------------------
+  QuotaRateLimitFilter   order -2   runs FIRST    UI Type = ORGANIZATION
+      bucket:  orgId alone  ->  one budget across ALL endpoints and methods
+      redis:   rate-limit:QUOTA:ORGANIZATION:ORG_<org>
+
+  PathRateLimitFilter    order -1   runs SECOND   UI Type = REGEX or API
+      bucket:  <raw path>:<method>:<orgId>
+      redis:   rate-limit:PATH:<TYPE>:<KEY>:<METHOD>:ORG_<org>
+
+  They are NOT alternatives. Both must pass. Either can return 429. An org
+  missing from one table is not exempt from that filter — it falls through to
+  that filter's "ALL" default.
+
+2. HOW A LIMIT IS CHOSEN (PathRateLimitFilter)
+-----------------------------------------------
+  Step 1  exact API-type match on the RAW path + method + orgId
+  Step 2  REGEX rows for THIS org, method must match, path must match the
+          regex; if several match, LONGEST REGEX STRING WINS
+  Step 3  REGEX rows with organization = ALL, same longest-wins rule
+  Step 4  nothing matched -> hardcoded buildLimiter(50, 50) = 50 req/sec
+
+  QuotaRateLimitFilter: org-specific row, else ALL row, else pass through
+  with NO quota at all.
+
+3. READING THE NUMBERS (Spring Cloud Gateway token bucket, per SECOND)
+-----------------------------------------------------------------------
+      sustained req/sec = replenishRate / requestedTokens
+      burst  requests   = burstCapacity / requestedTokens
+      full refill secs  = burstCapacity / replenishRate
+
+  requestedTokens is the lever for sub-3600/hour limits, because replenishRate
+  is an integer >= 1/sec (i.e. >= 3600/hour) on its own.
+      burstCapacity 86400 = a DAY of tokens at 1/sec
+      burstCapacity  3600 = an HOUR of tokens at 1/sec
+
+4. WHAT PROD IS CONFIGURED TO DO
+---------------------------------
+  Rule                                    r/b/t      Effective
+  --------------------------------------------------------------------------
+  ORGANIZATION  per-org (3 orgs)          1/86400/3  1,200/hr   28,800/day
+  ORGANIZATION  ALL                       1/86400/17   212/hr    5,082/day
+  REGEX  create-run POST        ALL       1/3600/180    20/hr      480/day
+  REGEX  flow-runs  POST        ALL       1/3600/180    20/hr      480/day
+  REGEX  ^/v1.*  GET/POST/PUT   ALL       100/100/1    100/sec
+  REGEX  create-run / flow-runs per-org   1000/1000/1 1000/sec
+  REGEX  ^/v1.* POST  a3b98c27            1/5/2        0.5/sec  burst 2
+
+  Orgs with an ORGANIZATION (quota) row:  3
+  Orgs with a  REGEX (path) row:         16
+  Orgs in BOTH:                           0     <-- the finding
+
+5. THE FINDING: EVERY UPLIFT IS CANCELLED BY THE OTHER FILTER'S DEFAULT
+------------------------------------------------------------------------
+  Because the two sets are disjoint, no org has both a raised quota and a
+  raised path limit. Each gets throttled by whichever one it lacks.
+
+  A) The 3 orgs with a daily quota (ee0b773e, 19bf3c09, 2ae652e8)
+     have NO per-org REGEX row, so create-run falls to the ALL regex:
+         quota says   28,800/day
+         path  says      480/day   (20/hr)   <-- BINDS
+     The quota uplift is unreachable. It is 60x looser than the real ceiling.
+
+  B) The 16 orgs with a 1000/sec path allowlist have NO ORGANIZATION row,
+     so they fall to the ALL quota:
+         path  says 86,400,000/day
+         quota says      5,082/day            <-- BINDS
+     The 1000/sec allowlist is almost entirely cosmetic.
+
+  Net effective ceiling on POST /v1/cleanroom-questions/{id}/create-run:
+      org with quota row only   ->    480/day   (path ALL binds)
+      org with regex row only   ->  5,082/day   (quota ALL binds)
+      org with neither          ->    480/day
+      org with both             -> 28,800/day   (nobody is configured this way)
+
+  If the intent of an ORGANIZATION row is "give this customer headroom", it
+  does not currently achieve that. It needs a matching per-org REGEX row.
+
+6. SECOND FINDING: ONE REGEX LOOKS BROKEN
+------------------------------------------
+  Row:  \\/v1\\/cleanroom-questions\\/[^\\/]+\\/create-run
+        POST  REGEX  d58c99f0-978a-4b86-b213-7fc661c3c494  1000/1000/1
+
+  DOUBLE backslashes, where all 30 other rows use single. As a Java regex,
+  \\  matches a LITERAL backslash, so this pattern requires a path containing
+  \/v1\/... which no URL does. It can never match.
+
+  Consequence: d58c99f0 silently gets the ALL rule, 20/hour, not 1000/sec.
+  VERIFY against Redis before acting — this could be a copy/paste artifact
+  rather than stored data.
+
+7. THINGS THAT SURPRISE PEOPLE
+-------------------------------
+  a) PATH BUCKETS ARE PER RAW URL, not per route pattern.
+     One rule ^/v1/cleanrooms.* at 5/sec gives EACH distinct URL its own
+     5/sec. A client rotating 200 resource IDs gets 1000/sec. Only the org
+     QUOTA constrains such a client — this is why quota is the real control.
+
+  b) LONGEST REGEX STRING WINS, not most specific match. For org a3b98c27,
+     POST create-run resolves to the 44-char create-run rule (1000/sec), not
+     the 6-char ^/v1.* rule (0.5/sec) — deliberate and correct here, but it is
+     string length doing the work, not specificity.
+
+  c) API-type rows are looked up on the RAW path, so /v1/cleanrooms will not
+     match /v1/cleanrooms/{id}. Use REGEX for anything with an id in it.
+
+  d) DELETE and PATCH on /v1 match no ALL row, so they fall to the hardcoded
+     50/sec in code, not to anything in this table.
+
+  e) The config key is UPPERCASED before storage; matching compensates with
+     (?i). Safe for [^\/]+ and .*, but it INVERTS shorthand classes:
+     \d -> \D, \w -> \W, \s -> \S. Never use \d in a rule.
+
+  f) An org with no ORGANIZATION row and no ALL quota row would have NO
+     org-wide ceiling. An ALL row exists today, so this is covered — do not
+     delete it.
+
+8. WHAT TO DO
+--------------
+  1. Decide whether ORGANIZATION rows are meant to grant headroom. If yes,
+     each needs a matching per-org REGEX row, or the path ALL default must be
+     raised. Today they grant nothing.
+  2. Verify the d58c99f0 double-backslash row against Redis.
+  3. Treat the ALL quota (5,082/day) as the platform's real ceiling — it is
+     what actually binds for 16 of the 19 configured orgs.
+  4. Do not delete the ALL ORGANIZATION row; it is the only org-wide backstop.
+
+9. OBSERVABILITY (api-gateway PR #95)
+--------------------------------------
+  Before: rejections could not be attributed to a tenant, and the path
+  counter was tagged with the raw URI path (unbounded cardinality).
+  After:  both filters log key=value with organizationID, and the counter is
+  tagged with the bounded matched route.
+
+      # top organizations being throttled, either filter
+      topk(10, sum by (organizationID) (count_over_time(
+        {service_name="api-gateway"} |= "Rate limit exceeded"
+          | json | line_format "{{.message}}"
+          | pattern `<_>organizationID=<organizationID>,<_>` [$__range])))
+
+      # split by which limiter fired
+      sum by (route, method, source) (rate(rate_limit_exceeded_total[5m]))
+
+  Note the log says outcome=REJECTED, not status=429: the line is emitted
+  before the response status is set, so it states the decision, not the code.
