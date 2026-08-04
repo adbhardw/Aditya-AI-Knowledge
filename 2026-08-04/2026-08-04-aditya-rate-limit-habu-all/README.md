@@ -10,6 +10,12 @@ production configuration read from the Internal Admin screen.
   with the behaviours that surprise people.
 - **[aditya-rate-limit-habu-all.txt](aditya-rate-limit-habu-all.txt)** — the same content
   as a one-page plain-text reference, for pasting into a runbook or ticket.
+- **[aditya-rate-limit-numbers-and-bucket-semantics.txt](aditya-rate-limit-numbers-and-bucket-semantics.txt)** —
+  companion reference for the numbers themselves: the token-bucket formula and the
+  `86400 / requestedTokens` daily-allowance trick, the **config-lookup vs bucket-key**
+  distinction, whether an `ALL` row is a per-org cap or a shared pool (**per-org**),
+  whether a per-org row overrides or adds to it (**overrides, entirely**), the full prod
+  numbers decoded, and the two coverage gaps.
 
 ## The headline
 

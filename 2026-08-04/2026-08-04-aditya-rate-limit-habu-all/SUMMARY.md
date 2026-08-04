@@ -2,7 +2,9 @@
 
 **Date:** 2026-08-04
 **Session type:** Source trace + production configuration audit
-**Deliverable:** [`aditya-rate-limit-habu-all.txt`](aditya-rate-limit-habu-all.txt) — the one-page reference
+**Deliverables:**
+- [`aditya-rate-limit-habu-all.txt`](aditya-rate-limit-habu-all.txt) — the one-page reference
+- [`aditya-rate-limit-numbers-and-bucket-semantics.txt`](aditya-rate-limit-numbers-and-bucket-semantics.txt) — companion on the numbers and bucket semantics (see §10)
 **Related:** [2026-08-03 dashboard prompts + telemetry inventory](../../2026-08-03/2026-08-03-aditya-grafana-dashboard-prompts-and-telemetry-inventory/SUMMARY.md) · [api-gateway PR #95](https://github.com/deklareddotcom/api-gateway/pull/95)
 
 ---
@@ -160,7 +162,32 @@ The log says `outcome=REJECTED`, not `status=429` — the line is emitted before
 - Was the disjointness deliberate (two separate initiatives) or accidental?
 - Should the path `ALL` default for create-run (20/hr) be raised, or should quota-uplifted orgs get matching REGEX rows? These are different policies.
 
-## 9. Next steps
+## 10. Bucket semantics — the two questions everyone asks
+
+Full detail in [`aditya-rate-limit-numbers-and-bucket-semantics.txt`](aditya-rate-limit-numbers-and-bucket-semantics.txt). The short version:
+
+**Config lookup and bucket key are different things.** The `ALL` row supplies *which numbers apply*; `orgId` decides *which counter is drawn down*. The bucket key never contains `ALL` just because the `ALL` config was used.
+
+```
+config:  rate-limit:QUOTA:ORGANIZATION:ORG_<org>  →  else ORG_ALL
+bucket:  isAllowed("quota_organization", orgId)   →  request_rate_limiter.{<orgId>}.tokens
+```
+
+**Q: Is the `ALL` row a per-org cap or a shared pool?** → **Per-org.** Every org without its own row gets its *own* private 5,082/day bucket. 50 such orgs = 254,100/day of aggregate headroom. **There is no global platform-wide ceiling anywhere in this system** — that would need a limiter with a constant bucket key, which doesn't exist.
+
+**Q: Does a per-org row override the `ALL` row or add to it?** → **Overrides, entirely.** `createQuotaRateLimiter` returns on the first hit, so the `ALL` row is never read and only one bucket is checked. An org with its own row gets 28,800/day *instead of* 5,082/day — not the sum, not the tighter of the two.
+
+| Org's quota config | Daily quota | Row applied |
+|---|---|---|
+| own row (tokens 3) | 28,800/day | its own — `ALL` ignored |
+| no row | 5,082/day | `ALL` |
+| no row **and** no `ALL` row | **unlimited** | none — passes through |
+
+**Coverage gap:** the two filters disagree when the org can't be resolved. The path filter defaults `organizationId = "ALL"` and carries on; the quota filter **returns immediately with no quota at all**. So unattributable traffic (no JWT org claim, no `LR-Org-ID` header) is subject to per-URL path limits only — and those are defeated by ID rotation. That is precisely the abuse profile this work started from.
+
+---
+
+## 11. Next steps
 
 1. Decide the intent behind `ORGANIZATION` rows, then either add matching per-org `REGEX` rows or raise the path `ALL` default.
 2. Verify `d58c99f0` against `redis-cli --scan --pattern 'rate-limit:PATH:REGEX:*'`.

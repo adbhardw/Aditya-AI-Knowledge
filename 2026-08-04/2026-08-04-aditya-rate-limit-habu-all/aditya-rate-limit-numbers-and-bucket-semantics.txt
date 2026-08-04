@@ -1,0 +1,203 @@
+================================================================================
+RATE LIMIT NUMBERS AND BUCKET SEMANTICS
+Companion to aditya-rate-limit-habu-all.txt
+Source: deklareddotcom/api-gateway  ·  Prod config read 2026-08-04
+================================================================================
+
+This file answers the "what do the numbers actually mean" questions:
+  - how to convert replenish/burst/tokens into requests per hour or day
+  - whether an ALL row is a per-org cap or a shared pool
+  - whether a per-org row overrides or adds to the ALL row
+
+
+1. THE FORMULA
+---------------
+  Spring Cloud Gateway RedisRateLimiter is a token bucket, in SECONDS.
+
+      sustained req/sec = replenishRate / requestedTokens
+      burst requests    = floor(burstCapacity / requestedTokens)
+      seconds/request   = requestedTokens / replenishRate
+      full refill secs  = burstCapacity / replenishRate
+
+  requestedTokens is the ONLY way to express a limit slower than 3600/hour,
+  because replenishRate is an integer and its minimum is 1/sec.
+
+  THE DESIGN TRICK USED IN PROD
+      burstCapacity 86400 = seconds in a DAY   -> bucket refills in exactly 24h
+      burstCapacity  3600 = seconds in an HOUR -> bucket refills in exactly 1h
+
+  With replenishRate = 1, that collapses to a clean allowance:
+
+      requests per day  = 86400 / requestedTokens
+      requests per hour =  3600 / requestedTokens
+
+      tokens |  per day  | per hour
+      -------|-----------|----------
+         1   |  86,400   |  3,600
+         3   |  28,800   |  1,200      <- per-org QUOTA rows
+        17   |   5,082   |    212      <- ALL QUOTA row
+       180   |     480   |     20      <- ALL create-run / flow-runs PATH rows
+
+
+2. CONFIG LOOKUP vs BUCKET KEY — THE DISTINCTION THAT MATTERS
+--------------------------------------------------------------
+  These are two different things and conflating them causes every
+  misunderstanding about the ALL row.
+
+      CONFIG LOOKUP  decides WHICH NUMBERS apply   (org row, else ALL row)
+      BUCKET KEY     decides WHICH COUNTER is drawn down
+
+  QuotaRateLimitFilter
+      config:  rate-limit:QUOTA:ORGANIZATION:ORG_<org>, else ...:ORG_ALL
+      bucket:  isAllowed("quota_organization", orgId)
+               -> redis  request_rate_limiter.{<orgId>}.tokens
+
+  PathRateLimitFilter
+      config:  exact API row, else org REGEX row, else ALL REGEX row
+      bucket:  isAllowed("api_path_method_organization",
+                         path + ":" + method + ":" + organizationId)
+               -> redis  request_rate_limiter.{<path>:<method>:<org>}.tokens
+
+  The bucket key NEVER contains the string "ALL" just because the ALL config
+  was used. The ALL row is a source of numbers, not a shared counter.
+
+
+3. IS THE ALL ROW A PER-ORG CAP OR A COMBINED CAP?
+---------------------------------------------------
+  PER-ORG. Each org gets its OWN 5,082/day bucket.
+
+      org A (no quota row) -> bucket {orgA} -> 5,082/day
+      org B (no quota row) -> bucket {orgB} -> 5,082/day
+      org C (no quota row) -> bucket {orgC} -> 5,082/day
+
+  They do not share. 50 such orgs = 254,100 requests/day of aggregate
+  headroom.
+
+  ***  THERE IS NO GLOBAL / PLATFORM-WIDE CEILING ANYWHERE.  ***
+  Nothing in this system caps total traffic across all organizations. A
+  platform-wide limit would require a new limiter with a CONSTANT bucket key,
+  which does not exist today. Worth knowing for capacity planning: the sum of
+  what the config permits grows linearly with customer count.
+
+
+4. DOES A PER-ORG ROW OVERRIDE THE ALL ROW, OR ADD TO IT?
+----------------------------------------------------------
+  OVERRIDE. Full replacement. The ALL row is never even read.
+
+      createQuotaRateLimiter:
+          Step 1  org-specific config
+                  if (orgLimiter != null) return orgLimiter;   <-- returns here
+          Step 2  ALL fallback                                 <-- not reached
+
+  Only ONE limiter object is built, so only ONE bucket is checked. An org with
+  its own row gets 28,800/day INSTEAD OF 5,082/day. Not 5,082 + 28,800, and
+  not "whichever is tighter".
+
+  The path filter uses the same early-return shape: org REGEX rows are
+  returned before ALL REGEX rows are considered.
+
+      org's quota config          | daily quota | row applied
+      ----------------------------|-------------|--------------------
+      own row, tokens 3           |  28,800/day | its own (ALL ignored)
+      no row                      |   5,082/day | ALL
+      no row AND no ALL row       |   UNLIMITED | none - passes through
+
+  The last line is why the ALL row must not be deleted.
+
+
+5. PROD NUMBERS, DECODED
+-------------------------
+  QUOTA (org-wide, all endpoints, all methods)
+    per-org  1/86400/3    0.3333 req/s   1,200/hr   28,800/day  burst 28,800
+    ALL      1/86400/17   0.0588 req/s     212/hr    5,082/day  burst  5,082
+
+  PATH (per raw URL + method + org)
+    create-run POST ALL     1/3600/180   0.0056 r/s   20/hr    480/day  burst 20
+    flow-runs  POST ALL     1/3600/180   0.0056 r/s   20/hr    480/day  burst 20
+    ^/v1.* GET/POST/PUT ALL 100/100/1     100   r/s                     burst 100
+    per-org create-run      1000/1000/1  1000   r/s                     burst 1000
+    ^/v1.* POST a3b98c27    1/5/2          0.5 r/s  1,800/hr            burst 2
+
+  NET EFFECTIVE CEILING on POST /v1/cleanroom-questions/{id}/create-run
+  (both filters apply; the TIGHTER of the two binds)
+
+      org has          | quota    | path       | binds
+      -----------------|----------|------------|------------------
+      quota row only   | 28,800/d |    480/day | 480/day   (path)
+      path row only    |  5,082/d | 86.4M/day  | 5,082/day (quota)
+      neither          |  5,082/d |    480/day | 480/day   (path)
+      both             | 28,800/d | 86.4M/day  | 28,800/day
+                                                 ^ nobody is configured this way
+
+  3 orgs have a quota row. 16 have a path row. ZERO have both.
+  So every configured uplift is cancelled by the other filter's ALL default.
+
+
+6. TWO GAPS IN COVERAGE
+------------------------
+  a) MISSING ORG SKIPS QUOTA ENTIRELY.
+     The two filters disagree on what to do when the org cannot be resolved:
+
+        PathRateLimitFilter   organizationId = "ALL", carries on
+                              -> bucket {path:method:ALL}, limits still apply
+        QuotaRateLimitFilter  returns chain.filter(exchange) immediately
+                              -> NO QUOTA AT ALL
+
+     A request with no JWT org claim and no LR-Org-ID header is therefore
+     subject to path limits only -- and those are per-URL, so ID rotation
+     defeats them. Unattributable traffic has no org-wide ceiling, which is
+     exactly the abuse profile that started this investigation.
+
+     Measure it after PR #95 merges: organizationID=ALL rows in the rejection
+     log, plus the existing "Organization ID is missing for path: {}" warning.
+
+  b) PATH BUCKETS ARE PER RAW URL.
+     One rule at N req/sec gives EACH distinct URL its own N req/sec. A client
+     rotating 200 resource ids gets 200 x N. Only the org QUOTA constrains
+     such a client -- which is why (a) above matters so much.
+
+
+7. UI CHANGE 2026-08-04: "ORGANIZATION" REMOVED FROM THE ADD DROPDOWN
+----------------------------------------------------------------------
+  This is a UI-only change. The backend is untouched:
+      - RateLimiterStrategies.QUOTA still exists
+      - QuotaRateLimitFilter still runs at order -2 on every request
+      - existing quota rows in Redis still enforce
+
+  The API still accepts them. POST /configs is strategy-agnostic; the only
+  gate is validateSuperUser, and the UpsertValidations method check only
+  applies when strategy is PATH. So a quota config can still be created with:
+
+      { "strategy": "QUOTA", "type": "organization",
+        "organization": "<org-uuid>",
+        "replenishRate": 1, "burstCapacity": 86400, "requestedTokens": 3 }
+
+  RISK: the ALL quota row still has a Delete button but can no longer be
+  recreated from the UI. It is the only org-wide backstop in the system.
+  Deleting it would give every org without an explicit row an unlimited
+  org-wide quota.
+
+  CONSEQUENCE: new customers can only be given PATH rules from the UI, so they
+  all inherit the 5,082/day ALL quota and cannot be granted headroom without
+  an API call.
+
+  TO CONFIRM: does Edit still work on existing ORGANIZATION rows, or only
+  Delete? And was the removal deliberate (deprecating quota) or incidental?
+
+
+8. QUICK REFERENCE
+-------------------
+  "How many requests per day does this row allow?"
+      86400 / requestedTokens         (when replenishRate=1, burst=86400)
+
+  "Does the ALL row cap everyone together?"
+      No. Each org gets its own bucket with those numbers.
+
+  "Does a per-org row add to the ALL row?"
+      No. It replaces it entirely.
+
+  "Which limit actually applies to a request?"
+      The tighter of (org quota) and (path rule) -- both filters run.
+
+  "What if the org is unknown?"
+      Quota is skipped entirely. Path applies with org="ALL".
