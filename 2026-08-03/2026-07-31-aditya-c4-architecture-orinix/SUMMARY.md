@@ -1,5 +1,13 @@
 # SUMMARY — Orinix Change Event Platform, C4 Architecture Package
 
+> ⚠️ **DESIGN SUPERSEDED (2026-08-04).** The final agreed design is
+> [`2026-08-04/2026-08-04-aditya-final-hank-audit-event-to-xmi/`](../../2026-08-04/2026-08-04-aditya-final-hank-audit-event-to-xmi/SUMMARY.md).
+> The outbox, the aggregate root and every `AuditLog` struct addition were **dropped**;
+> XMI now subscribes to our SNS and orinix leaves the M1 path. **The source-level
+> findings in this document remain correct** and are still cited by the final design —
+> keep it as the decision trail, do not implement from it.
+
+
 **Date:** 2026-07-31
 **Prepared by:** Aditya Bhardwaj
 **Audience:** Principal Architects, Staff/Principal Engineers, Engineering Managers, XMI

@@ -1,0 +1,542 @@
+FINAL DISCUSSION VERSION — HANK AUDIT EVENT → SNS → XMI
+Agreed with two architects + Director of Engineering, 2026-08-04
+Aditya Bhardwaj
+================================================================================
+STATUS: THIS DOCUMENT SUPERSEDES ALL EARLIER DESIGNS IN THIS FOLDER.
+        Everything below is what we build. Anything in earlier documents that
+        contradicts this is obsolete — see §2 for the explicit list of what is
+        now DROPPED.
+
+READ THIS IN 60 SECONDS
+  - Hank's EXISTING audit event is the event. No new event type. No new fields.
+  - Hank publishes it to a NEW SNS topic, filtered to an allow-list of object
+    types.
+  - XMI SUBSCRIBES to our SNS (via an SQS queue we provision for them). We do
+    NOT push to their Pub/Sub.
+  - The payload is thin: object type, object id, action, actor, time. XMI reads
+    back through our API to learn the new state.
+  - orinix is NOT in the M1 path.
+  - FIRST TASK IS NOT CODE: confirm in Datadog that flow-run state changes
+    actually produce audit log lines today. If they do not, the whole approach
+    fails for XMI's most important use case.
+
+
+================================================================================
+1. WHAT WAS DECIDED
+================================================================================
+
+D1  USE HANK'S EXISTING AUDIT EVENT AS THE CHANGE EVENT.
+    Rationale: XMI will keep asking for more object types — not just Data
+    Connection and Dataset. Instrumenting each function is tedious for new
+    engineers and does not scale. Hank already emits an audit event on every
+    row write, for every model that embeds hdb.Audit, in every service.
+
+D2  DO NOT MODIFY THE AuditLog STRUCT.
+    No RootObjectType. No RootObjectID. No state map. No changedFields.
+    No struct changes at all.
+
+D3  XMI SUBSCRIBES TO OUR SNS. WE DO NOT PUBLISH TO THEIR PUB/SUB.
+    Rationale from the architect: subscribing is just an endpoint plus a
+    credential on their side. It also keeps Google Cloud credentials out of our
+    services, and it makes adding a second consumer a subscription rather than
+    code. Our obligation is to keep the topic/queue continuously consumable.
+
+D4  THE CODE CHANGE LIVES IN HANK.
+    Hank is the library embedded in every microservice, and it is where the
+    audit event is already produced. Per-service work is configuration only.
+
+D5  FIRST DELIVERABLE IS A VERIFICATION, NOT CODE.
+    Check Datadog: when a flow moves from initialized to run-completed, do we
+    see the audit log line? If yes, XMI can rely on flow completion events. If
+    no, that use case does not work and we must fix the producing path first.
+
+D6  ORINIX IS NOT IN THE M1 PATH.
+    No object_events, no pull API, no webhook delivery, no replay for M1. Those
+    remain valuable for history/audit/multi-consumer and move to M2+.
+
+
+================================================================================
+2. WHAT THIS DROPS FROM THE EARLIER DESIGNS
+================================================================================
+Stated explicitly so nobody implements something we have abandoned.
+
+  DROPPED                          WAS FOR                        NOW
+  -------------------------------- ------------------------------ -------------
+  RootObjectType / RootObjectID    aggregate roll-up              dropped (D2)
+  EventScoped / EventRoot()        aggregate roll-up              dropped (D2)
+  event:"state" struct tags        Level 1 current state          dropped (D2)
+  changedFields                    XMI filtering                  dropped (D2)
+  change_outbox table              at-least-once guarantee        dropped (see §6)
+  Outbox relay goroutine           publish after commit           dropped (see §6)
+  orinix object_events             history + replay               deferred to M2+
+  orinix pull API / webhooks       delivery + catch-up            deferred to M2+
+  Publishing to XMI's Pub/Sub      delivery                       replaced by D3
+
+  KEPT from earlier work
+  ----------------------
+  - A NEW SNS topic (not the existing FIFO one). Reason unchanged: pegleg's
+    subscription filter already matches "dataImportJob"
+    (orinjade/aws/modules/habu-events/pegleg.tf:17), so reusing the existing
+    topic would deliver our messages into pegleg's queue.
+  - Standard topic, not FIFO. hank/aws/sns/service.go:48 sets MessageGroupId to
+    the request id, and FIFO orders only WITHIN a group — so two updates to the
+    same object from different requests are already unordered. FIFO buys us
+    nothing and caps at 300 msg/s.
+  - The object-type ALLOW-LIST. This is now load-bearing — see §5.
+
+  NOTE FOR THE RECORD
+  -------------------
+  What we have landed on is exactly the option catalogued in the original
+  analysis as "2b — hooks + thin payload + ObjectType filter", which that
+  document described as "the honest strongest form of the just-use-Hank
+  proposal". The two objections raised against it then were (a) no field values
+  and (b) it cannot say "COMPLETED", only "updated". Both are accepted
+  deliberately now, because XMI reads back — see §4.
+
+
+================================================================================
+3. THE ARCHITECTURE
+================================================================================
+
+    Clean Room UI
+         |
+         v
+    forebitt / unhygienix / picanmix / primage / pegleg
+         |   (any row write on a model embedding hdb.Audit)
+         v
+    +--------------------------------------------------+
+    |  hank  —  hdb.Audit AfterCreate/Update/Delete     |
+    |    1. build AuditLog          (EXISTS TODAY)      |
+    |    2. log "Audit Log: {...}"  (EXISTS TODAY)      |
+    |    3. if enabled AND ObjectType in allow-list:    |
+    |         publish AuditLog to SNS      <-- NEW      |
+    +--------------------------------------------------+
+         |
+         v
+    SNS topic  habu-change-events  [Standard]
+         |
+         +-----------------------------> SQS queue  xmi-change-events
+         |                                    |  (we provision; XMI polls)
+         |                                    v
+         |                                  XMI
+         |                                    |
+         |                                    +--> reads back via our API
+         |                                         to learn the new state
+         |
+         +--- (M2+) additional subscriptions: audit tier, Microsoft,
+              SafeHaven, orinix — each is a SUBSCRIPTION, not code
+
+  WHY A QUEUE IN FRONT OF XMI AND NOT A RAW SNS SUBSCRIPTION
+    SNS alone has no retention. If XMI is down, an HTTPS-endpoint subscription
+    retries for a bounded window and then the message is gone. An SQS queue
+    subscribed to the topic gives durability, a DLQ, and lets XMI consume at
+    their own pace — which is exactly the "continuously consumable" property we
+    committed to. This is what makes D3 safe.
+
+
+================================================================================
+4. WHAT XMI ACTUALLY RECEIVES
+================================================================================
+
+The message body is the AuditLog exactly as it exists today
+(hank/db/audit.go:43-56):
+
+    {
+      "ObjectID":            "d56ada74-...",
+      "ObjectName":          "Adidas EMEA CRM Data",
+      "ObjectType":          "DataImportJob",
+      "Action":              "UPDATE",
+      "ActionByID":          "...",
+      "ActionByEmail":       "aditya@...",
+      "ActionAt":            "2026-08-04T09:14:02Z",
+      "Method":              "...",
+      "OrgID":               "org-adidas-emea",
+      "RequestID":           "abc-123",
+      "ImpersonatedByID":    "",
+      "ImpersonatedByEmail": ""
+    }
+
+  WHAT IT DOES NOT CONTAIN
+    No field values. No before/after. No Status. No Stage.
+    So the event says "DataImportJob d56ada74 was updated". It CANNOT say
+    "stage is now CONFIGURATION_COMPLETE".
+
+  HOW XMI SATISFIES THEIR FOUR USE CASES ANYWAY
+
+    1. Data Connection stage change -> event -> XMI GETs the connection by
+       ObjectID -> reads stage.
+    2. Flow Run state change        -> event -> XMI GETs the flow run -> reads
+       state (STARTED / COMPLETED / FAILED).
+    3. Flow 1 completes -> trigger Flow 2 -> same as 2.
+    4. All datasets assigned -> trigger run -> events on Dataset -> XMI GETs and
+       evaluates.
+
+  IS THIS JUST POLLING AGAIN? NO — AND THIS IS THE POINT TO MAKE IF ASKED.
+    DV-15621's problem is PERIODIC BLIND polling: XMI calls every few minutes
+    for every object regardless of whether anything changed, and most calls
+    return "no change". Under this design XMI calls ONLY when we tell them
+    something changed, and only for the object that changed. The call volume
+    drops by whatever the change rate is relative to the poll rate — typically
+    one to two orders of magnitude. The read is TRIGGERED, not scheduled.
+
+    In Fowler's taxonomy this is the EVENT NOTIFICATION pattern, and read-back
+    is a normal, intended part of it, not a workaround.
+    https://martinfowler.com/articles/201701-event-driven.html
+
+  ONE THING TO DECIDE BEFORE WE SHIP (§9 Q1)
+    The AuditLog carries ActionByEmail and ImpersonatedByEmail — internal
+    LiveRamp user identities — and Method. Sending those to an external partner
+    is a privacy/security question. We can publish a PROJECTION of the struct
+    (choose which fields to serialize) without modifying the struct, so this
+    does not violate D2.
+
+
+================================================================================
+5. THE ALLOW-LIST — WHY IT IS NOW LOAD-BEARING
+================================================================================
+
+Without roll-up (D2), EVERY row write on EVERY model embedding hdb.Audit would
+publish. unhygineix alone has ~91 such models. Unfiltered, this would flood the
+topic and expose our internal table names to a partner.
+
+So Hank publishes ONLY when ObjectType is in a configured allow-list, e.g.
+
+    changeEvents.objectTypes = [ "DataImportJob", "FlowRun", "Flow",
+                                 "CleanRoomQuestion", "Dataset" ]
+
+  THE ALLOW-LIST ALSO GIVES US ROLL-UP FOR FREE — THIS IS THE ELEGANT PART.
+
+  A "create data connection" performs 5 SQL writes and fires 4 audit hooks
+  (1 on data_import_jobs, 3 on organization_job_parameters — the DELETE fires
+  no hook, see §8). With OrganizationJobParameter NOT in the allow-list:
+
+      4 hook firings  ->  filter  ->  1 published event
+
+  That is exactly the one-event-per-user-action behaviour we spent weeks
+  designing an aggregate root for, achieved with a config list.
+
+  WHERE THE ALLOW-LIST DOES NOT ROLL UP (be honest about these)
+
+    a) V1 create route (job_service.go:1418 then :1425) saves the connection
+       twice, so XMI sees CREATE then UPDATE for one user action. Harmless with
+       read-back — they read once and see final state.
+
+    b) A change that touches ONLY child rows publishes NOTHING. Example: the
+       standalone SetOrganizationJobParameters path, if it does not also write
+       the data_import_jobs row. The main update path (UpdateJobV2) DOES update
+       the job row, so it is covered. Needs confirming — §9 Q3.
+
+    c) Bulk endpoints publish one event per affected object, which is correct.
+
+
+================================================================================
+6. RELIABILITY — WHAT WE ARE ACCEPTING, AND THE ONE REAL HAZARD
+================================================================================
+
+We are not building the outbox. That is a reasonable call for M1 speed. But two
+consequences must be understood and stated, because both are NEW and are caused
+by moving publication into the hook.
+
+  6.1  THE HOOK RUNS *INSIDE* THE TRANSACTION  [VERIFIED]
+
+    gorm v1.9.11 callback_create.go:10-18 registers, in order:
+        gorm:create
+        gorm:after_create                    <-- the audit hook runs here
+        gorm:commit_or_rollback_transaction  <-- COMMIT happens AFTER
+
+    And callback_create.go:166 -> scope.go:450-451 -> scope.go:414-426: an error
+    returned from the hook is pushed onto the scope and CommitOrRollback then
+    ROLLS THE TRANSACTION BACK.
+
+    TWO CONSEQUENCES:
+
+    (i)  A SYNCHRONOUS SNS CALL FROM THE HOOK WOULD PUT NETWORK LATENCY INSIDE
+         AN OPEN TRANSACTION, holding row locks — and if SNS returned an error
+         and we propagated it, an SNS outage would start FAILING CUSTOMER
+         WRITES.
+         => MUST publish ASYNCHRONOUSLY and MUST never return the publish error.
+            This is not optional. See §7 task H3.
+
+    (ii) PHANTOM EVENTS ARE NOW POSSIBLE. The hook fires BEFORE commit, so if
+         the transaction later rolls back we have already announced a change
+         that never happened.
+
+         THIS IS REACHABLE IN REAL CODE, not theoretical:
+             forebitt/db/job_v2.go:20   tx.Create(&job)      <- hook fires
+             forebitt/db/job_v2.go:25   SetOrganizationJobParametersInTransaction
+             forebitt/db/job_parameters.go — several tx.Rollback() paths
+                 (parameter not found in dataSource, name mismatch, ...)
+         So a validation failure on parameters rolls back a job INSERT whose
+         event has already been published.
+
+         WHY IT IS SURVIVABLE HERE: because the payload is thin and XMI reads
+         back, a phantom event is SELF-CORRECTING. XMI receives "go look at
+         d56ada74", calls our API, gets 404 or the unchanged state, and moves
+         on. The cost is one wasted API call.
+
+         This is worth saying out loud to the architects: the thin-payload
+         decision is what makes skipping the outbox acceptable. With a fat
+         payload a phantom event would be actively wrong.
+
+  6.2  WHAT WE ARE ACCEPTING
+
+    CAN HAPPEN                                       IMPACT        MITIGATION
+    ------------------------------------------------ ------------- ------------
+    Phantom event (tx rolled back after hook fired)  wasted read   self-correcting
+    Event lost (pod dies before async publish)       XMI misses    metric + alert
+    Event lost (SNS publish fails, error swallowed)  XMI misses    metric + alert
+    Duplicate event (retry)                          wasted read   harmless
+    Out-of-order events                              none          read-back wins
+
+    LOSS is the one that is NOT self-correcting. If we drop an event, XMI never
+    learns. Minimum acceptable position: a publish-failure counter and an alert,
+    so we can answer "how many did we lose" with a number instead of a shrug.
+
+  6.3  THE DOCUMENTED UPGRADE PATH
+    If loss later proves unacceptable, the transactional outbox is additive and
+    goes at exactly the line the publish sits on. Choosing speed now does not
+    make it harder later. Do not build it for M1.
+
+
+================================================================================
+7. THE WORK — EVERYTHING THAT HAS TO BE DONE
+================================================================================
+
+PHASE 0 — VERIFY (BEFORE ANY CODE)  ~0.5 day
+  V0.1  DATADOG: FLOW-RUN STATE TRANSITIONS                       [THE GATE]
+        Query Datadog/Loki for `Audit Log:` lines where
+        ObjectType = FlowRun (or the actual model name) around a flow moving
+        initialized -> completed.
+          - Do the lines exist at all?
+          - Do they appear for a run driven by a BACKGROUND WORKER, not a user
+            request?
+        WHY THIS IS THE GATE: every hook begins
+            tokenClaims, ctx, parsed := claims(scope)
+            if !parsed { return nil }
+        and claims() (hank/db/audit.go:33-41) needs a context attached by
+        BeginDB/BeginTxDB (audit.go:215-225). A background worker has no HTTP
+        request and may have no parsed auth claims — in which case NO AUDIT
+        RECORD IS PRODUCED AT ALL, silently. If that is what we find, flow
+        completion events do not exist and use cases 2, 3 and 4 are blocked
+        until the producing path is fixed.
+        THIS IS EXACTLY THE CHECK THE ARCHITECT ASKED FOR. Do it first.
+
+  V0.2  BUILD THE ALLOW-LIST FROM REALITY
+        From the same logs, list the distinct ObjectType values that actually
+        occur. Confirms the exact strings (they come from the Go MODEL NAME via
+        getModelName, e.g. "DataImportJob", not the table name).
+
+  V0.3  VOLUME
+        Count audit lines/day for the allow-listed types. Sizes the topic and
+        tells us whether Standard-vs-FIFO or cost matters in practice.
+
+  V0.4  CONFIRM DELETE AND CHILD-ONLY PATHS  (see §8)
+
+
+PHASE 1 — HANK  ~3 days
+  H1  hank/db/events_publish.go (new)
+        type ChangeEventConfig struct {
+            Enabled     bool
+            TopicARN    string
+            ObjectTypes []string      // allow-list
+            BufferSize  int           // default 1024
+            Workers     int           // default 2
+        }
+
+  H2  ALLOW-LIST FILTER
+        publishable(objectType) — exact match against the configured list.
+        Disabled or empty list => publish nothing. Default is OFF.
+
+  H3  ASYNCHRONOUS PUBLISH  [CRITICAL — see §6.1]
+        - a buffered channel + N worker goroutines drain it and call SNS
+        - the hook only does a NON-BLOCKING send onto the channel
+        - if the buffer is full: DROP, increment a counter, log a warning.
+          Never block, because blocking would stall a database transaction.
+        - the publish error is logged and counted, NEVER returned to the hook
+
+  H4  WIRE INTO THE THREE HOOKS
+        In AfterCreate / AfterUpdate / AfterDelete (audit.go:150 / :183 / :199),
+        immediately after the existing auditLog is built and logged:
+
+            publishChangeEvent(ctx, auditLog)   // one line, non-blocking
+
+        NOTHING ELSE IN THE HOOKS CHANGES. The AuditLog struct is untouched (D2).
+
+  H5  ONE SNS CLIENT, NOT ONE PER PUBLISH
+        hank/events/service.go:18 constructs a new client on EVERY publish via
+        hevent.New(config). At hook volume that is wasteful. Hold one client for
+        the lifetime of the process.
+        Publish through hank/aws/sns — service.go:34 already accepts
+        `message any`, so NO CHANGE TO THAT PACKAGE IS NEEDED.
+
+  H6  PAYLOAD PROJECTION (pending §9 Q1)
+        If we decide not to send internal identities to a partner, serialize a
+        projection of AuditLog rather than the whole struct. This does not
+        modify the struct, so it is consistent with D2.
+
+  H7  LIFECYCLE
+        StartChangeEventPublisher(ctx, cfg) at service boot; Stop() drains the
+        buffer on shutdown so in-flight events are not lost on a normal deploy.
+
+  H8  METRICS  (non-negotiable — this is how we answer "did we lose any?")
+        change_events_published_total
+        change_events_dropped_total{reason="buffer_full"|"not_allowlisted"}
+        change_events_publish_failures_total
+        change_events_buffer_depth
+
+  H9  TESTS
+        - allow-listed type publishes; non-allow-listed does not
+        - publisher disabled => nothing published, zero behaviour change
+        - SNS failure does NOT return an error into the hook  (guards §6.1(i))
+        - full buffer drops rather than blocks
+        - the `Audit Log:` line is byte-identical to today  (guards other services)
+
+
+PHASE 2 — INFRASTRUCTURE (orinjade / fiddley / dyogram)  ~2 days, other teams
+  I1  New SNS Standard topic  habu-change-events
+  I2  SQS queue  xmi-change-events  subscribed to the topic, + DLQ + redrive
+  I3  Queue policy allowing SNS to write
+  I4  IAM: publish permission for each producing service's role
+  I5  IAM: a role/user for XMI with ReceiveMessage + DeleteMessage on the queue
+  I6  Topic ARN into dyogram values.yaml and fiddley overrides (stage, then prod)
+  I7  Empty-ARN guard so the code can merge and deploy before the topic exists
+
+
+PHASE 3 — PER-SERVICE ENABLEMENT  ~0.5 day per service
+  S1  forebitt first: set ChangeEventConfig (ARN + allow-list). No model
+      changes, no handler changes, no migrations.
+  S2  unhygienix next — this is where flow runs live, so it is the one XMI
+      actually needs. Gated on V0.1.
+  S3  picanmix (export service), primage, pegleg later, as XMI asks for them.
+
+
+PHASE 4 — XMI ONBOARDING  ~1 day + their time
+  X1  Give XMI: queue URL, region, IAM credentials/role, and the message schema
+  X2  Written schema doc — the AuditLog field list, with an explicit statement
+      that the payload is a NOTIFICATION and they must read back for state
+  X3  Agree retention and DLQ behaviour on the queue
+  X4  Agree what they do with an event for an object they have never seen
+
+
+PHASE 5 — ROLLOUT
+  R1  Merge Hank with Enabled=false. Zero change anywhere.
+  R2  Services bump Hank at their own pace — still zero change.
+  R3  Enable in STAGE for forebitt with the allow-list. Watch the SQS queue
+      directly. Confirm one create = one event.
+  R4  QE verification.
+  R5  Enable in prod. Onboard XMI in stage first, then prod.
+
+  ROLLBACK: set Enabled=false. No migration to revert, no schema to undo.
+
+TOTAL: roughly 6-7 engineering days on our side, plus infrastructure lead time
+and XMI's integration time. Phase 0 is half a day and it gates Phase 3 S2.
+
+
+================================================================================
+8. KNOWN DEFECTS THAT AFFECT WHAT XMI RECEIVES
+================================================================================
+These are pre-existing. They are not caused by this work, but they LIMIT it, so
+they should be decided consciously rather than discovered by XMI.
+
+  8.1  DELETE EVENTS CARRY NO OBJECT ID              [blocks delete use cases]
+       forebitt/db/job.go:185
+           tx.Scopes(IDScope(id)).Delete(&models.DataImportJob{})
+       A pointer is passed so the hook DOES fire, but the struct is EMPTY — the
+       id is only in the WHERE clause. getObjectDetails (audit.go:241-267)
+       marshals the struct and finds no ID, so:
+           { "ObjectType":"DataImportJob", "ObjectID":"", "Action":"DELETE" }
+       XMI would receive "something was deleted, we are not saying what".
+       This is ALSO a live defect in the compliance audit log we ship today.
+       FIX: populate the primary key on the struct passed to Delete. Small, and
+       worth its own ticket regardless of this project.
+
+  8.2  SOME WRITES FIRE NO HOOK AT ALL               [silent gaps]
+       hdb.Audit's hooks have POINTER receivers, and gorm only takes .Addr()
+       when the value is addressable (scope.go:434-436). A struct passed BY
+       VALUE therefore never matches the method set and NO HOOK RUNS.
+       Verified against gorm's own reflection logic:
+           Delete(Model{})   -> hook found = false
+           Delete(&Model{})  -> hook found = true
+       Confirmed by-value sites:
+           forebitt/db/job_parameters.go:81   Delete(models.OrganizationJobParameter{})
+           forebitt/db/job_parameters.go:62   Model(models.OrganizationJobParameter{}).Update(...)
+           forebitt/db/job.go:207             Delete(models.OrganizationJobParameter{})
+       IMPACT UNDER THIS DESIGN: mostly BENIGN, because those are all child-table
+       writes that the allow-list would filter out anyway. Worth knowing so that
+       nobody later adds OrganizationJobParameter to the allow-list and wonders
+       why deletes never appear.
+
+  8.3  ONE CREATE VIA THE V1 ROUTE PRODUCES TWO EVENTS
+       job_service.go:1418 then :1425 saves the connection twice (draft, then
+       final), so XMI sees CREATE then UPDATE. Harmless with read-back.
+
+
+================================================================================
+9. OPEN QUESTIONS TO CLOSE
+================================================================================
+
+  Q1  Do we send ActionByEmail / ImpersonatedByEmail / Method to XMI?
+      These are internal LiveRamp identities. Recommend publishing a PROJECTION
+      that omits them (does not modify the struct, so D2 holds). Needs a
+      security/privacy sign-off either way.
+      OWNER: Aditya + security.  BLOCKS: H6, X2.
+
+  Q2  Does XMI subscribe with an SQS queue WE own, or one in THEIR account?
+      The meeting language ("the SNS SQS that we have ... consumed by them")
+      implies we own it and hand them credentials. That is simplest for them.
+      The alternative — they own a queue in their account and we allow a
+      cross-account subscription — gives them control of retention and DLQ and
+      removes us from their consumption problems. Decide before I2/I5.
+
+  Q3  Is there a settings-only update path that does NOT touch data_import_jobs?
+      If yes, that change publishes nothing after filtering (§5b). Cheap to
+      check; decides whether we need a parent touch.
+
+  Q4  Exact ObjectType strings for flows and flow runs in unhygienix.
+      They come from the Go model name, not the table name. Needed for the
+      allow-list. Comes out of V0.2.
+
+  Q5  What is XMI's expected latency, and their behaviour on an unknown object?
+      Affects nothing we build, but it should be written down in X2.
+
+  Q6  Retention and DLQ policy on the XMI queue. What happens if XMI is down
+      for a week?
+
+
+================================================================================
+10. THE ONE-PARAGRAPH VERSION FOR THE DIRECTOR
+================================================================================
+Hank already writes an audit record on every database change in every service.
+We will publish that same record to a new SNS topic, filtered to the handful of
+object types XMI cares about, and give XMI an SQS queue to subscribe to. There
+are no changes to the audit record itself and no changes to any service's
+business code — each service turns it on with configuration. XMI receives "this
+object changed" and calls our existing API to read the new state, which replaces
+their current blind polling with targeted reads. The work is about six
+engineering days plus infrastructure, and it starts with a half-day check in
+Datadog to confirm flow state changes are actually being recorded today, because
+that is the one thing that would invalidate the approach.
+
+
+================================================================================
+11. REFERENCES
+================================================================================
+  Event Notification pattern (thin event + read-back) — Martin Fowler
+      https://martinfowler.com/articles/201701-event-driven.html
+  Transactional Outbox (the documented upgrade in §6.3) — Chris Richardson
+      https://microservices.io/patterns/data/transactional-outbox.html
+  Source anchors used above:
+      hank/db/audit.go:43-56    AuditLog struct (unchanged)
+      hank/db/audit.go:33-41    claims() — the background-worker gate
+      hank/db/audit.go:150/183/199   the three hooks
+      hank/db/audit.go:215-225  BeginDB / BeginTxDB attach ctx
+      hank/db/audit.go:241-267  getObjectDetails — reads only ID and Name
+      hank/aws/sns/service.go:34     accepts `message any` — no change needed
+      hank/aws/sns/service.go:48     MessageGroupId = requestId (FIFO caveat)
+      hank/events/service.go:18      new SNS client per publish — fix in H5
+      gorm callback_create.go:10-18  after_create runs BEFORE commit
+      gorm scope.go:414-426          CommitOrRollback rolls back on hook error
+      gorm scope.go:434-436          .Addr() only when addressable (§8.2)
+      forebitt/db/job.go:185         delete with empty struct (§8.1)
+      forebitt/api/server/job_service.go:1418,:1425   V1 double save (§8.3)
+      orinjade/aws/modules/habu-events/pegleg.tf:17   why a new topic
