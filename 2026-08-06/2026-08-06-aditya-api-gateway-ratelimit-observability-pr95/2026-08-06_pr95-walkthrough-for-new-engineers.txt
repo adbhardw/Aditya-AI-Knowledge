@@ -1,4 +1,34 @@
 ================================================================================
+NOTE — THE DESIGN EVOLVED AFTER THIS WAS WRITTEN. READ THIS FIRST.
+================================================================================
+  This document describes the PR at the point where the metric was tagged with
+  the MATCHED ROUTE PATTERN via a matchedRoute() helper. Two later commits
+  changed that:
+
+    5f186e9  tag by organization instead of route; matchedRoute() REMOVED
+    bf7eb74  add the raw path back alongside organization; comments trimmed
+
+  FINAL TAG SHAPE
+      rate_limit_exceeded{source="Path",  path, organization_id, method}
+      rate_limit_exceeded{source="QUOTA", organization_id}
+
+  So: matchedRoute(), the UNKNOWN_ROUTE / "NOT_FOUND" fallback and the route tag
+  no longer exist. Change 2 below is therefore HISTORICAL — the cardinality
+  reasoning in it is still the reason the raw path was ever questioned, and is
+  worth reading, but the code it describes is not what shipped.
+
+  The path tag was deliberately kept in the end. The reasoning: to create one
+  new path series an attacker must first EXHAUST that URL's bucket (a novel URL
+  starts full, so the first request is allowed and counts nothing), and the
+  quota filter runs FIRST at order -2 and short-circuits the path filter once
+  the org's daily budget is gone. Worst case is roughly 242 new series/day for
+  an org on the ALL quota. The quota is the backstop; no extra cap was needed.
+
+  Everything else in this document — the final-variable capture, the org in the
+  log, outcome=REJECTED, the AbstractRateLimitFilter changes, the runtime
+  walkthrough and the debugging guide — is unchanged and accurate.
+
+================================================================================
 API GATEWAY PR #95 — WALKTHROUGH FOR A NEW ENGINEER
 deklareddotcom/api-gateway  ·  branch DV-observability/path-ratelimit-org-attribution
 Written 2026-08-06

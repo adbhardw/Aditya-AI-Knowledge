@@ -1,0 +1,271 @@
+================================================================================
+RATE LIMIT DASHBOARDS — PASTE-READY QUERIES FOR GRAFANA AND DATADOG
+Built against api-gateway PR #95 (branch DV-observability/path-ratelimit-org-attribution)
+Created 2026-08-06
+================================================================================
+
+WHAT THIS PR GIVES YOU TO QUERY
+--------------------------------
+  METRIC (Prometheus counter, name gets _total suffix in the Prometheus format)
+
+      rate_limit_exceeded_total{source="Path",  path, organization_id, method}
+      rate_limit_exceeded_total{source="QUOTA", organization_id}
+
+      source        "Path" | "QUOTA" | "Header"   which limiter rejected
+      organization_id                             the tenant ("ALL" if unresolvable)
+      path          raw request URL               path filter only
+      method        GET/POST/...                  path filter only
+
+  LOGS (api-gateway)
+
+      Rate limit exceeded limitType=path,  organizationID=<org>, method=<m>, outcome=REJECTED, path=<url>
+      Rate limit exceeded limitType=quota, organizationID=<org>, outcome=REJECTED
+      Rate limit rejection could not be completed limitType=<t>, path=<url>, outcome=ERROR, reason=MISSING_LIMITER_HEADERS
+      Rate limit rejection could not set status  limitType=<t>, path=<url>, outcome=ERROR, reason=RESPONSE_ALREADY_COMMITTED
+      Organization ID is missing for path: <p> method: <m> , setting default organization ID
+      Error during rate limiting check for path: <p>. Error: <e>       <- Redis failed, request PASSED
+
+  LOGS (external-api-server, already in production, unchanged by this PR)
+
+      Token request successful for clientID=<c>, userId=<u>, organizationID=<o>
+      Org mismatch on getCleanRoomIntelligence: caller=<o>, owner=<o>, cr=<id>
+      Org mismatch in authz check: caller=<o>, owner=<o>, cr=<id>
+
+
+READ THIS BEFORE YOU START — TWO UNVERIFIED THINGS
+---------------------------------------------------
+  1. Are api-gateway logs in Loki at all? Run this first and note the labels:
+         {cluster="eks-admin-prod"} |= "Rate limit exceeded"
+     If nothing returns, the gateway is not shipping to Loki and only the
+     Datadog log sections below apply.
+
+  2. Are gateway METRICS reachable from Grafana? Run this in a Prometheus
+     datasource:
+         rate_limit_exceeded_total
+     If empty, the metrics collection path is not wired up:
+     dyogram/charts/monitoring-k8s sets prometheusOperatorObjects.enabled=false
+     (so ServiceMonitors are NOT consumed) and the app charts carry no
+     prometheus.io/scrape annotation. That is a CONFIG fix, not a code fix.
+     Until it returns rows, use the LOG sections only — they are self-sufficient.
+
+  3. Datadog almost certainly has the LOGS but probably not these METRICS
+     (same annotation gap). All Datadog sections below are log-based for that
+     reason.
+
+  If the gateway logs are JSON (LogstashEncoder, as external-api-server is in
+  prod), insert  | json | line_format "{{.message}}"  before every | pattern or
+  | regexp below. If plain text, omit it. The STEP 1 query above tells you which.
+
+
+================================================================================
+SECTION A — EXECUTIVE OVERVIEW ("is something wrong right now?")
+================================================================================
+
+A1. Stat — Total rejections/sec
+    PROM   sum(rate(rate_limit_exceeded_total[5m]))
+    LOKI   sum(rate({service_name="api-gateway", cluster=~"$cluster"}
+                    |= "Rate limit exceeded" [5m]))
+    DD     service:api-gateway "Rate limit exceeded"     -> count, no group by
+
+A2. Stat — Organizations currently being throttled
+    PROM   count(count by (organization_id) (rate(rate_limit_exceeded_total[5m]) > 0))
+    LOKI   count(sum by (organizationID) (count_over_time(
+             {service_name="api-gateway", cluster=~"$cluster"} |= "Rate limit exceeded"
+               | regexp `organizationID=(?P<organizationID>[^,\s]+)` [5m])))
+    Description: a jump here means the problem is broad, not one tenant.
+
+A3. Pie — Which limiter is firing
+    PROM   sum by (source) (rate(rate_limit_exceeded_total[5m]))
+    LOKI   sum by (limitType) (count_over_time(
+             {service_name="api-gateway", cluster=~"$cluster"} |= "Rate limit exceeded"
+               | regexp `limitType=(?P<limitType>[a-z]+)` [$__range]))
+    Description: path = per-URL rule; quota = org-wide daily budget. Quota
+    firing means a tenant has burned its whole day's allowance.
+
+A4. Bar gauge — Top 10 organizations by rejections
+    PROM   topk(10, sum by (organization_id) (rate(rate_limit_exceeded_total[5m])))
+    LOKI   topk(10, sum by (organizationID) (count_over_time(
+             {service_name="api-gateway", cluster=~"$cluster"} |= "Rate limit exceeded"
+               | regexp `organizationID=(?P<organizationID>[^,\s]+)` [$__range])))
+    DD     service:api-gateway "Rate limit exceeded"  -> group by @organizationID, top 10
+    THIS IS THE PANEL THE WHOLE EXERCISE EXISTS FOR.
+
+
+================================================================================
+SECTION B — ORGANIZATION LEVEL
+================================================================================
+
+B1. Time series (bars) — Rejections per hour by organization
+    PROM   topk(10, sum by (organization_id) (increase(rate_limit_exceeded_total[1h])))
+           Min interval 1h · Draw style Bars · Stacking Normal · Unit short
+    LOKI   topk(10, sum by (organizationID) (count_over_time(
+             {service_name="api-gateway", cluster=~"$cluster"} |= "Rate limit exceeded"
+               | regexp `organizationID=(?P<organizationID>[^,\s]+)` [1h])))
+           Min interval 1h  <-- REQUIRED, or Grafana samples every ~20min and
+                                you get overlapping windows
+
+B2. Table — Organization x limiter type
+    PROM   sum by (organization_id, source) (increase(rate_limit_exceeded_total[$__range]))
+           Instant query · Table · sort by Value desc
+    LOKI   sum by (organizationID, limitType) (count_over_time(
+             {service_name="api-gateway", cluster=~"$cluster"} |= "Rate limit exceeded"
+               | regexp `limitType=(?P<limitType>[a-z]+), organizationID=(?P<organizationID>[^,\s]+)` [$__range]))
+    Reading it: an org appearing under BOTH is hitting a per-URL rule AND
+    burning its org-wide budget — the strongest abuse signal available.
+
+B3. Time series — Growth factor per organization (spike detection)
+    PROM   (sum by (organization_id) (rate(rate_limit_exceeded_total[15m])))
+           /
+           (sum by (organization_id) (rate(rate_limit_exceeded_total[6h])))
+           Unit: none (a RATIO, not a rate) · Thresholds green / yellow 3 / red 10
+    Reading it: 1.0 = normal. Above 3 = surging. Finds floods that absolute
+    volume hides — an org going 250 -> 3,000 matters more than one steady at 300.
+    An org with zero baseline renders +Inf on its first rejection; expected.
+
+B4. Stat — Rejections with an UNRESOLVABLE organization
+    PROM   sum(rate(rate_limit_exceeded_total{organization_id="ALL"}[5m]))
+    LOKI   sum(rate({service_name="api-gateway", cluster=~"$cluster"}
+                    |= "Organization ID is missing for path" [5m]))
+    WHY THIS MATTERS: the quota filter SKIPS ENTIRELY when the org cannot be
+    resolved (it returns chain.filter early). So this traffic has NO org-wide
+    ceiling — only per-URL path limits, which ID rotation defeats. A rise here
+    is the profile of anonymous abuse.
+
+
+================================================================================
+SECTION C — CLEANROOM / PATH LEVEL
+================================================================================
+  Available because the path tag was kept on the metric AND is in the log.
+
+C1. Bar gauge — Top 20 paths by rejections
+    PROM   topk(20, sum by (path) (increase(rate_limit_exceeded_total{source="Path"}[$__range])))
+    LOKI   topk(20, sum by (path) (count_over_time(
+             {service_name="api-gateway", cluster=~"$cluster"} |= "limitType=path"
+               | regexp `path=(?P<path>\S+)` [$__range])))
+    DD     service:api-gateway "limitType=path"  -> group by @path, top 20
+
+C2. Table — Organization x path (the drill-down)
+    PROM   sum by (organization_id, path) (increase(rate_limit_exceeded_total{source="Path"}[$__range]))
+           Instant · Table · sort desc · colored background on Value
+    DD     service:api-gateway "limitType=path"
+           -> group by @organizationID, @path
+    This answers "which cleanroom of which customer".
+
+C3. Time series — Path rejections for ONE organization
+    Add a dashboard variable:  name=org  type=Query
+       PROM query:  label_values(rate_limit_exceeded_total, organization_id)
+       (or type=Textbox with default .* if using Loki only)
+    PROM   sum by (path) (increase(rate_limit_exceeded_total{source="Path", organization_id="$org"}[1h]))
+           Min interval 1h · Bars
+    LOKI   sum by (path) (count_over_time(
+             {service_name="api-gateway", cluster=~"$cluster"} |= "limitType=path"
+               |= "organizationID=$org"
+               | regexp `path=(?P<path>\S+)` [1h]))
+
+C4. Logs panel — Raw drill-down
+    LOKI   {service_name="api-gateway", cluster=~"$cluster"}
+             |= "Rate limit exceeded" |= "organizationID=$org"
+           Show time on · Newest first · Limit 200
+
+
+================================================================================
+SECTION D — IS THE LIMITER ITSELF HEALTHY?
+================================================================================
+  These have no dashboard today and are the ones that fail silently.
+
+D1. Stat / alert — Rejections that FAILED to complete
+    LOKI   sum(count_over_time({service_name="api-gateway", cluster=~"$cluster"}
+                               |= "outcome=ERROR" [5m]))
+    DD     service:api-gateway "outcome=ERROR"
+    Means: the limiter decided to reject, but the client did not get a 429
+    (MISSING_LIMITER_HEADERS surfaces as a 500). Any non-zero value is a bug.
+    ALERT ON THIS. Threshold > 0.
+
+D2. Stat / alert — Redis failure = throttling silently OFF
+    LOKI   sum(rate({service_name="api-gateway", cluster=~"$cluster"}
+                    |= "Error during rate limiting check" [5m]))
+    DD     service:api-gateway "Error during rate limiting check"
+    Means: the rate limit check threw, onErrorResume returned Mono.empty(), and
+    THE REQUEST WAS ALLOWED THROUGH. Fail-open. If Redis is down, you have no
+    rate limiting at all and nothing else tells you.
+    ALERT ON THIS. Threshold > 0 sustained 2m.
+
+D3. Time series — Rate limiter internal errors
+    PROM   sum by (class) (rate(errors_total{class=~".*RateLimitFilter"}[5m]))
+           (metric name "errors" from MetricDefinitions.ERRORS, tags class/method)
+
+D4. Stat — Series count guard (watch the cardinality decision)
+    PROM   count(rate_limit_exceeded_total)
+    The path tag is deliberately unbounded-in-theory. Practically it is capped
+    by the org quota: to create one new path series an attacker must exhaust
+    that URL's bucket (21+ requests for the create-run ALL rule), and the quota
+    filter runs FIRST and short-circuits the path filter once the org's daily
+    budget is gone. Worst case ~242 new series/day for an org on the ALL quota,
+    ~1,371/day for an org with its own. Watch this panel anyway; if it climbs
+    past a few tens of thousands, add:
+        MeterFilter.maximumAllowableTags("rate_limit_exceeded", "path", 5000,
+                                          MeterFilter.deny())
+
+
+================================================================================
+SECTION E — UPSTREAM SIGNALS (external-api-server, already in production)
+================================================================================
+
+E1. Time series — Token requests per hour by organization
+    LOKI   topk(10, sum by (organizationID) (count_over_time(
+             {service_name="external-api-server", cluster=~"$cluster"}
+               |= "Token request successful"
+               | json
+               | logger_name="com.habu.api.external.service.auth0.Auth0Service"
+               | line_format "{{.message}}"
+               | pattern `<_>clientID=<clientID>, userId=<userId>, organizationID=<organizationID>` [1h])))
+           Min interval 1h · Bars
+           NOTE: use count_over_time([1h]) with Min interval 1h — NOT
+           rate(...[$__auto]) * 3600, which extrapolates micro-bursts and
+           previously made a panel read 780 when the truth was ~73.
+
+E2. Time series — Cross-tenant access attempts (SECURITY, dashboarded nowhere)
+    LOKI   sum by (caller) (count_over_time(
+             {service_name="external-api-server", cluster=~"$cluster"}
+               |= "Org mismatch"
+               | json | line_format "{{.message}}"
+               | pattern `<_>caller=<caller>, owner=<owner>, cr=<cr>` [1h]))
+           Thresholds: green base, red at 1
+    One organization attempting to reach another organization's clean room.
+    An authorization failure, not a capacity signal. Arguably the most important
+    panel on the whole dashboard.
+
+E3. Time series — Errors and warnings by class
+    LOKI   topk(10, sum by (logger_name, level) (count_over_time(
+             {service_name="external-api-server", cluster=~"$cluster"}
+               | json | level=~"WARN|ERROR" [5m])))
+    No message parsing at all — level and logger_name are top-level JSON fields.
+
+
+================================================================================
+SUGGESTED DASHBOARD LAYOUT
+================================================================================
+  ROW 1  EXECUTIVE       A1 · A2 · A3 · A4
+  ROW 2  BY ORG          B1 (wide) · B2 (table)
+  ROW 3  SPIKES          B3 · B4
+  ROW 4  BY CLEANROOM    C1 · C2 · C3
+  ROW 5  LIMITER HEALTH  D1 · D2 · D3 · D4
+  ROW 6  UPSTREAM        E1 · E2 · E3
+  ROW 7  DRILL-DOWN      C4 (logs, filtered by the $org variable)
+
+
+PANEL RULES — PASTE THESE IF THE ASSISTANT PROPOSES SOMETHING ELSE
+===================================================================
+  1. Use count_over_time([window]) / increase([window]), never
+     rate(...[$__auto]) * 3600. The latter measures a burst and extrapolates it
+     across an hour. 10 events in a 2-minute burst reads as 300/hr instead of 10.
+  2. Min interval MUST equal the range vector. [1h] only sets the lookback;
+     without Min interval 1h, Grafana picks its own ~15-20min step and you get
+     overlapping hourly windows landing on :15 and :45.
+  3. Unit must match the expression's real dimension. A per-hour count under a
+     "req/min" unit is wrong by 60x and nothing warns you. Use short/none for
+     counts, none/percentunit for ratios.
+  4. Time series panel + Draw style Bars, not the Bar chart panel (that one is
+     for categorical data).
+  5. Line filter before parser: always |= "..." before | json / | regexp.
+  6. Do not put a threshold in a panel title unless one is configured.

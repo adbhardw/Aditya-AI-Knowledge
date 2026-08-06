@@ -1,11 +1,12 @@
-# SUMMARY — API gateway rate-limit observability (PR #95): walkthrough, cardinality, merge readiness
+# SUMMARY — API gateway rate-limit observability (PR #95): design, cardinality, dashboards
 
 **Date:** 2026-08-06
-**Session type:** PR authoring → teaching walkthrough → merge-readiness review
+**Session type:** PR authoring → teaching walkthrough → design iteration → dashboard queries
 **PR:** [deklareddotcom/api-gateway#95](https://github.com/deklareddotcom/api-gateway/pull/95) — branch `DV-observability/path-ratelimit-org-attribution`
 
 **Files in this folder:**
-- [`2026-08-06_pr95-walkthrough-for-new-engineers.txt`](2026-08-06_pr95-walkthrough-for-new-engineers.txt) — change-by-change walkthrough with line numbers, runtime flow, debugging guide
+- [`2026-08-06_rate-limit-dashboard-queries-grafana-datadog.txt`](2026-08-06_rate-limit-dashboard-queries-grafana-datadog.txt) — **paste-ready**: 19 panels, every query in both Prometheus and Loki, plus Datadog log queries
+- [`2026-08-06_pr95-walkthrough-for-new-engineers.txt`](2026-08-06_pr95-walkthrough-for-new-engineers.txt) — change-by-change teaching walkthrough (carries a header noting which section is historical)
 - [`2026-08-06_metric-cardinality-why-raw-paths-cost-money.txt`](2026-08-06_metric-cardinality-why-raw-paths-cost-money.txt) — why "just strip the UUIDs in Grafana" doesn't work
 
 **Related:** [rate-limit reference + prod audit (2026-08-04)](../../2026-08-04/2026-08-04-aditya-rate-limit-habu-all/SUMMARY.md) · [filter order and request lifecycle](../2026-08-06-aditya-understanding-api-gateway-filter-order-and-request-lifecycle/SUMMARY.md)
@@ -14,80 +15,78 @@
 
 ## 1. Problem statement
 
-Rate-limit rejections in the API gateway could not answer the one question the whole abuse-detection effort exists for: **which customer is being throttled?** Separately, the rejection counter carried an unbounded-cardinality tag that was live in production.
+Rate-limit rejections could not answer the question the whole abuse-detection effort exists for: **which customer is being throttled?** The organization was resolved inside the filter (it builds the Redis bucket key) and then discarded. Separately, the rejection counter was tagged with the raw request URL.
 
 ## 2. First principles
 
 ```
 METRICS  →  "how much?"   bounded labels, aggregate counts, cheap, alertable
-LOGS     →  "who?"        unbounded detail, one line per event, free per value
+LOGS     →  "who / which one?"   unbounded detail, one line per event, free per value
 ```
 
-Every metric name **plus one specific set of tag values** is a separate time series, stored for the whole retention window. So the question to ask before adding any tag is *"how many distinct values can this take, worst case?"*
+A metric name **plus one specific set of tag values** is a separate time series, retained for the whole window and — in Micrometer — a `Counter` object retained in JVM heap until the process restarts. So the question before adding any tag is *"how many distinct values, worst case?"*
 
-## 3. What the PR changes
+## 3. What shipped
 
 | Change | File / lines | Why |
 |---|---|---|
-| `final String orgId` | `PathRateLimitFilter.java:93` | Java requires lambda-captured locals be *effectively final*; `organizationId` is assigned twice. Compile-only. |
-| Metric tag: raw path → matched route (+ `method`) | `PathRateLimitFilter.java:101-102, 178-186` | Fixes unbounded cardinality |
-| Log gains `organizationID`, `route`, `method`, `outcome` | `PathRateLimitFilter.java:112-113` | Makes rejections attributable to a tenant |
-| Failure branches gain context; `setStatusCode` return checked | `AbstractRateLimitFilter.java:48-61` | A failed rejection was previously anonymous and silent |
-| Message shape aligned, `organizationId` → `organizationID` | `QuotaRateLimitFilter.java` | One Datadog facet / Grafana variable covers both services (matches `Auth0Service.java:75`) |
+| `final String orgId` | `PathRateLimitFilter.java:89` | Java requires lambda-captured locals be *effectively final*; `organizationId` is assigned twice. Compile-only. |
+| Log gains `organizationID`, `method`, `outcome`, `path` | `PathRateLimitFilter.java:99-100` | Makes rejections attributable to a tenant |
+| Counter tagged `{source, path, organization_id, method}` | `PathRateLimitFilter.java:97, 154-157` | Per-tenant **and** per-cleanroom breakdown, alertable in Prometheus |
+| Quota tag renamed `key` → `organization_id` | `QuotaRateLimitFilter.java` | One query spans both limiters |
+| Failure branches gain context; `setStatusCode` return checked | `AbstractRateLimitFilter.java:34-47` | A failed rejection was previously anonymous and silent |
 | New test | `PathRateLimitFilterTelemetryTest.java` | There was no test for this filter at all |
 
 **No throttling behaviour changes** — no limits, buckets, thresholds or request outcomes are touched.
 
-## 4. The core finding: a cardinality bomb triggered by the attack
-
-The counter increments only **on rejection** (`PathRateLimitFilter.java:114`). Before the PR it was tagged with `exchange.getRequest().getURI().getPath()` — the raw URL:
+### Final metric shape
 
 ```
-BEFORE   rate_limit_exceeded{source="Path", key="/v1/cleanrooms/3f2a91c4-…/questions/8c1b7e90-…"}
-         → one permanent series per RESOURCE
-
-AFTER    rate_limit_exceeded{source="Path", route="/v1/cleanrooms/**", method="POST"}
-         → one series per configured ROUTE + method
+rate_limit_exceeded_total{source="Path",  path, organization_id, method}
+rate_limit_exceeded_total{source="QUOTA", organization_id}
 ```
 
-Rejections spike during a flood. A client enumerating resource IDs — precisely the abuse being hunted — creates thousands of series in minutes. **The metric explodes exactly when you need to read it**, degrading the same Prometheus serving the dashboard.
+## 4. The design went through three positions — worth recording why
 
-### Why "strip the UUIDs in Grafana" doesn't help
+| Commit | Tag design | Why it moved |
+|---|---|---|
+| `ec3c730` / `6220bf8` | raw path → **matched route pattern** via `matchedRoute()` | Fixed the cardinality bomb, but duplicated a dimension `http_server_requests{route=…}` already provides, and rested on an unverified assumption about when `GATEWAY_PREDICATE_MATCHED_PATH_ATTR` is populated |
+| `5f186e9` | **organization** instead of route; `matchedRoute()` removed | The org dimension existed *nowhere*; the route dimension existed already. Trading a duplicate for a unique signal, and removing the unverified assumption entirely |
+| `bf7eb74` | **path added back** alongside org and method | Per-cleanroom breakdown wanted in Prometheus/Datadog too, not only in Loki |
 
-The cost is paid three steps before any query:
+## 5. The cardinality question, resolved
 
-1. **JVM heap** — `Metrics.counter(name, tags)` creates and *permanently retains* a `Counter` object per unique tag set for the process lifetime.
-2. **Scrape payload** — one line per series, re-serialised every 30s.
-3. **Prometheus / Grafana Cloud** — memory and billing are on active series; `label_replace()` must load them all first.
+The original concern: the counter increments **only on rejection**, rejections spike during a flood, and a client enumerating resource IDs would create thousands of series in minutes — *the metric exploding precisely when you need to read it*.
 
-**But the IDs aren't lost.** `PathRateLimitFilter.java:112-113` still logs `path={}` with the full raw URL on every rejection. The detail moved from the metric to the log, where cardinality is free — logs charge per line written, not per distinct value.
+**That concern was overstated, and the arithmetic shows why.** Two facts settle it:
 
-## 5. Where the bounded route comes from
+1. **A novel URL starts with a full bucket.** The counter lives inside `if (!response.isAllowed())`. A brand-new random UUID means a brand-new Redis bucket at full burst capacity, so the first request is *allowed* → no series created.
+2. **Quota short-circuits the path filter.** `QuotaRateLimitFilter` is order −2, `PathRateLimitFilter` is −1. When quota rejects, `handleRateLimitExceeded` calls `setComplete()`, terminating the chain — the path filter never runs.
 
-`matchedRoute()` reads `ServerWebExchangeUtils.GATEWAY_PREDICATE_MATCHED_PATH_ATTR` — the *pattern* Spring Cloud Gateway matched, from route config:
+So to create **one** new `path` series an attacker must exhaust that URL's bucket:
+
+| Rule in play | Burst | Requests to trip it |
+|---|---|---|
+| create-run `ALL` (1/3600/180) | 20 | 21 |
+| `^/v1.*` `ALL` (100/100/1) | 100 | 101 |
+| per-org allowlist (1000/1000/1) | 1000 | 1001 |
 
 ```
-request:   /v1/cleanrooms/3f2a91c4-…/questions/8c1b7e90-…
-attribute: "/v1/cleanrooms/**"
+org on the ALL quota      5,082 req/day ÷ 21 ≈ 242 new series/day
+org with its own quota   28,800 req/day ÷ 21 ≈ 1,371 new series/day
 ```
 
-**Default return value: the literal string `"NOT_FOUND"`** (constant at line 27) when the attribute is absent. Not `null`, for two reasons: `Tags.of()` with a null value throws — turning a rejection into a 500 — and it collapses unmatched requests into one bounded series.
+**The quota is the backstop; no extra cap was added.** No hard limit exists anywhere in the stack (Micrometer has no default cap, the ServiceMonitor sets no `sampleLimit`); the real ceiling is the Grafana Cloud plan's active-series limit. JVM-side accumulation is cleared by pod restart, so normal deploys bound it naturally.
 
-This mirrors the existing `http/metrics/RouteIdWebFluxTagContributor.java:19-22`, which reads the same attribute with the same `"NOT_FOUND"` fallback, so the `route` tag agrees with the one already on `http_server_requests`.
+If it ever does bite, the one-line fix is `MeterFilter.maximumAllowableTags("rate_limit_exceeded", "path", 5000, MeterFilter.deny())` — full detail up to a ceiling, then no new series. Panel **D4** in the dashboard file watches for it.
 
-## 6. Design reasoning: why org is logged, not tagged
+## 6. `outcome=REJECTED`, not `status=429` — and an honest correction
 
-As a metric tag, `organizationID` multiplies: 500 orgs × 30 routes × 7 methods ≈ 105,000 potential series. As a log field it costs nothing — the line is written regardless. The reasoning is left as a comment at `PathRateLimitFilter.java:104-106` so a future contributor doesn't "helpfully" add the tag.
+The first version logged `status=429`. That line is emitted before `handleRateLimitExceeded` runs, and that method has a branch returning `Mono.error` → a 500. The log asserted something undecided.
 
-## 7. `outcome=REJECTED`, not `status=429` — and an honest correction
+Writing a test for that branch revealed it is **unreachable**: `RedisRateLimiter.Response`'s constructor asserts non-null headers. So no wrong data was ever emitted — `status=429` was accurate *by accident of a constructor three classes away*. The test was deleted rather than kept as one that cannot fail; the rename stands because it removes the coupling.
 
-The first version logged `status=429`. That line is emitted at 112, but `handleRateLimitExceeded` (which decides the status) runs at 115 and has a branch returning `Mono.error` → a 500. The log asserted something undecided.
-
-Writing a test for that branch revealed it is **unreachable**: `RedisRateLimiter.Response`'s constructor asserts non-null headers. So no wrong data was ever emitted — `status=429` was accurate *by accident of a constructor three classes away*. The test was deleted rather than kept as one that cannot fail; the rename stands because it removes the coupling (if quota later returns 503, the log won't silently lie).
-
-## 8. Does the `setStatusCode` change carry risk?
-
-**No.** The `if` body contains only a log — no return, no throw, no state change:
+## 7. `setStatusCode` — no behavioural risk
 
 ```java
 if (!exchange.getResponse().setStatusCode(HttpStatus.TOO_MANY_REQUESTS)) {
@@ -97,48 +96,57 @@ addRateLimitHeaders(exchange, response);   // runs either way
 return exchange.getResponse().setComplete();
 ```
 
-`ServerHttpResponse.setStatusCode` returns `boolean` — `false` when the response is already committed. The old code discarded it, so "silently failed to throttle" had no signal. Now it does. Purely a detection change.
+The `if` body contains only a log — no return, no throw, no state change. `ServerHttpResponse.setStatusCode` returns `boolean` (`false` when the response is already committed); the old code discarded it, so "silently failed to throttle" had no signal. Purely a detection change.
 
-## 9. Merge readiness (as of 2026-08-06)
+## 8. What you can build now — 19 panels
+
+Full queries in [`2026-08-06_rate-limit-dashboard-queries-grafana-datadog.txt`](2026-08-06_rate-limit-dashboard-queries-grafana-datadog.txt). The ones that matter most:
+
+- **A4 — top 10 orgs by rejections.** The panel the whole exercise exists for.
+- **B2 — org × limiter type.** An org appearing under *both* `path` and `quota` is hitting a per-URL rule *and* burning its daily budget — the strongest abuse signal available.
+- **B4 — rejections with `organization_id="ALL"`.** The quota filter **skips entirely** when the org can't be resolved, so this traffic has no org-wide ceiling — only per-URL limits, which ID rotation defeats.
+- **C2 — org × path.** Which cleanroom of which customer. Available in Prometheus because the `path` tag was kept.
+- **D1 / D2 — alert on these.** `outcome=ERROR` means the limiter decided to reject but the client didn't get a 429. `"Error during rate limiting check"` means Redis threw, `onErrorResume` returned `Mono.empty()`, and **the request was allowed through** — fail-open, with nothing else signalling it.
+- **E2 — cross-tenant access attempts.** Already in production, parseable today, dashboarded nowhere.
+
+## 9. Two things must be verified before the dashboards work
+
+1. **Are gateway logs in Loki?** `{cluster="eks-admin-prod"} |= "Rate limit exceeded"`
+2. **Are gateway metrics in Grafana?** `rate_limit_exceeded_total` — if empty, this is the collection-path gap: `monitoring-k8s` sets `prometheusOperatorObjects.enabled: false` (ServiceMonitors not consumed) and the app charts carry no `prometheus.io/scrape` annotation. **A config fix, not a code fix.** Every panel has a Loki variant meanwhile.
+
+Datadog sections are all log-based, since the same annotation gap likely means Datadog has the logs but not these metrics.
+
+## 10. Merge readiness
 
 | Check | State |
 |---|---|
-| `check-labels` | ❌ → ✅ — was the **only** red check; missing SOC2 label, `change/standard` added |
+| `check-labels` | ❌ → ✅ — was the only red check; `change/standard` added |
 | `build`, Snyk × 6 | ✅ |
-| Local `mvn test` | ✅ 13 tests, 0 failures |
-| Merge with `main` | clean; 3 commits behind, **zero overlap** with rate-limiter files |
+| Local `mvn test` | ✅ 13 tests |
+| Merge with `main` | clean |
 | Reviews | 0 — `REVIEW_REQUIRED` |
 
-### The real pre-merge risk
+**The real pre-merge risk:** two log message strings changed shape (`"Path rate limit exceeded for path: {}"` and `"Quota exceeded. organizationId={}"`). Any Datadog monitor matching those literals **stops firing**, and a silent monitor is indistinguishable from "no problems." A grep of `dyogram` and all locally checked-out repos found nothing referencing them or `rate_limit_exceeded`, but monitors usually live in the Datadog UI. **Someone with Datadog access must confirm.** Same class of check for the `key` → `organization_id` tag rename on the quota counter.
 
-Two **log message strings changed shape**:
+## 11. Open questions
 
-```
-"Path rate limit exceeded for path: {}"   →  "Rate limit exceeded limitType=path, …"
-"Quota exceeded. organizationId={}"       →  "Rate limit exceeded limitType=quota, …"
-```
+- Does any Datadog monitor match the two old log strings? (blocking)
+- Are gateway logs and metrics actually reaching Grafana? (§9)
+- Four commits, with the tag design moving twice — squash on merge, or keep the history that records why?
 
-Any Datadog monitor matching those literals **stops firing** — and a silent monitor is indistinguishable from "no problems." A grep of `dyogram` and all locally checked-out repos found nothing referencing them or `rate_limit_exceeded`, but monitors usually live in the Datadog UI, not git. **Someone with Datadog access must confirm before merge.** Same class of check for the `key` → `route` tag rename.
+## 12. Next steps
 
-## 10. Open questions
-
-- Is `GATEWAY_PREDICATE_MATCHED_PATH_ATTR` actually populated at filter order −1 in a routed request? Tests set it by hand. If not, every series tags `route="NOT_FOUND"` — safe but useless. **Post-deploy check:** `sum by (route) (rate(rate_limit_exceeded_total{source="Path"}[5m]))`.
-- Does any Datadog monitor match the two old log strings?
-- Two commits, the second partly reversing the first (`status=429` → `outcome=REJECTED`) — squash on merge, or keep the history?
-
-## 11. Next steps
-
-1. Datadog monitor check on the two old strings (blocking).
-2. Request reviewers — none assigned yet.
-3. Merge, then verify the `route` tag isn't universally `NOT_FOUND`.
-4. Build the top-offenders-by-org panel, now that the org is in the log.
+1. Datadog monitor check (blocking).
+2. Request reviewers — none assigned.
+3. Run the two verification queries; if metrics are absent, fix the scrape config.
+4. Build the dashboard from the queries file, starting with A4, B2, D1, D2.
 5. Consider the same treatment for `HeaderRateLimitFilter`, untouched by this PR.
 
-## 12. Key takeaways
+## 13. Key takeaways
 
-1. Metrics answer *how much*, logs answer *who*. Never put a customer ID in a metric tag.
+1. Metrics answer *how much*, logs answer *who*. Choose deliberately which tier carries each dimension.
 2. Every metric tag value is a permanent object — in the JVM *and* in Prometheus.
-3. If you plan to strip part of a tag value at query time, it shouldn't be in the tag.
+3. Before rejecting a tag on cardinality grounds, **do the arithmetic**. Here the enforcement design (full initial bucket + quota short-circuit) bounded it far better than intuition suggested.
 4. Log what you **know**, not what you **assume**.
 5. Check return values — `setStatusCode` returning `boolean` isn't decoration.
-6. Match existing conventions; consistency is what makes cross-service queries possible.
+6. Changing a log message shape silently breaks monitors matching the old literal. Grep is necessary but not sufficient.
