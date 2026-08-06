@@ -1,0 +1,121 @@
+================================================================================
+WHY RAW PATHS IN METRIC TAGS COST MONEY
+And why "we can just strip the UUIDs in Grafana" does not work
+Written 2026-08-06 · context: api-gateway PR #95
+================================================================================
+
+THE QUESTION
+------------
+  "The earlier metric had 3f2a91c4 (the cleanroom id) and the question id, and
+   now we don't have those. We can strip them in Grafana anyway when building
+   the dashboard — so why was the earlier metric bad?"
+
+  Fair question. The answer is that stripping at query time is TOO LATE,
+  because the cost is paid three steps earlier.
+
+
+WHERE THE COST IS ACTUALLY PAID
+--------------------------------
+  metric emitted -> Micrometer registry -> /actuator/prometheus -> Prometheus -> YOUR QUERY
+                    (JVM heap)             (scrape payload)        (TSDB)        (label_replace)
+                    ^^^^ cost              ^^^^ cost               ^^^^ cost      ^^^^ too late
+
+  1. JVM HEAP — inside the gateway process
+     MetricsService.incrementCounter calls Metrics.counter(name, tags), which
+     CREATES AND PERMANENTLY RETAINS a Counter object per unique tag set for
+     the life of the process. 50,000 distinct throttled URLs = 50,000 live
+     Counter objects that are never freed.
+     That is a memory leak in the gateway itself, before Prometheus is involved.
+
+  2. SCRAPE PAYLOAD
+     Every series is one line in the /actuator/prometheus response,
+     re-serialised every 30 seconds (metrics.serviceMonitor.interval: 30s).
+     Series count directly inflates scrape size and scrape duration.
+
+  3. PROMETHEUS / GRAFANA CLOUD
+     Memory and billing are driven by ACTIVE SERIES. label_replace() still has
+     to load every one of them before it can rewrite the label, so the query
+     gets slower too — you pay the full cost and then throw the detail away.
+
+
+WHY THIS METRIC IN PARTICULAR IS DANGEROUS
+-------------------------------------------
+  rate_limit_exceeded only increments ON REJECTION.
+  Rejections spike during a flood.
+  A client enumerating resource ids — the exact abuse this work exists to
+  detect — creates thousands of new series in minutes.
+
+  THE METRIC EXPLODES PRECISELY WHEN YOU NEED TO READ IT, and the explosion
+  degrades the same Prometheus you are trying to read the dashboard from.
+
+  A normal high-cardinality mistake leaks slowly. This one is triggered by the
+  attack.
+
+
+BUT YOU DID NOT LOSE THE IDs
+-----------------------------
+  PathRateLimitFilter.java:112-113 still logs the raw path:
+
+      log.warn("Rate limit exceeded limitType=path, organizationID={}, "
+             + "route={}, method={}, outcome=REJECTED, path={}",
+              orgId, route, method.name(), path);
+                                           ^^^^ RAW path, UUIDs and all
+
+  The full path is recorded on EVERY rejection. It moved from the metric to the
+  log. Logs charge per line written, not per distinct value, so high
+  cardinality is free there.
+
+  THE PRINCIPLE
+      METRICS  bounded labels, aggregate counts, "how many?"
+               cheap to store, fast to query, safe to alert on
+      LOGS     unbounded detail, individual events, "which one?"
+               cheap per event, searchable, terrible to aggregate at scale
+
+  This PR did not delete information. It moved the high-cardinality detail to
+  the tier that can afford it.
+
+
+WHAT EACH ANSWERS IN GRAFANA
+-----------------------------
+  "Which routes are being throttled, and how hard?"  — Prometheus, fast, cheap
+      sum by (route, method) (rate(rate_limit_exceeded_total{source="Path"}[5m]))
+
+  "Which limiter fired — path rule or org quota?"
+      sum by (source) (rate(rate_limit_exceeded_total[5m]))
+
+  "Which specific cleanrooms?" — Loki, when you actually need the detail
+      topk(20, sum by (path) (count_over_time(
+        {service_name="api-gateway"} |= "Rate limit exceeded"
+          | json | line_format "{{.message}}"
+          | pattern `<_>path=<path>` [1h])))
+
+  "Which organization?" — ONLY POSSIBLE AFTER THIS PR
+      topk(10, sum by (organizationID) (count_over_time(
+        {service_name="api-gateway"} |= "Rate limit exceeded"
+          | json | line_format "{{.message}}"
+          | pattern `<_>organizationID=<organizationID>,<_>` [1h])))
+
+  "Which org AND which cleanroom, together?"
+      sum by (organizationID, path) (count_over_time(
+        {service_name="api-gateway"} |= "Rate limit exceeded"
+          | json | line_format "{{.message}}"
+          | pattern `<_>organizationID=<organizationID>, route=<route>, method=<method>, outcome=<outcome>, path=<path>` [1h]))
+
+  Net: the dashboard becomes MORE answerable, not less. You gained the
+  organization, and kept the resource ids where they are affordable.
+
+
+THE GENERAL RULE
+----------------
+  Before adding a tag to any metric, ask:
+      "How many distinct values can this take, across the lifetime of the
+       process, worst case?"
+
+  SAFE as a metric tag       route template, method, status, outcome, service,
+                             environment, limit type   (bounded, tens)
+  NEVER as a metric tag      organization id, customer id, user id, request id,
+                             trace id, raw URL containing an id
+  FINE as a log field        all of the above
+
+  Corollary: if you find yourself planning to strip part of a tag value at
+  query time, that part should not have been in the tag.

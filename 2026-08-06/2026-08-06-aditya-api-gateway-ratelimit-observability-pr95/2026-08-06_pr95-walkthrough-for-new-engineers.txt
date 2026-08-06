@@ -1,0 +1,368 @@
+================================================================================
+API GATEWAY PR #95 — WALKTHROUGH FOR A NEW ENGINEER
+deklareddotcom/api-gateway  ·  branch DV-observability/path-ratelimit-org-attribution
+Written 2026-08-06
+================================================================================
+
+WHAT THIS PR IS
+  A pure-observability change. It makes rate-limit rejections answer
+  "which customer?", and fixes an unbounded-cardinality Prometheus metric that
+  was live in production.
+
+  NO throttling behaviour changes. No limits, buckets, thresholds or request
+  outcomes are touched. Only what gets RECORDED changes.
+
+FILES
+  PathRateLimitFilter.java             log the org; bound the metric route tag
+  AbstractRateLimitFilter.java         attributable failure logs; check a
+                                       discarded return value
+  QuotaRateLimitFilter.java            one line — align the message shape
+  PathRateLimitFilterTelemetryTest.java  NEW — there was no test for this filter
+
+
+TERMS YOU NEED FIRST
+--------------------
+  ServerWebExchange   one object holding everything about a single request and
+                      its response. Also carries an ATTRIBUTES map — a
+                      scratchpad where framework components leave notes for
+                      each other.
+  Mono<Void>          reactive: "this will finish later, with no value".
+                      .flatMap(x -> ...) = "when it arrives, do this next".
+  time series         a metric name PLUS one specific set of tag values.
+                      rate_limit_exceeded{route="/v1/**"} and
+                      rate_limit_exceeded{route="/v2/**"} are TWO series,
+                      stored separately, forever.
+  cardinality         how many distinct values a tag can take. High
+                      cardinality = many series = memory and money.
+
+
+CHANGE 1 — final String orgId          PathRateLimitFilter.java:93
+--------------------------------------------------------------------
+  Pure Java mechanics, not architecture.
+
+  Line 99 opens a lambda: .flatMap(response -> { ... }). Java requires that a
+  lambda only capture local variables that are EFFECTIVELY FINAL — assigned
+  exactly once.
+
+  organizationId is assigned TWICE earlier in the method:
+      organizationId = getOrganizationIdFromRequest(exchange);
+      if (organizationId == null || organizationId.isEmpty()) {
+          organizationId = "ALL";
+      }
+
+  So it cannot be captured. The compiler error was literally:
+      local variables referenced from a lambda expression must be final or
+      effectively final
+
+  final String orgId = organizationId; creates a once-assigned copy the lambda
+  can use.
+
+  WHY DIDN'T THE OLD CODE NEED IT?  Because the lambda never used the org.
+  That IS the bug this PR fixes.
+  QuotaRateLimitFilter already had this exact line; the pattern was copied.
+
+  WITHOUT THIS CHANGE: it does not compile. Nothing else.
+
+
+CHANGE 2 — metric tag: raw path -> matched route
+  PathRateLimitFilter.java:101-102, 178-186        (the most important change)
+--------------------------------------------------------------------------
+  BEFORE
+      Tags tags = createTags(GatewayConstants.SOURCE_PATH, path);
+      private Tags createTags(String source, String key) {
+          return Tags.of("source", source, "key", key);
+      }
+  where path = exchange.getRequest().getURI().getPath()  — the RAW url:
+      /v1/cleanrooms/3f2a91c4-.../questions/8c1b7e90-...
+
+  AFTER
+      String route = matchedRoute(exchange);
+      Tags tags = createTags(GatewayConstants.SOURCE_PATH, route, method.name());
+
+      private String matchedRoute(ServerWebExchange exchange) {
+          Object attr = exchange.getAttribute(
+              ServerWebExchangeUtils.GATEWAY_PREDICATE_MATCHED_PATH_ATTR);
+          String route = attr != null ? attr.toString() : null;
+          return StringUtils.hasLength(route) ? route : UNKNOWN_ROUTE;
+      }
+
+  THE PROBLEM
+      The counter increments at line 114, inside the rejection branch. So
+      BEFORE this PR, every distinct URL that was ever throttled created a
+      permanent new Prometheus time series.
+
+      BEFORE — one series per RESOURCE
+        rate_limit_exceeded{source="Path", key="/v1/cleanrooms/3f2a91c4-.../questions/8c1b7e90-..."}
+        rate_limit_exceeded{source="Path", key="/v1/cleanrooms/9d8e77b2-.../questions/1a4c2f90-..."}
+        ... grows with the number of RESOURCES
+
+      AFTER — one series per ROUTE + METHOD
+        rate_limit_exceeded{source="Path", route="/v1/cleanrooms/**", method="POST"}
+        ... bounded by the number of CONFIGURED ROUTES (a few dozen)
+
+  THE VICIOUS PART
+      This metric only fires on rejection. Rejection happens during a flood. A
+      client enumerating resource ids — the exact abuse scenario this work
+      exists to detect — creates thousands of series in minutes.
+      The metric explodes precisely when you need to read it.
+
+  WHAT IS GATEWAY_PREDICATE_MATCHED_PATH_ATTR?
+      When Spring Cloud Gateway matches a request to a route, the path
+      predicate stores the PATTERN it matched (not the URL) on the exchange
+      attribute scratchpad:
+          request:   /v1/cleanrooms/3f2a91c4-.../questions/8c1b7e90-...
+          attribute: "/v1/cleanrooms/**"      <- from route config, bounded
+
+      This is not a new idea in this codebase.
+      http/metrics/RouteIdWebFluxTagContributor.java:19 already reads the same
+      attribute and calls it "the matched gateway route as a low-cardinality
+      key". Using the same source means the route tag on rate_limit_exceeded
+      AGREES with the route tag on http_server_requests, so they can be
+      overlaid on one dashboard.
+
+  DEFAULT RETURN VALUE
+      matchedRoute returns the literal string "NOT_FOUND" (constant declared at
+      line 27) when the attribute is absent or empty. Two reasons it is not
+      null:
+        1. Tags.of(...) with a null value throws — that would turn a rate-limit
+           rejection into a 500 crash.
+        2. It collapses all unmatched requests into ONE bounded series instead
+           of creating garbage.
+      RouteIdWebFluxTagContributor:22 uses the identical "NOT_FOUND" string.
+      Covered by PathRateLimitFilterTelemetryTest.rejectionFallsBackToNotFound...
+
+  WHY method WAS ADDED
+      method.name() has at most ~7 values. Bounded tags are free, and it lets
+      you separate read throttling from write throttling.
+
+  ALTERNATIVES
+      keep raw path            -> the bug
+      drop the route tag       -> viable; http_server_requests{route,status=429}
+                                  already gives per-route 429s. Rejected because
+                                  it forces a two-metric join to answer "which
+                                  limiter fired on which route".
+      tag with organizationID  -> REJECTED. org x route x method multiplies out.
+                                  Org goes in the log instead.
+      matched route pattern    -> CHOSEN. Bounded, and matches existing
+                                  codebase precedent.
+
+  TRADE-OFF (stated in the PR body)
+      The key tag is RENAMED to route for the Path filter. Any dashboard
+      querying rate_limit_exceeded{key=...} breaks. Given key held raw URLs,
+      it is unlikely anything queried it usefully — but it is a breaking change.
+
+
+CHANGE 3 — the log line gains the organization
+  PathRateLimitFilter.java:112-113
+------------------------------------------------
+  BEFORE
+      log.warn("Path rate limit exceeded for path: {}", path);
+  AFTER
+      log.warn("Rate limit exceeded limitType=path, organizationID={}, route={}, "
+             + "method={}, outcome=REJECTED, path={}",
+              orgId, route, method.name(), path);
+
+  WHY
+      The entire point of the project: "which customer is hammering us?"
+      You cannot answer that if the rejection log does not name the customer.
+
+      The maddening part: organizationId was ALREADY in scope. Line 94 uses it
+      to build the Redis bucket key:
+          isAllowed("api_path_method_organization",
+                    path + ":" + method + ":" + organizationId)
+      The code knew who it was throttling. It just never said so.
+
+  WHY key=value FORMAT
+      Datadog auto-extracts key=value pairs from a message into searchable
+      FACETS. Loki parses it with | pattern in one line.
+      Auth0Service.java:75 in external-api-server already uses this shape, so
+      matching it means ONE Datadog facet and ONE Grafana variable cover both
+      services. organizationId (lowercase d) would have created a second field
+      for the same concept.
+
+  WHY LOG IT INSTEAD OF TAGGING THE METRIC
+      METRICS answer "how much?" — cheap, bounded tags, aggregated
+      LOGS    answer "who?"      — one line per event, unlimited distinct values
+
+      As a metric tag: 500 orgs x 30 routes x 7 methods = 105,000 potential
+      series. As a log field: zero extra cost, the line is written anyway.
+      This reasoning is a comment at lines 104-106 so the next person does not
+      "helpfully" add the tag.
+
+  WHY outcome=REJECTED AND NOT status=429
+      The first version wrote status=429. A reviewer challenged it and was right.
+
+      line 112   log "status=429"        <- claims the answer
+      line 114   counter++
+      line 115   handleRateLimitExceeded <- DECIDES the answer, may be 500
+
+      The log asserted something not yet decided. outcome=REJECTED states what
+      IS certain at that line — the limiter said no.
+
+      HONEST FOOTNOTE (also in the Javadoc): while writing a test for that 500
+      path, it turned out to be UNREACHABLE — RedisRateLimiter.Response's
+      constructor asserts headers are non-null. So no wrong data was ever
+      emitted; status=429 was accurate by accident of a constructor three
+      classes away, not by anything the log site could guarantee. The test was
+      deleted rather than kept as one that cannot fail. The rename stands
+      because it removes the coupling: if someone later returns 503 for quota
+      exhaustion, the log will not silently start lying.
+
+
+CHANGE 4 — AbstractRateLimitFilter.java:48-61
+----------------------------------------------
+  This is the shared "actually reject the request" method used by all three
+  limiters (Path, Quota, Header).
+
+  4a — THE FAILURE LOG WAS ANONYMOUS
+      BEFORE  log.warn("Rate limiter response or headers are missing");
+      AFTER   log.warn("Rate limit rejection could not be completed "
+                     + "limitType={}, path={}, outcome=ERROR, "
+                     + "reason=MISSING_LIMITER_HEADERS",
+                       getRateLimitSource(),
+                       exchange.getRequest().getURI().getPath());
+
+      The old message told you nothing. Which limiter? Which request? You would
+      see it and have no next step.
+
+      getRateLimitSource() is an abstract method each subclass implements
+      (PathRateLimitFilter.java:163-165 returns "Path"), so the parent can name
+      the child with no extra plumbing.
+
+      outcome=ERROR vs the caller's outcome=REJECTED lets a dashboard tell
+      "we throttled someone" apart from "we tried to throttle someone and
+      failed" — very different operational meanings.
+
+  4b — THE DISCARDED RETURN VALUE
+      BEFORE  exchange.getResponse().setStatusCode(HttpStatus.TOO_MANY_REQUESTS);
+      AFTER   if (!exchange.getResponse().setStatusCode(HttpStatus.TOO_MANY_REQUESTS)) {
+                  log.warn("... reason=RESPONSE_ALREADY_COMMITTED", ...);
+              }
+
+      ServerHttpResponse.setStatusCode(...) returns a BOOLEAN. Spring's
+      contract: returns false if the status was NOT set because the response is
+      already committed ("committed" = bytes already going to the client, so
+      headers and status are frozen).
+
+      The old code threw that away. If it were ever false, execution sailed on
+      to setComplete() and the client got whatever status was already set — NOT
+      a 429 — with zero trace.
+
+      LIKELIHOOD: low. These filters run at order -2 and -1, before routing, so
+      nothing should have written a response yet. But it is a free check, and
+      "silently did not throttle" is a bad thing to have no signal for.
+
+      NOTE it logs and CONTINUES rather than throwing. If the status cannot be
+      set there is nothing better to do; throwing would make it worse.
+
+      CAN THIS CHANGE BEHAVIOUR? NO. The if body contains only a log — no
+      return, no throw, no state change. Same method, same argument, every
+      subsequent line runs identically. The only observable difference is one
+      WARN line in a case that was previously completely silent.
+
+
+RUNTIME WALKTHROUGH — ONE REAL REQUEST
+---------------------------------------
+  POST /v1/cleanroom-questions/8c1b7e90-.../create-run, org abc-123,
+  bucket already empty.
+
+  BEFORE
+    1  path   = "/v1/cleanroom-questions/8c1b7e90-.../create-run"  (raw)
+    2  method = POST
+    3  orgId  = "abc-123"        <- resolved, then discarded
+    4  Redis    bucket ".../create-run:POST:abc-123" -> 0 tokens
+    5  LOG      "Path rate limit exceeded for path: /v1/.../create-run"
+                 ^ no org. Cannot answer "who?"
+    6  METRIC   rate_limit_exceeded{source="Path", key="/v1/.../8c1b7e90-.../create-run"}
+                 ^ BRAND NEW SERIES. Next request, different id -> another one.
+    7  RESPONSE 429
+
+  AFTER
+    1-4  identical — no behaviour change
+    5    route  = "/v1/cleanroom-questions/**"    <- from exchange attribute
+    6    LOG      "Rate limit exceeded limitType=path, organizationID=abc-123,
+                   route=/v1/cleanroom-questions/**, method=POST,
+                   outcome=REJECTED, path=/v1/.../8c1b7e90-.../create-run"
+                 ^ org present. Raw path still logged for humans, just not tagged.
+    7    METRIC   rate_limit_exceeded{source="Path",
+                                      route="/v1/cleanroom-questions/**",
+                                      method="POST"}
+                 ^ SAME series next time. Bounded.
+    8    handleRateLimitExceeded: headers non-null OK; setStatusCode -> true;
+         add X-RateLimit-* headers; setComplete()
+    9    RESPONSE 429
+
+
+DEBUGGING GUIDE
+---------------
+  BREAKPOINTS
+    PathRateLimitFilter:93    is orgId real, or "ALL"? "ALL" = no JWT org claim
+                              AND no LR-Org-ID header
+    PathRateLimitFilter:94    the exact bucket key sent to Redis
+    PathRateLimitFilter:101   is route a pattern, or "NOT_FOUND"?
+    PathRateLimitFilter:103   is response.isAllowed() what you expect?
+    PathRateLimitFilter:115   entering the shared rejection path
+    AbstractRateLimitFilter:49  the theoretically-unreachable branch. Landing
+                                here means a non-RedisRateLimiter got wired in.
+    AbstractRateLimitFilter:55  did setStatusCode return false? Something
+                                committed the response earlier.
+
+  LOG SEARCHES
+    "Rate limit exceeded"                  normal rejections (outcome=REJECTED)
+    "outcome=ERROR"                        we FAILED to reject properly <- ALERT
+    "route=NOT_FOUND"                      route attribute missing
+    "Organization ID is missing for path"  org unresolvable
+    "Error during rate limiting check"     Redis failed. NOTE lines 96-97 return
+                                           Mono.empty(), so flatMap never runs
+                                           and the request PASSES. Redis down =
+                                           throttling silently OFF (fail-open,
+                                           predates this PR).
+
+  REDIS
+    # the config that supplied the numbers
+    HGETALL 'rate-limit:PATH:REGEX:<UPPERCASED_KEY>:POST:ORG_abc-123'
+    # the live token bucket
+    GET 'request_rate_limiter.{/v1/.../create-run:POST:abc-123}.tokens'
+    GET 'request_rate_limiter.{/v1/.../create-run:POST:abc-123}.timestamp'
+
+  METRIC CHECK AFTER DEPLOY
+    If rate_limit_exceeded series count keeps climbing with traffic, then
+    matchedRoute is returning something unbounded and the fix did not take.
+
+
+BEFORE vs AFTER
+---------------
+                        BEFORE                         AFTER
+  who was throttled?    unanswerable                   organizationID= in log
+  which route?          raw URL with UUIDs             bounded route pattern
+  Prometheus series     one per throttled URL          one per route+method
+  failed rejection      anonymous one-line warning     limitType, path,
+                                                       outcome=ERROR, reason=
+  setStatusCode false   silent                         logged
+  throttling behaviour  --                             IDENTICAL
+
+
+WHAT WOULD BREAK WITHOUT THIS CHANGE
+-------------------------------------
+  1. "Top orgs by 429" cannot be built. The dashboard the project exists for
+     is impossible.
+  2. Prometheus degrades under attack. Series grow with resource count, and the
+     blast radius peaks during the abuse you are trying to observe.
+  3. A failed rejection is invisible. You would never learn that a 429 silently
+     became a 500.
+
+
+KEY TAKEAWAYS FOR A NEW ENGINEER
+---------------------------------
+  1. Metrics answer "how much", logs answer "who". Never put a customer id in a
+     metric tag; never expect a log to aggregate cheaply.
+  2. Every metric tag value is a permanent object. Ask "how many distinct values
+     can this take?" before adding a tag. A UUID = never.
+  3. Log what you KNOW, not what you ASSUME. outcome=REJECTED was certain at
+     that line; status=429 was a prediction about code that had not run.
+  4. Check return values. setStatusCode returning boolean is not decoration.
+  5. Match existing conventions — RouteIdWebFluxTagContributor for the route
+     attribute, QuotaRateLimitFilter for the final capture, Auth0Service for
+     organizationID=. Consistency is what makes cross-service queries possible.
+  6. Write the reasoning down. The comments at lines 104-111 exist so the next
+     person does not re-add the org tag "to be helpful".
