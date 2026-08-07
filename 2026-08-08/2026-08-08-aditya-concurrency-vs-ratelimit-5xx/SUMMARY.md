@@ -87,6 +87,8 @@ The missing control is a **concurrency cap**, not a better rate limit. Fixes, in
 **Primary fix = concurrency limit at api-gateway.** Rate limits count arrivals/sec; add a cap on *simultaneous in-flight per org*. Spring Cloud Gateway supports request-limiting beyond the token bucket.
 **Equally important = timeouts at external-api-server** so a slow downstream fails fast instead of pinning a thread for 17s. A rate limit + a concurrency limit + tight timeouts together close the gap; any one alone doesn't.
 
+> **Refinement (see [the-fix-concurrency-limits-and-timeouts.txt](the-fix-concurrency-limits-and-timeouts.txt)):** a *per-org* cap alone does **not** protect the shared backend — 26 orgs × 30 = 780 still drowns it (26 × a 20-cap = 520 > ~200 threads). You need a **global** in-flight cap sized to backend capacity (survival) **plus** a per-org cap (fairness). And the rejection is **not** automatically 429 — choose it; prefer **`503 + Retry-After`** and keep it distinct from the rate-limit 429 on dashboards.
+
 ---
 
 ## 6. The observability change shipped this session — external-api-server PR #353

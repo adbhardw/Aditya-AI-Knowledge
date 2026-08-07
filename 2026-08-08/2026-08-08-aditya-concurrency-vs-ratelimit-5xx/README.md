@@ -13,6 +13,11 @@ requests in flight at once exhausted the backend's thread pool.
 - **[concurrency-vs-ratelimit-explained.txt](concurrency-vs-ratelimit-explained.txt)** —
   the plain-language walkthrough: concurrent vs parallel, why `ab` reuses connections but
   `xargs -P` opens new ones, why queuing doesn't help slow requests, and the fix table.
+- **[the-fix-concurrency-limits-and-timeouts.txt](the-fix-concurrency-limits-and-timeouts.txt)** —
+  the fix in depth: why a per-org cap alone fails against many orgs summing up (26 × 30 = 780),
+  the **global vs per-org** cap distinction, why the backend thread pool is a *bad* global cap,
+  what status to return (**not** automatically 429 — prefer `503 + Retry-After`, kept distinct
+  from the rate 429), and the full fix by service with implementation order.
 
 ## Headline
 
@@ -28,10 +33,12 @@ pinned → Tomcat (~200 threads) exhausted → `502`/`500`. The number that matt
 
 ## The fix, and at which service
 
-**Primary:** a **per-org concurrency limit at the api-gateway** (rate limits count arrivals/sec;
-this caps simultaneous in-flight). **Equally important:** **downstream timeouts at
-external-api-server** so slow calls fail fast instead of pinning a thread. Rate + concurrency +
-timeouts together close the gap; any one alone doesn't.
+**Primary:** a **global in-flight cap at the api-gateway** sized to backend capacity (a *per-org*
+cap alone doesn't help — 26 orgs × 30 = 780 still drowns the backend), plus a per-org cap for
+fairness, returning **`503 + Retry-After`** (not a blurred 429). **Equally important:** **downstream
+timeouts at external-api-server** so slow calls fail fast instead of pinning a thread. Rate +
+concurrency + timeouts together close the gap; any one alone doesn't. Full detail in
+[the-fix-concurrency-limits-and-timeouts.txt](the-fix-concurrency-limits-and-timeouts.txt).
 
 ## Related
 

@@ -1,0 +1,183 @@
+================================================================================
+THE FIX — CONCURRENCY LIMITS, TIMEOUTS, AND WHAT ERROR TO RETURN
+Companion to SUMMARY.md and concurrency-vs-ratelimit-explained.txt
+Date 2026-08-08
+================================================================================
+
+THE PROBLEM BEING FIXED (recap)
+  A per-second RATE limit does not cap CONCURRENCY. ~150 slow requests in flight
+  at once exhausted the backend thread pool -> 502/500 for EVERYONE on that
+  backend, not just the flooder. The missing control is a limit on how many
+  requests are IN FLIGHT at the same instant.
+
+
+================================================================================
+1. YOU NEED TWO CONCURRENCY LIMITS, NOT ONE
+================================================================================
+
+  A per-ORG cap alone does NOT protect the shared backend. Example:
+    backend holds ~200 concurrent (thread pool)
+    26 orgs, each capped at 20 in flight
+    -> aggregate = 26 x 20 = 520 in flight
+    -> 520 >> 200 -> backend STILL falls over
+
+  Each org is individually under its cap, but the SUM drowns the backend.
+
+  LIMIT              JOB                              SIZED TO
+  ---------------------------------------------------------------------------
+  GLOBAL / aggregate SURVIVAL - protect the backend  backend capacity (~150-180,
+    in-flight cap                                    below the ~200 thread pool,
+                                                     with headroom)
+  PER-ORG in-flight  FAIRNESS - stop one org eating  a share of the global
+    cap              the whole global budget
+
+  - GLOBAL alone  -> one greedy org consumes all 200, starves everyone (unfair)
+  - PER-ORG alone -> 26 x 20 = 520 overwhelms the backend (the 780 scenario)
+  - BOTH          -> total never exceeds ~150 (backend healthy) AND no single
+                     org takes more than its share
+
+  With both, "780 requests arrive" becomes: ~150 allowed in flight (backend
+  fine), the other ~630 rejected fast, spread fairly across the pushiest orgs.
+
+  SUBTLE TENSION: a STATIC per-org cap wastes capacity when few orgs are active
+  (if only org A is online, why cap it at 20 when the backend could take 150?).
+  Mature setups make the global cap the hard backstop and the per-org share
+  DYNAMIC (each active org gets a fair slice of the CURRENT global budget). Start
+  with static; refine to dynamic later.
+
+
+================================================================================
+2. THE BACKEND ALREADY HAS A GLOBAL CAP - A BAD ONE
+================================================================================
+
+  external-api-server's thread pool (~200) IS a global concurrency limit. That
+  is exactly why it broke: when 780 hit it, it did not reject cleanly - it
+  queued, timed out, and 502'd, taking every tenant down.
+
+  The point of a GATEWAY global cap is to move that limit UPSTREAM and make it
+  fail GRACEFULLY:
+
+    WITHOUT: 780 -> backend thread pool (200) -> overwhelmed -> slow 502s, crash
+    WITH:    780 -> gateway global cap (150)  -> 150 pass, 630 fast rejects
+                                              -> backend never sees the overload
+
+  Same ceiling, but the gateway rejects the excess BEFORE it touches the backend
+  - a cheap instant reject instead of a slow catastrophic 502.
+
+
+================================================================================
+3. WHAT ERROR TO RETURN, AND WHY IT IS NOT AUTOMATICALLY 429
+================================================================================
+
+  429 is the RATE limiter's default. A concurrency / load-shed rejection is a
+  status YOU choose - nothing returns it automatically.
+
+  MECHANISM                              DEFAULT
+  ---------------------------------------------------------------------------
+  existing rate limiter                  429 Too Many Requests, rate headers,
+    (handleRateLimitExceeded)            empty body
+  Resilience4j bulkhead (concurrency)    throws BulkheadFullException -> if
+                                         unhandled, 500; configure to 429 or 503
+  custom in-flight counter filter        whatever you set
+
+  TWO SENSIBLE CHOICES
+    429 Too Many Requests  - "you are sending too much, back off". Consistent
+                             with the existing rate-limit 429; clients already
+                             handle it.
+    503 Service Unavailable + Retry-After - "service at capacity, try later".
+                             The semantically correct code for LOAD SHEDDING
+                             (the problem is capacity, not your request count).
+
+  RECOMMENDED: 503 + Retry-After for the concurrency cap, because it is a
+  DIFFERENT condition from the rate limit and you want to tell them apart.
+
+  EXAMPLE RESPONSE
+    HTTP/1.1 503 Service Unavailable
+    Retry-After: 2
+    X-Reject-Reason: concurrency-limit
+    { "error": "Service at capacity, please retry" }
+
+  Retry-After matters: it tells a well-built client exactly how long to wait, so
+  it backs off instead of hammering.
+
+  DO NOT BLUR THE TWO INTO A BARE 429
+    If the concurrency reject and the rate reject both return a plain 429, your
+    "429 by org" dashboard mixes two unrelated problems:
+      - org exceeded its RATE (sending too fast)
+      - backend at CAPACITY (too many in flight)
+    They have different fixes. Distinguish them: 503 for concurrency vs 429 for
+    rate, OR keep both 429 but add a marker (a header / log field like the
+    source= tag from api-gateway PR #95).
+
+  WITH-CAP vs WITHOUT-CAP FAILURE
+    WITH cap:    deliberate 503/429 + Retry-After, instant, clear signal,
+                 only the over-limit traffic affected
+    WITHOUT cap: uncontrolled 502/504/000, slow, ambiguous, client often retries
+                 immediately (worsening it), EVERY tenant on the backend affected
+
+  The error does not disappear - it becomes FAST, DELIBERATE and SELF-DESCRIBING
+  instead of SLOW, AMBIGUOUS and CONTAGIOUS. A client can act on 503+Retry-After;
+  it cannot act on a dead backend.
+
+
+================================================================================
+4. THE FULL FIX, BY SERVICE
+================================================================================
+
+  FIX                                    SERVICE              STOPS
+  ---------------------------------------------------------------------------
+  GLOBAL in-flight cap  ***PRIMARY***    api-gateway          the 780 total -
+    (aggregate across all orgs, sized                         many orgs summing
+    to backend capacity, return 503 +                         up and drowning
+    Retry-After)                                              the backend
+  PER-ORG in-flight cap                  api-gateway          one org
+    (fairness; a share of the global)                         monopolizing
+  Gateway -> backend response timeout    api-gateway          gateway hanging
+    + bulkhead (isolate a slow route)                         forever on a dead
+                                                              backend -> 502
+  Downstream gRPC timeouts + connection- external-api-server  slow calls pinning
+    pool caps (fail fast, do not pin a                        a thread for 17s
+    thread 17s)
+  ALB target-group / connection tuning   ALB (infra/TF)       accidental
+                                                              connection shedding
+
+  WHY EACH LAYER
+    - GLOBAL cap = survival of the shared backend (the real fix for 780).
+    - PER-ORG cap = fairness on top of the global budget.
+    - Gateway->backend timeout = the gateway gives up on a dead backend quickly
+      instead of holding the request (and a thread) for the full slow duration.
+    - Downstream timeouts = the ROOT of the slowness. If the gRPC call to
+      moonraker etc. returns fast (or fails fast), requests do not pile up in
+      the first place. This attacks the 5-17s latency that made everything else
+      worse.
+    - ALB tuning = make the connection-level shedding deliberate, not accidental.
+
+  ORDER TO IMPLEMENT
+    1. Downstream timeouts in external-api-server. Cheapest, attacks the root
+       (slow requests). Even alone, it shrinks how long each request holds a
+       thread, raising effective capacity.
+    2. Global in-flight cap at the gateway (503 + Retry-After). The backstop that
+       protects the backend regardless of how load is distributed across orgs.
+    3. Per-org in-flight cap for fairness.
+    4. Gateway->backend response timeout.
+    5. ALB tuning if connection-level 000s remain a concern.
+
+  Rate limit + concurrency limit + tight timeouts together close the gap. Any
+  one alone does not:
+    - rate limit only  -> the 780-concurrent-but-slow case slips under it
+    - concurrency only -> requests still hold threads for 17s (fewer, but still
+                          slow); capacity is wasted waiting
+    - timeouts only    -> fast failures, but an unbounded client can still open
+                          more connections than the backend/ALB can accept
+
+
+================================================================================
+5. ONE-LINE TAKEAWAYS
+================================================================================
+  - RATE limits count arrivals/sec; they do NOT cap how many run at once.
+  - A per-ORG cap does not protect the shared backend; you also need a GLOBAL cap.
+  - The backend thread pool is a de-facto global cap that fails BADLY (502);
+    move the limit upstream to fail GRACEFULLY (fast 503).
+  - Concurrency rejection is NOT automatically 429 - choose it; prefer
+    503 + Retry-After, and keep it distinct from the rate 429 on dashboards.
+  - Attack the root: downstream timeouts, so requests stop being slow.
