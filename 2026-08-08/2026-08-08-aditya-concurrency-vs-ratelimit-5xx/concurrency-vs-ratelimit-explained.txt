@@ -1,0 +1,154 @@
+================================================================================
+CONCURRENCY vs RATE LIMITING — WHY A RATE-LIMITED API STILL 5xx'd
+Plain-language walkthrough. Companion to SUMMARY.md.
+Date 2026-08-08
+================================================================================
+
+THE ONE-LINE ANSWER
+  A per-second RATE limit does not cap CONCURRENCY. Traffic stayed under the
+  rate limit, but ~150 slow requests were IN FLIGHT AT ONCE, and that exhausted
+  the backend's thread pool. Rate counts arrivals/sec; it says nothing about how
+  many requests are being processed simultaneously.
+
+
+THREE DIFFERENT LIMITS PEOPLE CONFUSE
+--------------------------------------
+  QUOTA        = total requests counted over time   (5,082 burst / ~5,082 day)
+                 "how many customers you serve all day"
+  RATE         = arrivals per second                (token bucket, per second)
+                 "how many customers walk in per minute"
+  CONCURRENCY  = requests in flight at the same instant
+                 "how many can SIT at once" (limited by tables = threads)
+
+  The quota was 5,082 and was NEVER the problem — we never sent 5,082.
+  The rate stayed ~10/sec — under any limit, so no 429.
+  ~150 arrived AT ONCE and each sat 5-17s. The tables filled. That is
+  concurrency, and nothing was capping it.
+
+  Restaurant: you can serve 5,000 customers in a day (quota), but if 150 walk in
+  the same minute and each stays 15 min, only your 40 tables seat them; the rest
+  are turned away at the door — even though the kitchen could do 5,000 all day.
+
+
+CONCURRENT vs PARALLEL (they are not the same)
+-----------------------------------------------
+  CONCURRENT = many things in progress, overlapping in time; some wait while
+               others move. One cook juggling 5 dishes.
+  PARALLEL   = many things executing at the very same instant on separate
+               resources (cores/threads). Five cooks, one dish each.
+
+  What hurts a server is the CONCURRENT in-flight count — how many it must hold
+  open at once — regardless of whether they truly run in parallel.
+
+
+WHY SLOW REQUESTS ARE THE MULTIPLIER
+-------------------------------------
+  Every in-flight request holds, for its WHOLE duration:
+    - a thread (Tomcat is thread-per-request, ~200 max)
+    - a connection
+    - a downstream connection (gRPC to moonraker etc.), held while it waits
+  At 5-17 seconds each, 150 simultaneous requests = 150 threads pinned for 15s.
+  The pool (~200) can't hold that many slow ones at once → it breaks.
+
+  Fast requests would be fine: they finish in ms, free the thread, the next
+  reuses it. Slow requests DON'T free the thread, so they stack up.
+
+
+THE 5 RUNS — WHAT EACH PROVED
+------------------------------
+  -Pn  = xargs -P n : n curl PROCESSES in parallel, each a NEW connection
+                      (new TLS handshake every request)
+  -c n = ab -c n    : n concurrent connections, REUSED (keep-alive) — one
+                      program managing a pool
+
+  Run 1  200 req  -P40          200 OK              40 concurrent: backend copes
+  Run 2  1000 req -P150         40x 5xx, 216x 000   150 concurrent: overwhelmed
+  Run 3  500 req  ab -c60 -k    0 fail              60 reused: copes (slow, no err)
+  Run 4  400 req  -P200         198x 000, 0 5xx     200 new conns: ALB refuses half
+  Run 5  25 req  (after 2/2)    15x 429             rate rule works, once set
+
+  THE NUMBER THAT MATTERS IS PARALLELISM, NOT TOTAL.
+    Run 1 sent 200 total, fine (40 at a time).
+    Run 4 sent 400 total, half refused (200 at a time).
+    Same-ish totals, opposite outcomes — because of how many ran AT ONCE.
+
+  "400 requests but 200 parallel": xargs -P200 with seq 400 means 400 total
+  work items, at most 200 running at any instant. As each finishes, another
+  starts. At no moment were 400 in flight — 400 total, 200 wide.
+
+
+WHY ab REUSES CONNECTIONS BUT xargs OPENS NEW ONES
+---------------------------------------------------
+  ab -k is ONE program: opens ~60 connections, and after a request finishes on
+  one, sends the NEXT request down the SAME open pipe. 500 requests ride on 60
+  long-lived connections. One handshake per connection.
+
+  xargs -P150 -I{} curl : 150 SEPARATE processes. Plain curl opens a connection,
+  does ONE request, closes, exits. Next request = new process = new connection =
+  new TLS handshake. 1000 requests = 1000 handshakes, 150 alive at a time.
+
+  So the same "concurrency" behaves worse under xargs: churning fresh
+  connections piles pressure on the ALB and TLS layers on top of the backend
+  load.
+
+
+WHERE EACH ERROR CODE COMES FROM
+---------------------------------
+  client -> ALB -> api-gateway -> external-api-server -> gRPC downstream
+
+  000  connection never established. The ALB refused it (too many at once) BEFORE
+       it reached the gateway. Load shedding at the door. (Run 4's 198.)
+  502  bad gateway. The gateway/ALB couldn't get a good response from a slow or
+       overwhelmed backend. Reached but too slow, or connection dropped.
+  500  internal error. external-api-server actually threw and caught it.
+
+  During the test: 40 total 5xx (30x502 + 10x500), ALL in Run 2 (the 1000 run).
+  Client-side counts only; server-side exact count needs the access log (PR #353).
+
+
+WHY IT CAN'T JUST QUEUE INSTEAD OF PROCESSING 150 AT ONCE
+----------------------------------------------------------
+  It DOES queue — Tomcat has maxThreads (~200 processing) + acceptCount (~100
+  waiting) + then refuse (000). But queuing does not save you here:
+
+    - 200 threads each stuck on a 15s request -> all busy for 15s.
+    - New requests queue, but must wait 15s+ for a thread to free.
+    - The gateway/ALB TIMEOUT fires before that -> client gets 502/504 even
+      though the request was "safely queued".
+    - If traffic keeps arriving, the queue itself fills -> refuse (000).
+
+  Unbounded queue = memory grows per held request -> server OOMs and dies. So
+  servers CAP the queue on purpose and refuse beyond it. Refusing fast (000) is
+  the HEALTHY failure; accepting everything and dying is the bad one.
+
+  Queuing helps a SHORT burst of FAST requests (drains quickly). It does not help
+  SUSTAINED SLOW requests — the queue fills with things that time out before
+  being served. Same failure, slower.
+
+
+HOW TO FIX IT, AND AT WHICH SERVICE
+------------------------------------
+  The missing control is a CONCURRENCY CAP, not a better rate limit.
+
+  FIX                                          SERVICE              STOPS
+  ---------------------------------------------------------------------------
+  Downstream gRPC timeouts + connection-pool   external-api-server  slow calls
+    caps (fail fast, don't pin a thread 17s)                        holding a
+                                                                    thread
+  Per-org concurrency / in-flight limit  ***   api-gateway          the actual
+    (max N requests in flight per org)         PRIMARY FIX          trigger
+  Gateway->backend response timeout +          api-gateway          gateway
+    bulkhead (isolate a slow route)                                 hanging ->502
+  ALB target-group / connection tuning         ALB (infra)          accidental
+                                                                    shedding
+
+  PRIMARY: concurrency limit at the api-gateway. Rate limits count arrivals/sec;
+  add a cap on SIMULTANEOUS in-flight per org. Spring Cloud Gateway supports
+  request-limiting beyond the token bucket.
+  EQUALLY IMPORTANT: timeouts at external-api-server so a slow downstream fails
+  fast instead of pinning a thread. Rate limit + concurrency limit + tight
+  timeouts together close the gap; any one alone does not.
+
+  THE LESSON: you were throttling RATE, but the thing that hurt you was
+  CONCURRENCY. A per-second limit does not protect against many slow requests
+  in flight at once.

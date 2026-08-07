@@ -35,6 +35,12 @@ Diagrams are Mermaid, inline in the Markdown, so they render directly on GitHub.
 
 Reverse chronological — newest first.
 
+### 2026-08-08
+
+| Folder | Summary |
+|---|---|
+| [2026-08-08-aditya-concurrency-vs-ratelimit-5xx](2026-08-08/2026-08-08-aditya-concurrency-vs-ratelimit-5xx/) — [SUMMARY](2026-08-08/2026-08-08-aditya-concurrency-vs-ratelimit-5xx/SUMMARY.md) | **Why a rate-limited API still returned 5xx during a load test, and how to fix it.** A per-second **rate** limit does not cap **concurrency**: traffic stayed ~10/sec (under the limit, no 429) but put ~150 slow requests **in flight at once**, and since each held a Tomcat thread for 5–17s, the backend's ~200-thread pool exhausted → `502`/`500`. Distinguishes the **three independent limits** — quota (5,082 burst, counted over time), rate (arrivals/sec), concurrency (in flight at once) — and shows the quota was never the binding constraint. Uses **5 load-test runs** as evidence that the *parallelism* number decides, not the total (200 req at 40-wide passed; 400 at 200-wide had half refused at the ALB as `000`). Explains **concurrent vs parallel**, why `ab -c` reuses connections while `xargs -P` opens a new one per request, and why queuing can't save slow requests (the queue fills with things that time out before a thread frees; unbounded queue → OOM, so servers refuse fast). **Fix, by service:** primary = a **per-org concurrency / in-flight limit at api-gateway**; equally important = **downstream timeouts at external-api-server** so slow gRPC calls fail fast instead of pinning a thread; plus gateway→backend response timeout and ALB tuning. Also documents the observability change shipped this session — **external-api-server PR #353** adding an `AccessLogFilter` that logs `organizationID + status + latency` per request (outermost filter, org via request attribute not MDC, WARN on 5xx) — and the full filter-chain mechanics learned (nesting, the shared response object, `FilterChainExceptionHandler`). |
+
 ### 2026-08-06
 
 | Folder | Summary |
