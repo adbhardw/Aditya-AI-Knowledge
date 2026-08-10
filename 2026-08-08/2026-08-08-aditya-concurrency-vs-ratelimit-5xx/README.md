@@ -18,6 +18,13 @@ requests in flight at once exhausted the backend's thread pool.
   the **global vs per-org** cap distinction, why the backend thread pool is a *bad* global cap,
   what status to return (**not** automatically 429 — prefer `503 + Retry-After`, kept distinct
   from the rate 429), and the full fix by service with implementation order.
+- **[2026-08-10_external-api-server-bulkhead-design.txt](2026-08-10_external-api-server-bulkhead-design.txt)** —
+  **design spec (no Java edits)** for the authoritative fix: a **Semaphore bulkhead filter** at
+  external-api-server that fast-rejects the overflow with `503 + Retry-After` once N are in flight.
+  Covers the sizing rule (bulkhead **below** `threads.max` so a thread is always free to reject),
+  exact files/config/order to add, why it belongs at the backend (per-pod thread pool = per-pod
+  limiter, sees `/v1` **and** `/internal`), the 503-not-429 choice, metrics, and dark rollout.
+  Constraint respected: **the moonraker gRPC calls are not touched.**
 
 ## Headline
 
@@ -33,12 +40,13 @@ pinned → Tomcat (~200 threads) exhausted → `502`/`500`. The number that matt
 
 ## The fix, and at which service
 
-**Primary:** a **global in-flight cap at the api-gateway** sized to backend capacity (a *per-org*
-cap alone doesn't help — 26 orgs × 30 = 780 still drowns the backend), plus a per-org cap for
-fairness, returning **`503 + Retry-After`** (not a blurred 429). **Equally important:** **downstream
-timeouts at external-api-server** so slow calls fail fast instead of pinning a thread. Rate +
-concurrency + timeouts together close the gap; any one alone doesn't. Full detail in
-[the-fix-concurrency-limits-and-timeouts.txt](the-fix-concurrency-limits-and-timeouts.txt).
+**The guarantee belongs at external-api-server** — each pod's thread pool is a per-pod resource,
+so a **per-pod bulkhead** (Semaphore filter, `503 + Retry-After`, sized below `threads.max`)
+protects it exactly, and it sees *all* traffic (`/v1` via the gateway **and** `/internal`). The
+gateway concurrency limit is complementary — cheaper early shedding + **per-org fairness** — but a
+per-gateway cap can't *guarantee* the backend number (N replicas × cap, plus non-gateway traffic).
+Design spec: [2026-08-10_external-api-server-bulkhead-design.txt](2026-08-10_external-api-server-bulkhead-design.txt).
+Full layering in [the-fix-concurrency-limits-and-timeouts.txt](the-fix-concurrency-limits-and-timeouts.txt).
 
 ## Related
 

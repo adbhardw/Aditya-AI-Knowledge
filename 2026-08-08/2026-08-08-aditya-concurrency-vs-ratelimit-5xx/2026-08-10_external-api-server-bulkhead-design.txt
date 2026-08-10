@@ -1,0 +1,187 @@
+================================================================================
+DESIGN — CONCURRENCY BULKHEAD AT external-api-server
+Fast-reject with 503 + Retry-After once N requests are in flight.
+DESIGN ONLY — no Java changes here. Constraint: do NOT touch the gRPC calls to
+moonraker etc. (the 5-17s latency stays; we make hitting capacity graceful).
+Authored 2026-08-10.
+================================================================================
+
+GOAL
+  external-api-server's Tomcat thread pool (~200) is already a de-facto
+  concurrency cap, but it fails BADLY: when full it queues -> times out -> 502
+  for everyone. Replace that with a bulkhead that fast-rejects the overflow with
+  an instant 503 + Retry-After, keeping the pool from ever starving.
+
+  This is the AUTHORITATIVE cap. It belongs here (not only the gateway) because:
+    - Each pod's thread pool is a PER-POD resource, and a per-pod semaphore
+      protects it exactly. (The gateway's "N replicas x cap = too much" problem
+      does NOT apply: the resource is per-pod, the limiter is per-pod.)
+    - It sees ALL traffic to this pod: public /v1 via the gateway AND /internal
+      via identity-bridge. Nothing bypasses it.
+    - It knows its own capacity; nothing has to tell it the backend's number.
+
+
+================================================================================
+THE MECHANISM — a non-blocking Semaphore in a servlet filter
+================================================================================
+
+  A Semaphore with tryAcquire() is the right primitive: it is non-blocking, so
+  "no permit -> reject immediately" is exactly the behaviour we want.
+
+  Pseudocode (this is the shape; NOT edited into any file yet):
+
+    Semaphore permits = new Semaphore(MAX_IN_FLIGHT);   // non-fair is fine
+
+    doFilterInternal(request, response, chain):
+        if (!permits.tryAcquire()) {          // full -> instant reject
+            response.status = 503
+            response.header "Retry-After" = RETRY_AFTER_SECONDS
+            response.header "X-Reject-Reason" = "concurrency-limit"
+            response.body = {"error":"Service at capacity, please retry"}
+            return;                             // do NOT call chain.doFilter
+        }
+        try {
+            chain.doFilter(request, response);  // permit held for the whole request
+        } finally {
+            permits.release();                  // released even on exception
+        }
+
+  Why tryAcquire and not increment-and-check: tryAcquire is atomic and never
+  overshoots; release-in-finally guarantees the permit is returned even if the
+  request throws.
+
+
+================================================================================
+THE ONE SIZING RULE THAT MAKES IT WORK
+================================================================================
+
+  MAX_IN_FLIGHT must be set BELOW the Tomcat thread pool size.
+
+  Why: the filter runs ON a Tomcat thread. If all threads are already busy on
+  slow requests, the next request cannot even get a thread to RUN the filter and
+  reject -- it sits in Tomcat's acceptCount queue and eventually times out (the
+  same 502). So you must leave thread headroom for the filter to do its fast
+  rejects and for health checks.
+
+    server.tomcat.threads.max = 250        # explicit, was default 200
+    concurrency.max-in-flight  = 200       # the bulkhead, BELOW threads.max
+    -> ~50 threads always free to serve instant 503s and /actuator/health
+
+  Rule of thumb: bulkhead ~= 70-80% of threads.max. Never equal or above.
+
+
+================================================================================
+FILES TO ADD / CHANGE  (spec — implement later)
+================================================================================
+
+  1. NEW  http/filters/ConcurrencyLimitFilter.java
+     - extends OncePerRequestFilter (jakarta.servlet — Spring Boot 3)
+     - @Component, @Order(Ordered.HIGHEST_PRECEDENCE + 15)
+         Ordering rationale (see the ladder in InternalAuthFilter's javadoc):
+           AccessLogFilter            HIGHEST        (outermost — must LOG the 503)
+           RequestIdFilter            HIGHEST + 10   (503 gets a requestId)
+       ->  ConcurrencyLimitFilter     HIGHEST + 15   NEW: reject before real work
+           FilterChainExceptionHandler HIGHEST + 20
+           InternalAuthFilter         HIGHEST + 30   (terminal; /internal forward)
+       Being INSIDE AccessLogFilter means every 503 is captured by the access log
+       (status=503, organizationID=..., path=...). Being OUTSIDE InternalAuthFilter
+       means it counts BOTH /v1 and /internal traffic, once each (OncePerRequestFilter
+       + the forward does not re-trigger it).
+     - holds a Semaphore(MAX_IN_FLIGHT) and (for the dashboard) a Micrometer
+       Gauge on used permits + a Counter on rejections.
+     - shouldNotFilter: skip /actuator and /v1/health, /v2/health -- health must
+       stay green even at capacity (k8s liveness/readiness).
+
+  2. CHANGE  src/main/resources/application.yml
+       server:
+         tomcat:
+           threads:
+             max: ${TOMCAT_MAX_THREADS:250}
+       concurrency:
+         limit:
+           enabled: ${CONCURRENCY_LIMIT_ENABLED:false}   # start OFF, enable per env
+           max-in-flight: ${CONCURRENCY_MAX_IN_FLIGHT:200}
+           retry-after-seconds: ${CONCURRENCY_RETRY_AFTER:2}
+     - enabled flag so it can ship dark and be turned on per environment.
+     - when enabled=false the filter is a pass-through (or not registered).
+
+  3. NEW  test  http/filters/ConcurrencyLimitFilterTest.java
+     - fire MAX_IN_FLIGHT + K concurrent through a chain that blocks (latch) to
+       simulate slow requests; assert exactly K get 503 with Retry-After, and the
+       rest pass; assert permits fully released afterwards (count back to MAX).
+
+  NOTHING in the moonraker/gRPC path is touched. This only gates how many
+  requests are allowed to REACH that path at once.
+
+
+================================================================================
+THE RESPONSE — 503, not 429
+================================================================================
+
+  503 Service Unavailable + Retry-After is the correct code for LOAD SHEDDING
+  (the problem is capacity, not the client's request count). Keep it DISTINCT
+  from the gateway's rate-limit 429 so dashboards can tell the two apart:
+      429  -> "you exceeded your rate"          (gateway rate limiter)
+      503  -> "backend at capacity, retry"      (this bulkhead)
+  X-Reject-Reason: concurrency-limit makes it unambiguous in logs.
+
+
+================================================================================
+OBSERVABILITY (pairs with the AccessLogFilter access log, PR #353)
+================================================================================
+
+  Metrics (Micrometer, exposed at /actuator/prometheus):
+    Gauge   eas_inflight_requests            = MAX - permits.availablePermits()
+    Counter eas_concurrency_rejections_total = incremented on each 503
+
+  Logs: the AccessLogFilter already logs every response, so each 503 appears as
+    access ... status=503, organizationID=..., path=...
+  -> "who hit the concurrency wall" is answerable in Loki with no extra logging:
+    sum by (organizationID) (count_over_time(
+      {service_name="external-api-server"} |= "access " |= "status=503"
+        | json | line_format "{{.message}}"
+        | pattern `<_>organizationID=<organizationID>,<_>` [$__interval]))
+
+  Watch eas_inflight_requests approaching max-in-flight as the early-warning
+  signal, and eas_concurrency_rejections_total > 0 as the "shedding now" alert.
+
+
+================================================================================
+WHAT THIS DOES AND DOES NOT DO
+================================================================================
+
+  DOES
+    - Guarantees THIS pod never runs more than MAX_IN_FLIGHT requests at once,
+      keeping thread headroom so it never starves -> no more slow-502 cascade.
+    - Protects against ALL callers (gateway + /internal), because it sits in this
+      pod's own filter chain.
+    - Converts the failure from slow/ambiguous 502-for-everyone into
+      instant/clear 503-for-the-overflow, with Retry-After the client can act on.
+
+  DOES NOT
+    - Make requests faster. The moonraker calls still take 5-17s (untouched, as
+      required). Effective capacity is still "MAX_IN_FLIGHT slow requests"; the
+      bulkhead just stops the pool from being pushed past it.
+    - Do PER-ORG fairness. A global semaphore rejects whoever arrives when full,
+      not specifically the abuser. Per-org fairness is the GATEWAY's job (its
+      per-org rate/concurrency limit). Backend bulkhead = capacity guarantee;
+      gateway = fairness + cheap early shedding. Use both.
+    - Give a cluster-wide number. Each pod caps ITSELF -- which is correct here,
+      because each pod's thread pool is its own resource.
+
+  OPTIONAL LATER: a small per-org sub-cap inside this filter (e.g. no single org
+  may hold more than X of the MAX permits) to stop one org filling the whole
+  bulkhead. Only add if the gateway's per-org limit proves insufficient.
+
+
+================================================================================
+ROLLOUT
+================================================================================
+  1. Ship with enabled=false (dark). No behaviour change.
+  2. Set threads.max explicitly (250) and max-in-flight below it (200) in one env.
+  3. Enable in that env; watch eas_inflight_requests and rejections under real
+     load; confirm health checks stay green and 503s (not 502s) appear at
+     capacity.
+  4. Tune max-in-flight to the real safe ceiling, then enable everywhere.
+
+  Revert = flip enabled=false. No code rollback needed.
