@@ -34,13 +34,68 @@ Q2. IF THE 200 RETURN IN 2s vs 10s, HOW DOES THE OUTCOME CHANGE?
 
     10s / request:
       200 threads busy 10s -> queued 100 wait 10s+
-        -> if that exceeds the gateway/ALB timeout -> 502 / 504
-        -> and the other 700 keep arriving -> queue fills -> refuse (000)
+        -> timed out waiting in the queue     -> 504 (connected, no timely answer)
+        -> backend reset / broken response    -> 502 (connected, broken pipe)
+        -> the other 700 keep arriving, queue fills -> connection refused -> 000
 
   IDENTICAL request count, OPPOSITE outcome — purely because of latency.
   The rate limit did not change; concurrency x latency did. This is the exact
   5xx corner reproduced in the load test, and it is why a per-second RATE limit
   does not protect against it.
+
+  (EAS = external-api-server, used throughout.)
+
+
+ERROR-CODE TAXONOMY — WHO RETURNS WHAT, AND WHY
+------------------------------------------------
+  Topology (proxy/backend is relative to the hop):
+    client -> ALB -> api-gateway -> external-api-server (EAS) -> gRPC (moonraker...)
+              |       |              |
+       proxy  |backend|              |
+                proxy | backend      |
+                        proxy | backend
+
+  CODE  ORIGIN / MEANING
+  ---------------------------------------------------------------------------
+  429   api-gateway rate limiter (QUOTA / PATH token bucket exceeded). Deliberate.
+  403   AWS WAF on the ALB blocks (e.g. a rate-based rule). WAF's DEFAULT block
+        code is 403; can be configured to a custom 429. (The ALB itself does not
+        do token-bucket rate limiting; "ALB rate limiting" = WAF.)
+  502   Bad Gateway. A proxy connected to its upstream but got a BROKEN / RESET
+        response. e.g. EAS, overwhelmed, resets the api-gateway<->EAS connection,
+        or returns garbage mid-request -> gateway returns 502 -> ALB relays it.
+  504   Gateway Timeout. A proxy connected, sent the request, but got NO response
+        in time. e.g. the request sat in EAS's accept queue past the proxy's
+        response timeout. "Connected, waited, no answer."
+  503   Service Unavailable. TWO distinct origins (tag them apart on dashboards):
+          - ALB: no healthy api-gateway target in the group.
+          - EAS bulkhead: at capacity, fast-reject + Retry-After (the GOOD 503).
+  000   (client-side, curl) connection NEVER established -- refused at the TCP
+        level. ALB or target refused because the connection/accept backlog was
+        exceeded. e.g. queue holds 100 but 350 arrive -> the surplus get 000.
+  460   ALB-specific: client closed the connection before the ALB could respond.
+
+  502 vs 504 in one line:
+    504 = "I connected and waited, you never answered" (slow -> timeout)
+    502 = "I connected, but the response was broken or the pipe died"  (reset)
+  The exact code is proxy-and-config-dependent; the CAUSE is the same -- the
+  backend cannot keep up. Do not over-index on which 5xx appears.
+
+
+Q. WHAT ERROR WHEN THE ALB ITSELF RETURNS THE ERROR (IT CAN RATE-LIMIT VIA WAF)?
+--------------------------------------------------------------------------------
+  The ALB is the edge; it returns its error to the CLIENT.
+    no healthy api-gateway target       -> 503
+    WAF rate-based rule blocks           -> 403 (default) or configured 429
+    api-gateway slow (no timely answer)  -> 504
+    api-gateway reset / malformed        -> 502
+    ALB refuses TCP connection (overload)-> 000
+    client bailed before ALB replied     -> 460
+  So if you want ALB-level rate limiting to LOOK like the gateway's 429, set the
+  WAF block action to a custom 429. And note: 503-from-ALB (no healthy target) is
+  a DIFFERENT condition from 503-from-EAS-bulkhead (at capacity) even though the
+  number matches -- tag them (e.g. a header / body marker) so they are
+  distinguishable in Grafana.
 
 
 Q3. "PARALLEL 150" vs "CONCURRENT 150" — WHAT CHANGES?
@@ -70,6 +125,66 @@ Q3. "PARALLEL 150" vs "CONCURRENT 150" — WHAT CHANGES?
     cap in-flight itself and FAST-REJECT the excess (503) rather than let it pile
     up into a 502. The bulkhead is the server enforcing what a polite client
     would have done.
+
+
+Q. WITH A BULKHEAD, DO WE STILL ALLOW THE ~100 ACCEPT QUEUE? AND ISN'T
+   RESERVING ~50 THREADS A LOSS OF USEFUL CAPACITY?
+--------------------------------------------------------------------------------
+  THE QUEUE STILL EXISTS. The bulkhead is a SEMAPHORE IN A SERVLET FILTER, and a
+  filter runs ON a Tomcat thread -- so a request must already have a thread to run
+  the bulkhead and be rejected. That is WHY you size the bulkhead BELOW maxThreads.
+  With maxThreads=200, bulkhead N=150:
+    req 1-150   -> get a thread, ACQUIRE a permit, do the slow 10s work
+    req 151-200 -> get a thread, FAIL to acquire -> 503 in ms -> thread FREED fast
+    accept queue-> still queues when all 200 threads are momentarily busy, BUT
+                   threads 151-200 free in ms, so the queue DRAINS FAST -> queued
+                   requests get a quick 503 or a freed permit, not a 10s timeout.
+
+  So the bulkhead does not remove the queue; it stops the queue from becoming
+  FATAL, by GUARANTEEING THREAD TURNOVER (some threads always free quickly).
+
+    Without bulkhead: all 200 stuck 10s -> queue fills, waits 10s -> 504 -> 000
+    With bulkhead:    150 stuck 10s, ~50 doing fast 503s -> queue drains -> quick
+                      503 or admit; admitted 150 finish cleanly (200 OK)
+
+  THE "50 FEWER THREADS" IS A SAFETY MARGIN, NOT LOST CAPACITY:
+    - Slow throughput is bounded by threads either way (150 or 200).
+    - At 200 slow-in-flight you are ALREADY at the collapse point (queue fills,
+      timeouts) -- useful throughput there is ~zero because everyone 504s.
+    - At 150, 150 complete cleanly, overflow gets a fast 503, and the headroom
+      also serves FAST traffic (health checks, quick endpoints) that would
+      otherwise be stuck behind slow ones.
+    - The reserved threads are not idle -- a fast 503 uses a thread for ms.
+    - N is TUNABLE: set it to the highest the backend SUSTAINS without the queue
+      trapping. The rule is only N < maxThreads so rejection + fast traffic always
+      have room. 150 was illustrative.
+
+  IF YOU WANT THE OVERFLOW TO NEVER REACH EAS's QUEUE AT ALL:
+    put a concurrency limit at the api-gateway (reactive / WebFlux -- does NOT
+    hold a servlet thread), which rejects overflow before it reaches EAS. But see
+    the next Q -- a gateway limit has its own problem.
+
+
+Q. WHY NOT JUST DO THE CONCURRENCY LIMIT AT THE api-gateway?
+------------------------------------------------------------
+  Because a GLOBAL gateway limit blocks ALL downstream services together, and each
+  (moonraker, unhygienix, EAS, ...) has a DIFFERENT thread capacity. One number
+  cannot be right for all of them.
+
+  Two options:
+    - Gateway PER-ROUTE limit: Spring Cloud Gateway applies filters per route, so
+      you could cap concurrency per upstream (EAS routes = X, moonraker = Y).
+      Possible, but the gateway must KNOW and MAINTAIN every downstream's capacity
+      centrally -- brittle, drifts as services change.
+    - PER-SERVICE bulkhead (each service caps itself): cleaner and more accurate,
+      because each service knows ITS OWN capacity. No central capacity catalog,
+      no cross-service blocking.
+
+  CONCLUSION: the guarantee belongs at EACH BACKEND (per-service bulkhead). A
+  gateway limit, if used, should be PER-ROUTE and only a SECONDARY early-shed --
+  the authoritative cap lives in each service. This is exactly why "cap at the
+  gateway" is the harder, more error-prone path and "bulkhead at EAS" is the right
+  primary.
 
 
 THE DIRECTION UNDER DISCUSSION (constraint-respecting)
