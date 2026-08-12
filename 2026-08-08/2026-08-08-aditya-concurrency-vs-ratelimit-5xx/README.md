@@ -18,6 +18,14 @@ requests in flight at once exhausted the backend's thread pool.
   the **global vs per-org** cap distinction, why the backend thread pool is a *bad* global cap,
   what status to return (**not** automatically 429 — prefer `503 + Retry-After`, kept distinct
   from the rate 429), and the full fix by service with implementation order.
+- **[2026-08-12_concurrency-queue-mechanics-and-per-sub-quota.txt](2026-08-12_concurrency-queue-mechanics-and-per-sub-quota.txt)** —
+  worked example (1000 calls, quota 300, 200 threads): what happens to calls beyond the pool
+  (**they queue, not fail** — and succeed or 502 depending on latency vs timeout), the real
+  meaning of **parallel vs concurrent** (it's *how many in flight at once*; a cap below the
+  burst moves the waiting off the server), and a review of the constraint-respecting direction:
+  a **per-`sub`/client_id quota as a child of org**, UI-configured via moonraker, **no
+  identity-bridge change** — which also solves agent-vs-human by letting the org segment via
+  separate credentials, but is *rate not concurrency* so it must be paired with the bulkhead.
 - **[2026-08-10_external-api-server-bulkhead-design.txt](2026-08-10_external-api-server-bulkhead-design.txt)** —
   **design spec (no Java edits)** for the authoritative fix: a **Semaphore bulkhead filter** at
   external-api-server that fast-rejects the overflow with `503 + Retry-After` once N are in flight.

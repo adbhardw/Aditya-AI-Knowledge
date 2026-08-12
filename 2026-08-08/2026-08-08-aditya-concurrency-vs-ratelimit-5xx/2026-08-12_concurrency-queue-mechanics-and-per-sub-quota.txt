@@ -1,0 +1,132 @@
+================================================================================
+CONCURRENCY QUEUE MECHANICS + PER-SUB QUOTA (child of org)
+Worked example, parallel-vs-concurrent, and a review of the constraint-respecting
+direction (no identity-bridge change).
+Authored 2026-08-12. Companion to the 2026-08-08 concurrency-vs-ratelimit docs.
+================================================================================
+
+WORKED EXAMPLE
+  1000 calls · gateway quota burst 300 / refill 300/sec · 300 fired in parallel ·
+  backend maxThreads = 200.
+
+
+Q1. WHAT HAPPENS TO THE 100 CALLS BEYOND THE 200 THREADS — FAIL, OR WAIT?
+--------------------------------------------------------------------------
+  They WAIT. Not rejected. Two separate gates:
+
+  1. Gateway quota (burst 300): all 300 pass (300 <= 300 burst). Quota is NOT the
+     binding limit here. 300 requests reach the backend.
+  2. Backend threads (200): 200 processed on threads at once. The other 100 sit
+     in the backend's accept/wait queue (Tomcat acceptCount, ~100 default) as
+     accepted connections with no thread yet. They wait for a thread to free,
+     then get served.
+
+  Nothing in the rate limiter rejected the 100 — they are INSIDE the backend,
+  queued. Rejection only happens if the queue itself fills (beyond acceptCount).
+
+
+Q2. IF THE 200 RETURN IN 2s vs 10s, HOW DOES THE OUTCOME CHANGE?
+----------------------------------------------------------------
+  Latency decides whether the queue DRAINS before the timeout.
+
+    2s / request:
+      200 threads finish in 2s -> queued 100 picked up -> done ~3s -> ALL SUCCEED
+
+    10s / request:
+      200 threads busy 10s -> queued 100 wait 10s+
+        -> if that exceeds the gateway/ALB timeout -> 502 / 504
+        -> and the other 700 keep arriving -> queue fills -> refuse (000)
+
+  IDENTICAL request count, OPPOSITE outcome — purely because of latency.
+  The rate limit did not change; concurrency x latency did. This is the exact
+  5xx corner reproduced in the load test, and it is why a per-second RATE limit
+  does not protect against it.
+
+
+Q3. "PARALLEL 150" vs "CONCURRENT 150" — WHAT CHANGES?
+------------------------------------------------------
+  The real axis is HOW MANY ARE IN FLIGHT AT THE SERVER AT THE SAME INSTANT — not
+  the word.
+
+  - If "concurrent 150" also means 150 in flight -> NOTHING changes. Same as
+    parallel 150. 150 simultaneous is 150 simultaneous.
+  - The difference appears only when you put a CAP below the burst. "150 total,
+    at most N outstanding (N < 150)": only N are in flight; the other 150-N WAIT
+    at the client (or behind a semaphore), released as slots free — the
+    "queue-and-release as some return" model. The server only ever sees N.
+
+    "150 fired at once"          -> up to 150 in flight -> server holds 200
+                                     threads / queues excess  (SERVER-side pressure)
+    "150 with concurrency cap 30"-> 30 in flight; other 120 wait at the CLIENT,
+                                     released as each returns  (CLIENT-side pacing)
+
+  Load test mapping: xargs -P 150 = 150 in flight; xargs -P 30 (or ab -c 30) =
+  30 in flight, rest wait for a slot. THE CAP MOVES THE WAITING OFF THE SERVER.
+
+  THE KEY POINT:
+    A WELL-BEHAVED client caps its own concurrency (queue-and-release).
+    An ABUSIVE one — an agent firing 150 at once — does NOT.
+    You cannot rely on the client to be polite. So the SERVER needs a BULKHEAD to
+    cap in-flight itself and FAST-REJECT the excess (503) rather than let it pile
+    up into a 502. The bulkhead is the server enforcing what a polite client
+    would have done.
+
+
+THE DIRECTION UNDER DISCUSSION (constraint-respecting)
+======================================================
+  Context: identity-bridge CANNOT be changed to add a persona. moonraker (where
+  client_id/secret is generated) CAN be changed. So drop the persona claim; add a
+  per-clientId / per-sub quota as a CHILD OF THE ORGANIZATION, configurable from
+  the UI (which writes to moonraker). Agent use = just set that cred's limit.
+
+
+Q4. IS PER-SUB QUOTA (CHILD OF ORG, UI-CONFIGURED) ENOUGH?
+-----------------------------------------------------------
+  YES — and it is cleaner than the persona claim. It sidesteps the IB blocker AND
+  the persona problem entirely:
+
+  - sub is ALREADY in the M2M JWT (sub = client_id@clients). No new claim, no
+    Auth0 Action, no identity-bridge change. Gateway reads sub, applies per-sub
+    limit.
+  - "Child of org" is the right shape: org = aggregate ceiling (parent), sub =
+    per-caller sub-budget within it. Both apply — org quota AND sub quota.
+  - Agent use = org sets that client_id's limit from the UI -> moonraker. No
+    detection, no persona flag; the limit is attached to the credential directly.
+  - It quietly solves "cannot tell agent from human": the org creates a SEPARATE
+    client_id for its agent and gives it its own limit. Self-segmentation by
+    credential (the Stripe / GitHub model). You never classify traffic; the org
+    declares intent by WHICH credential it uses. Sharing one cred between human
+    and agent is the org's choice, within that sub's limit.
+  - Scope-honest: works for M2M client-cred (created in moonraker — the thing he
+    CAN touch). SSO / LR (sub = user, IB-owned) deferred, which the constraint
+    forces anyway.
+
+  WHERE IT SITS IN THE FILTER STACK
+    DailyOrgQuota (-3) -> OrgQuota (-2) -> Path (-1) -> [NEW] SubQuota (0)
+    Each is a token bucket / daily counter keyed differently. SubQuota keys on
+    the JWT sub (client_id). Config stored in Redis like the others
+    (rate-limit:SUB:...:<sub>), admin-set from the UI via moonraker.
+
+  TWO CAVEATS TO STATE EXPLICITLY (so they are not assumed away)
+    1. STILL RATE, NOT CONCURRENCY. A per-sub QUOTA caps how many / how fast, not
+       how many IN FLIGHT. So Q1-Q2 (slow requests exhausting threads -> 502) is
+       NOT addressed by per-sub limits. Pair it with the backend BULKHEAD (Q3).
+       Different axis, still needed. This is the single most important thing not
+       to assume away: the new per-sub layer improves "who / how fast", it does
+       nothing for "how many at once".
+    2. PER-SUB IS CONFIGURED INDIVIDUALLY (no class default that a persona would
+       give). Fine if the number of agent creds is small; if it grows, add a
+       default tier later. Not a blocker.
+
+
+ONE-LINE SUMMARY
+================
+  - Beyond the thread pool, extra calls WAIT in a bounded queue; they succeed if
+    latency lets the queue drain before the timeout, and 502 if it does not.
+  - "Parallel vs concurrent" is really "how many in flight at once"; a cap below
+    the burst moves the waiting off the server. A polite client self-caps; an
+    agent will not, so the server needs a bulkhead.
+  - Per-sub quota as a child of org (UI -> moonraker, no IB change) is a solid,
+    constraint-respecting backbone that also solves agent-vs-human by letting the
+    org segment via separate credentials — BUT it is rate, not concurrency, so it
+    must be paired with the backend concurrency bulkhead to close the 5xx corner.
