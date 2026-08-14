@@ -1,0 +1,165 @@
+================================================================================
+TOKEN BUCKET UNDER PARALLEL REQUESTS
+Why "100 requests -> 98 rejected" is usually WRONG, and what really decides the
+number that passes. Grounded in live stage + prod load tests (2026-08-14).
+Companion to the defense-layers doc in this folder.
+================================================================================
+
+THE RULE UNDER TEST
+  A temporary rate rule of 2 / 2 / 1 was set on a test endpoint/org:
+    replenishRate   = 2   tokens added per second
+    burstCapacity   = 2   maximum tokens the bucket can ever hold
+    requestedTokens = 1   tokens consumed per request
+  (Spring Cloud Gateway RedisRateLimiter, backed by an atomic Redis Lua script.)
+
+
+================================================================================
+Q1. For 100 requests, shouldn't 98 be rejected and only 2 pass?
+================================================================================
+  Only if all 100 arrive within the SAME second. The bucket REFILLS at 2/sec,
+  so the number that passes is not just the burst -- it is burst PLUS refill over
+  the time the burst takes:
+
+      passed  ~=  burst (2)  +  replenishRate (2/sec) x duration_of_burst (sec)
+
+  So the DURATION of the burst decides how many pass, not the total count.
+
+  Verified against real runs (2/2/1 rule live):
+
+    RUN     REQUESTS  DURATION   PREDICTED PASS (2 + 2*dur)   ACTUAL PASS
+    stage     100       13s        2 + 26 = 28                 26   (74 x 429)
+    prod      120       63s        2 + 126 = 128 (> 120)       ~86  (rest 000)
+    prod      250       49s        2 + 98  = 100               ~68  (rest 000)
+
+  The stage run is the clean match: over 13 seconds the bucket refilled ~26
+  tokens on top of the initial 2, so ~28 passed and 74 got 429. The prod runs
+  had 000s (connection refusals) removing arrivals, which muddies the count, but
+  the shape holds: passed tracks burst + refill*duration, NOT "only 2".
+
+  => To actually reject ~98 of 100, all 100 must hit within ~1 second, before the
+     refill matters. Bursts that spread over 13-63s let the 2/sec refill keep the
+     bucket topped up, so far more than 2 pass.
+
+
+================================================================================
+Q2. For parallel calls, doesn't each request "see 2 available" and go through?
+================================================================================
+  NO. This is the key misconception. The token count is ATOMIC.
+
+  The bucket lives in Redis and is checked by an atomic Lua script. Even if 30
+  requests arrive at the exact same instant, they are serialized at the counter:
+
+      bucket = 2 tokens
+      req A  -> atomic decrement 2->1 -> PASS
+      req B  -> atomic decrement 1->0 -> PASS
+      req C  -> sees 0 -> 429
+      req D  -> sees 0 -> 429
+      ...
+      req 30 -> sees 0 -> 429
+
+  30 TRULY-simultaneous requests -> exactly 2 pass, 28 x 429. They do NOT each
+  read "2 available" and all proceed. There is no race where parallel requests
+  all see 2 and all go through -- the atomic operation guarantees only 2 win the
+  2 tokens. That is the entire point of using Redis with an atomic script as the
+  single source of truth for the count.
+
+
+================================================================================
+Q3. Then why did MORE than 2 pass in the tests?
+================================================================================
+  NOT because parallel calls defeated the bucket. Because the bursts took
+  SECONDS, and during those seconds the bucket REFILLED at 2/sec.
+
+  Parallelism controls HOW FAST requests arrive; refill controls HOW MANY tokens
+  exist over that time. The two combine:
+
+      30 requests in 0.5 sec   -> bucket ~2 (+1 refill)  -> ~3 pass, ~27 x 429
+      30 requests over 15 sec  -> refill 2/sec = 30 tokens -> all 30 pass, 0 x 429
+
+  Same 30 requests, opposite outcome -- purely from how COMPRESSED IN TIME they
+  are. "Parallel" fired via curl/xargs is NOT simultaneous: network latency and
+  TLS handshakes spread the arrivals over seconds, so the refill keeps up and the
+  observed 429 count is far below the naive 98/100.
+
+
+================================================================================
+Q4. Can we compress the burst into ~1 second to force the high reject ratio?
+================================================================================
+  Tried it on prod (2/2/1 rule, test org). 200 requests at xargs -P150:
+
+      RESULT:  170 x 000,  18 x 429,  12 x 200,   wall time 20.7s
+
+  Compression FAILED -- and that failure is the finding. The ALB refused 85% of
+  the connections (000) before they even reached the gateway. Only ~30 actually
+  connected; of those, 12 passed and 18 got 429 (the 2/2 bucket working on the
+  ones that got through). The wall time was 20.7s, not 1s.
+
+  Two lessons:
+
+  1. You CANNOT deliver 100+ truly-simultaneous connections from ONE machine.
+     Push the concurrency up to compress the window and the ALB's connection
+     ceiling hits first -> 000, not 429. Spread it out and the refill lets many
+     through -> fewer 429. Either way one laptop tops out around 65-74 clean
+     429s. To genuinely reject ~98 of 100 you need DISTRIBUTED sources (many
+     IPs) -- which, not coincidentally, is also why real floods come from
+     botnets and why per-IP limits alone don't stop them.
+
+  2. Under a flood the ordering of defenses is:
+        ALB refuses excess connections (000)
+          -> THEN gateway rate-limits what got through (429)
+            -> THEN backend serves what passed (200)
+     The ALB's connection limit is itself a crude protection layer that sheds at
+     the CONNECTION level before the app rate limiter ever runs.
+
+
+================================================================================
+Q5. Was the "~30 connected" an ALB per-IP cap of 30?
+================================================================================
+  NO -- do not record that as a spec. ~30 was OBSERVED in one run, not a
+  configured limit. AWS ALB does not document a per-source-IP concurrent-
+  connection cap; ALBs handle very high connection counts by design.
+
+  The ~30 ceiling most likely came from a MIX, and would float run to run:
+    - AWS edge / Shield Standard (on by default) throttling a sudden burst of
+      connections from a single IP as abusive -- adaptive, not a fixed number.
+    - The client laptop's own limits: ephemeral ports, socket limits, TLS-
+      handshake throughput establishing 150 connections at once; with
+      --connect-timeout 5, any that don't connect in 5s become 000.
+    - Target-side (gateway pod) connection capacity.
+
+  To confirm which layer refused, read ALB/target-group CloudWatch metrics over
+  the window: RejectedConnectionCount (ALB refused), ActiveConnectionCount,
+  NewConnectionCount, TargetConnectionErrorCount. RejectedConnectionCount > 0
+  would prove the ALB itself refused.
+
+
+================================================================================
+000 = CONNECTION REFUSED, AT WHICHEVER LAYER HITS ITS LIMIT FIRST
+================================================================================
+  curl reports 000 when the connection is NEVER established. That can be:
+    - the ALB refusing (its connection ceiling / Shield throttling), OR
+    - the backend's accept queue / OS socket backlog being full (connection
+      refused at the target), OR
+    - a connect-timeout (couldn't establish TLS in time).
+
+  Same symptom (can't connect), different layer. In the 2/2 rate test the 000s
+  are the ALB/gateway CONNECTION layer (rate-rejected requests are 429'd at the
+  gateway and never reach the backend queue). In the earlier 5xx load test (loose
+  rule, backend overwhelmed) the 000s were the backend BACKLOG filling. Both are
+  "connection refused"; read which by the layer that was actually saturated.
+
+
+================================================================================
+ONE-LINE TAKEAWAYS
+================================================================================
+  - passed ~= burst + replenishRate * burst_duration. "Only 2 pass" is true ONLY
+    for a truly instantaneous burst; any real duration lets the refill through.
+  - The token count is ATOMIC (Redis Lua). Parallel requests do NOT each see the
+    full burst; simultaneous requests are serialized and only `burst` win.
+  - "Parallel" via curl/xargs is spread over seconds by latency -- not
+    simultaneous -- which is why observed 429 counts are far below 98/100.
+  - You cannot compress 100 simultaneous connections from one machine; the ALB
+    connection ceiling (000) hits before the gateway rate limit (429). Real
+    saturation of a per-second limit needs distributed sources.
+  - 000 = connection refused at whichever layer saturated first (ALB or backend
+    backlog); it is not a single fixed "per-IP cap".

@@ -35,6 +35,12 @@ Diagrams are Mermaid, inline in the Markdown, so they render directly on GitHub.
 
 Reverse chronological — newest first.
 
+### 2026-08-14
+
+| Folder | Summary |
+|---|---|
+| [2026-08-14-aditya-ratelimit-defense-layers](2026-08-14/2026-08-14-aditya-ratelimit-defense-layers/) — [SUMMARY](2026-08-14/2026-08-14-aditya-ratelimit-defense-layers/SUMMARY.md) | **Where each rate/abuse defense belongs, the token-bucket mechanics under parallel load, and an audit of what the platform actually runs.** Corrects the intuition that a `2/2/1` rule (replenish 2/sec, burst 2) rejects ~98 of 100 requests: the bucket is **time-based**, so `passed ≈ burst(2) + 2×burst_duration` — true "only 2 pass" holds **only** if all arrive within ~1s (verified live: a stage burst of **100 requests over 13s → 26 passed / 74 × 429**, predicted `2+2×13=28`). The token count is **atomic** (Redis Lua), so 30 truly-simultaneous requests don't each "see 2 available" — they serialize and only `burst` win; and "parallel" via `xargs` isn't simultaneous (latency spreads arrivals, so refill keeps up). A live prod attempt to **compress a flood failed** — 200 @ `-P150` → **170 × 000, 18 × 429, 12 × 200** — because the **ALB refused 85% of connections** first; one machine tops out ~65–74 × 429, so real saturation needs **distributed IPs**. Establishes the flood order **ALB refuses (`000`) → gateway rate-limits (`429`) → backend serves (`200`)**, and that `000` = connection refused at whichever layer saturates first (not a fixed ALB per-IP cap). **Architecture:** match the defense to the identity the threat is known by — **WAF/ALB by IP** (volumetric, can't see the org), **api-gateway by org/credential** (the only layer that decodes the JWT — so rogue-org abuse is inherently a gateway problem), **backend bulkhead by in-flight count**. Explains **how AWS WAF rate-based auto-blocking works** (count → block → auto-unblock, Count-mode tuning, 403 at the edge) and why IP-blocking is wrong for a rogue org (one org spans many IPs; one IP carries many orgs → collateral). **Verified infra reality** from `orinjade` (Terraform) + `dyogram` (Helm): **no CDN, no WAF** (only latent IAM permissions — no WebACL attached), an **internet-facing AWS ALB** fronts everything (TLS 443); `api-gateway` trusts `X-Forwarded-For` (`application.yml:26`) but `external-api-server` does not. Topology of record (no diagram files exist in the repos): `client → ALB → api-gateway → external-api-server → gRPC`. |
+
 ### 2026-08-08
 
 | Folder | Summary |

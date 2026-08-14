@@ -1,0 +1,205 @@
+================================================================================
+DEFENSE LAYERS: WHERE EACH LIMIT LIVES, KEYED ON WHAT IDENTITY
+WAF/ALB (by IP) vs api-gateway (by org) vs backend bulkhead (by concurrency).
+How WAF auto-blocking works, and the CDN/X-Forwarded-For caveat.
+Authored 2026-08-14. Companion to the token-bucket doc in this folder.
+================================================================================
+
+THE CORE PRINCIPLE
+  Match the defense to the IDENTITY the threat is known by. Each layer sees a
+  different identity and defends a different threat. Do not make one layer do
+  another's job.
+
+  LAYER               DEFENDS AGAINST              KEYED ON            ROGUE ORG?
+  ---------------------------------------------------------------------------
+  WAF / ALB / Shield  volumetric DDoS, connection  IP + connection     NO - can't
+                      floods, bad IPs, scrapers,   pattern             see the org
+                      SQLi/XSS
+  api-gateway         a rogue ORGANIZATION or      org + sub + path    YES - this
+    rate limit        credential over-using the    (from the JWT)      is the layer
+                      API                                              for it
+  backend bulkhead    concurrency exhausting       in-flight count     protects
+    (external-api-svr) threads (regardless of who)                     regardless
+
+  THE LOAD-BEARING INSIGHT: the WAF CANNOT SEE YOUR ORG. A rogue organization
+  holding a VALID credential, calling from LEGITIMATE IPs, looks identical to
+  good traffic at the WAF. Only the gateway decodes the JWT and knows "this is
+  org X". So rogue-org abuse is inherently a GATEWAY-layer problem -- exactly
+  where the per-org / per-sub rate + quota limits already live (api-gateway PR
+  #95 and the per-sub-as-child-of-org direction).
+
+
+================================================================================
+SHOULD I BLOCK IPs AT THE WAF BY READING METRICS?
+================================================================================
+  Block by IP ONLY when the threat is identified by IP.
+
+  IP-shaped threats -> YES, at the WAF, but AUTOMATE it.
+    Volumetric floods, one IP hammering, a botnet member, scrapers ARE IP-
+    identifiable, and the WAF is the right place (it sheds them BEFORE they
+    consume app resources). Use WAF RATE-BASED RULES (automatic) rather than
+    manually reading metrics and blocking -- manual metric-reading is slow,
+    reactive, and doesn't scale. Reserve manual IP blocking for confirmed
+    incidents where investigation pins a specific bad actor to specific IPs.
+
+  ORG-shaped threats -> NO, don't chase IPs. For a rogue ORGANIZATION, IP
+  blocking is the wrong tool and actively risky:
+    - an org's traffic comes from MANY IPs (cloud egress, agents, proxies) ->
+      whack-a-mole;
+    - one IP can carry MANY orgs (shared NAT / cloud egress) -> blocking it
+      COLLATERAL-DAMAGES legitimate tenants.
+    The precise handle is the org / credential in the JWT: tighten that org's
+    gateway limit or quarantine the credential. Surgical, no collateral.
+
+
+================================================================================
+HOW WAF AUTO-BLOCKING ACTUALLY WORKS (AWS WAF rate-based rules)
+================================================================================
+  The "auto" part is a continuous COUNT -> BLOCK -> UNBLOCK loop with no human in
+  it. You write ONE rule once:
+
+    "Count requests PER SOURCE IP over a rolling window. If any IP crosses N in
+     that window, BLOCK it."
+
+  WAF then runs forever on its own:
+
+    for every incoming request:
+        key = source IP
+        increment that IP's running count over the trailing window
+    continuously (re-evaluated ~every 30s):
+        if an IP's count  > threshold          -> start BLOCKING all its requests
+        if a blocked IP's count < threshold     -> automatically STOP blocking it
+
+  The auto-UNBLOCK is the key to "auto": when the flood stops and the IP falls
+  back under the limit, WAF releases it by itself. No dashboard-watching.
+
+  THE KNOBS (the whole config):
+    Threshold        requests-per-window that trips the block   (e.g. 2000 / 5min)
+    Window           rolling window it counts over              (1 / 2 / 5 / 10 min)
+    Aggregation key  WHAT it counts by                          (source IP, default)
+    Action           what to do when tripped                    (Block / Count /
+                                                                 CAPTCHA / Challenge)
+    Scope-down       only count SOME requests                   (e.g. only /oauth/token)
+
+  TURN IT ON SAFELY -- Count mode first: set action = Count (does everything
+  except block, just tags "would have blocked"), watch for a day to see if any
+  LEGITIMATE IP would be caught, tune the threshold, THEN flip to Block. This is
+  how you avoid blocking a real customer on day one.
+
+  WHAT THE BLOCKED CALLER SEES: the request never reaches the ALB or gateway --
+  WAF returns 403 by default (customizable). That is the classic "WAF blocked me
+  at the edge" signature: a 403 with no app fingerprint, never becoming a 429 or
+  000 because it died before the infrastructure.
+
+
+================================================================================
+THE CDN / PROXY / X-FORWARDED-FOR CAVEAT
+================================================================================
+  A WAF rate-based rule keyed on "source IP" only works if the WAF sees the REAL
+  client IP. If traffic sits behind a CDN or reverse proxy, every request arrives
+  with the PROXY's IP as the source. Then "aggregate by source IP" counts all
+  customers as one IP -> the rule either never trips (spread across the real
+  clients it can't see) or blocks EVERYONE (all attributed to the proxy IP).
+
+  Fix when behind a CDN/proxy: set the aggregation key to "IP address in
+  X-Forwarded-For" (the real client IP the proxy forwards) instead of the socket
+  source IP. Same caveat applies to the APP: if the app logs/limits by
+  getRemoteAddr() it sees the proxy IP unless it is configured to trust and read
+  X-Forwarded-For (e.g. Spring server.forward-headers-strategy / a RemoteIpValve
+  / trusted-proxy list).
+
+  => Before trusting the default "source IP" key you MUST know what sits in front
+     of the ALB. See the infra-reality section below.
+
+
+================================================================================
+INFRA REALITY -- DOES THIS PLATFORM USE WAF / CDN / A PROXY?
+(Verified 2026-08-14 from the actual repos/infra, not assumed.)
+================================================================================
+  Verified against the actual infra repos (orinjade = Terraform monorepo,
+  dyogram = Helm charts). Note: "orinjade"/"dyogram" are REAL repo names, not
+  typos -- orinjade holds all WAF/CloudFront/ALB/IAM config, dyogram holds all
+  ingress/ALB/nginx config.
+
+  CDN?  NO. No CloudFront/Fastly/Akamai/Cloudflare distribution fronts the app.
+        (CloudFront appears only in an EGRESS allow-list --
+         orinjade/azure/environments/habu/prod/westeu/prod.auto.tfvars L179 --
+         and as a read-only IAM permission cloudfront:ListDistributions --
+         orinjade/aws/modules/roles/policy_document.tf L229. Neither is in the
+         request path.)
+
+  WAF?  NO. No aws_wafv2_web_acl / _association resource is declared anywhere,
+        and no ingress carries a wafv2-acl-arn / waf-acl-id annotation. The ONLY
+        WAF references are LATENT IAM PERMISSIONS granted to the ALB ingress
+        controller so it COULD associate a WebACL:
+          orinjade/aws/modules/roles/policy_document.tf
+            L185-188  waf:Get*/List*, waf-regional:Get*/List*
+            L394-401  waf-regional/wafv2 AssociateWebACL / DisassociateWebACL
+        -> permissions exist; nothing creates or attaches a WebACL. WAF is NOT
+           deployed. To use the WAF auto-blocking above you must FIRST add a
+           WebACL and attach it to the ALB (the IAM already allows it; it just
+           needs the resource + the ingress annotation).
+
+  WHAT'S IN FRONT?  An internet-facing AWS APPLICATION LOAD BALANCER, provisioned
+        by the AWS Load Balancer Controller (kubernetes.io/ingress.class: alb,
+        scheme: internet-facing), terminating TLS on 443 and routing to the EKS
+        services:
+          dyogram/charts/api-gateway/values.yaml L118-126
+          dyogram/charts/external-api-server/values.yaml L85-99
+          SG opens 443 from 0.0.0.0/0 -- orinjade/aws/modules/security-groups/
+            http_alb_sg.tf L20-37
+        topgallant (the Deklared webapp) additionally runs an in-pod nginx
+        reverse proxy. (Separately, there is an AWS API Gateway for a Snowflake
+        external function -- NOT the public app path.)
+
+  X-FORWARDED-FOR / REAL CLIENT IP?
+        api-gateway       TRUSTS XFF. application.yml L26
+                          server.forward-headers-strategy: framework -> Spring's
+                          ForwardedHeaderFilter applies X-Forwarded-For/Proto/Host,
+                          so the gateway sees the REAL client IP from the ALB.
+        topgallant nginx  PARSES XFF (real_ip_header X-Forwarded-For), but the
+                          trusted set_real_ip_from CIDR defaults to a PLACEHOLDER
+                          0.0.0.0/16 (values.yaml L29) that MUST be overridden per
+                          env or XFF is spoofable.
+        external-api-server  DOES NOT read forwarded headers (no
+                          forward-headers-strategy in its application.yml) -> it
+                          sees the ALB/socket IP, NOT the true client IP.
+
+  IMPLICATIONS FOR THE X-FORWARDED-FOR CAVEAT ABOVE:
+    - Because there is NO CDN, a WAF attached to the ALB would see the REAL client
+      IP directly from the TCP connection -- the "aggregate by X-Forwarded-For"
+      workaround is only needed when a CDN sits IN FRONT of the ALB, which is not
+      the case here. So a hypothetical WAF rate rule keyed on source IP would be
+      correct by default.
+    - The XFF gap that IS real today is at external-api-server: any per-IP logic
+      (logging, limiting) there would key on the ALB IP, not the client. If per-IP
+      behaviour is ever needed at that service, enable forward-headers-strategy
+      with a trusted-proxy range first.
+    - No architecture/topology diagram files exist in the infra/service repos
+      (searched .drawio/.puml/.mmd/.mermaid) -- this doc IS the topology of record
+      for the request path: client -> ALB (TLS) -> api-gateway -> external-api-
+      server -> gRPC downstream. No WAF, no CDN.
+
+
+================================================================================
+WHAT I'D ACTUALLY DO (the layered recommendation)
+================================================================================
+  1. Let WAF/ALB/Shield own the network/IP/volumetric layer -- turn on WAF
+     RATE-BASED RULES so IP-level abuse is shed AUTOMATICALLY, before it reaches
+     the gateway. Don't rely on manual metric-reading to block IPs.
+  2. Own rogue ORGANIZATIONS at the gateway -- per-org quota + per-sub/credential
+     rate limits (the correct, precise layer for tenant abuse). Enforce by
+     tightening the org/credential limit or quarantining the credential -- NOT by
+     blocking an IP.
+  3. Add the backend CONCURRENCY BULKHEAD at external-api-server (503 +
+     Retry-After, sized below threads.max) -- the gap none of the above closes
+     (the 5xx corner). See the 2026-08-10 bulkhead design in the 2026-08-08
+     folder.
+  4. Reserve manual WAF IP-blocking for CONFIRMED incidents; read metrics to
+     investigate, not as a routine control loop.
+
+  RULE OF THUMB THROUGHOUT: block the threat by the identity it is known by --
+  IP-threats at the WAF by IP, org-threats at the gateway by org, resource
+  exhaustion at the backend by in-flight count. Don't cross the wires: don't
+  block IPs to stop an org (imprecise, collateral), and don't try to org-limit a
+  volumetric IP flood at the gateway (too late, resources already consumed).
