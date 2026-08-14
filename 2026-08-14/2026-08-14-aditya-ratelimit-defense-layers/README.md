@@ -24,6 +24,12 @@ verified with live stage + prod load tests, and an audit of what the platform **
   at the WAF vs when not to; **how AWS WAF rate-based auto-blocking works** (count → block →
   unblock, Count mode, 403 at the edge); the CDN / X-Forwarded-For caveat; and the **verified
   infra section** with exact file:line evidence from `orinjade` (Terraform) and `dyogram` (Helm).
+- **[2026-08-14_osi-layers-tls-termination-and-the-request-path.txt](2026-08-14_osi-layers-tls-termination-and-the-request-path.txt)** —
+  the **7 OSI layers** (L1 physical → L7 application) with a Habu example per layer; the **L4-vs-L7**
+  distinction (dumb pipe vs smart hop); what **TLS termination** is and why terminating at the
+  **edge** is faster (the distance-bound handshake); what breaks if TLS **doesn't** terminate
+  (passthrough → dumb L4 relay; no CDN → terminate at the ALB); the **full request path annotated
+  by layer**; and why each defense sits where it does (IP threats L3/L4, org threats L7).
 
 ## Headline
 

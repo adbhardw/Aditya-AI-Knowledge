@@ -45,6 +45,12 @@ Live prod test (`2/2/1`, test org): **200 requests at `xargs -P150` → 170 × 0
 ### How WAF auto-blocking works (AWS rate-based rules)
 A continuous **count → block → unblock** loop, no human in it: you set one rule (threshold + rolling window + "aggregate by source IP" + Block); WAF counts every IP, blocks any over threshold, and **auto-unblocks** when it drops back under. Tune in **Count mode** first, then flip to Block. Blocked requests get **403 at the edge**, never reaching the ALB/gateway.
 
+### Network layers & TLS termination — why the model holds (detail: [OSI/TLS doc](2026-08-14_osi-layers-tls-termination-and-the-request-path.txt))
+
+The layered defense maps directly onto the **OSI stack**: **L1** = physical bits on the wire (the cable whose length sets RTT), **L3** = IP, **L4** = TCP (ports, connections, the `000` refusals, the ALB ceiling), **L6** = TLS (encryption), **L7** = HTTP (paths, headers, the JWT). The key rule: **you can only do L7 work — path routing, WAF content inspection, reading the JWT to rate-limit by org — *after* TLS terminates (L6 decrypt).** An L4 device (TCP LB, or a CDN doing TLS passthrough) sees only IP+port — a dumb pipe.
+
+**TLS termination** is where the encrypted session is decrypted. The TLS handshake costs ~2–3 **distance-bound** round trips before any data flows, so terminating at a **CDN edge near the user** turns a ~500–750ms cross-ocean handshake into ~25ms + a warm pooled origin connection. **Habu has no CDN**, so the **ALB is both the sole TLS-termination point and the global edge** — distant users pay the full handshake, and there's no edge layer to absorb a flood before the ALB. This is *why* IP threats (L3/L4) block early at the WAF/ALB while org threats (L7, needs the decrypted JWT) belong at the gateway.
+
 ## 4. Infra reality (verified from `orinjade` + `dyogram`, not assumed)
 
 - **CDN? No.** No CloudFront/Fastly/Akamai/Cloudflare in the request path (CloudFront appears only in an egress allow-list + a read-only IAM permission).

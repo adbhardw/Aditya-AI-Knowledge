@@ -1,0 +1,160 @@
+================================================================================
+OSI LAYERS, TLS TERMINATION, AND THE REQUEST PATH
+What "Layer 7 vs Layer 1" means, why WHERE TLS terminates decides both speed
+and what each hop is allowed to do, and how Habu's path maps onto the 7 layers.
+Authored 2026-08-14. Companion to the defense-layers + token-bucket docs here.
+================================================================================
+
+THE 7 LAYERS (bottom = raw bits, top = the application request)
+  A request is built TOP-DOWN at the client (HTTP -> encrypt -> TCP -> IP ->
+  frames -> bits) and unwrapped BOTTOM-UP at the server.
+
+  #  LAYER          WHAT IT DOES                     ADDRESS/UNIT   IN OUR WORK
+  ---------------------------------------------------------------------------
+  7  Application    protocol apps speak: HTTP,       URLs, headers, path routing
+                    gRPC, DNS                        methods        /v1/*, JWT,
+                                                                    WAF rules,
+                                                                    org rate-limit,
+                                                                    429 / 403
+  6  Presentation   format / ENCRYPTION / compress   TLS cipher     TLS encrypt+
+                                                                    decrypt --
+                                                                    "TLS terminates"
+                                                                    HERE
+  5  Session        set up / tear down a session     (often folded  TLS session
+                                                     into TLS)      lifecycle
+  4  Transport      end-to-end delivery between      TCP/UDP,       TCP handshake,
+                    processes                        PORTS          port 443, 000
+                                                                    conn-refused,
+                                                                    ALB conn ceiling
+                                                                    / accept queue,
+                                                                    concurrency
+  3  Network        route packets across networks    IP ADDRESSES   "block by IP" at
+                                                     routers        WAF, source IP,
+                                                                    route to region
+  2  Data Link      frames between adjacent nodes    MAC, Ethernet  hop-by-hop in
+                                                     switches       the datacenter
+  1  Physical       raw bits on the medium           volts/light/   the fiber/cable
+                                                     radio          -> distance sets
+                                                                    RTT
+
+  Mnemonic 7->1: Please Do Not Throw Sausage Pizza Away.
+
+  "L7 vs L1": L1 is the physical bits on the wire (the transatlantic cable whose
+  LENGTH caused the ~250ms round-trip in the India example); L7 is the meaningful
+  application request (GET /v1/cleanrooms with a Bearer JWT). Same request, most
+  raw vs most meaningful -- bottom vs top of the stack.
+
+
+================================================================================
+THE DISTINCTION THAT TIES IT TOGETHER: L4 vs L7
+================================================================================
+  L4 device (a TCP load balancer, or a CDN doing TLS PASSTHROUGH) sees only
+    IP + PORT. It cannot read the HTTP inside. A DUMB PIPE.
+  L7 device (the ALB, a WAF, the api-gateway) has TERMINATED TLS, so it can read
+    HTTP -- route by path, inspect headers, rate-limit by org. A SMART hop.
+
+  You can only do L7 things AFTER TLS terminates, because the HTTP request (L7)
+  is sealed inside the encrypted payload (L6). This is why WHERE you terminate
+  TLS matters so much: no termination -> no Layer-7 features, just raw forwarding.
+
+
+================================================================================
+TLS TERMINATION -- WHAT IT IS, WHY EDGE TERMINATION IS FAST
+================================================================================
+  "Terminate" = the encrypted HTTPS session ENDS here and is DECRYPTED; the layer
+  now holds the request in CLEARTEXT. From there it forwards plain HTTP inside the
+  trusted network, or opens a FRESH TLS session for the next hop.
+
+  A new HTTPS connection is not free -- the HANDSHAKE costs round trips BEFORE any
+  data flows:
+     TCP handshake  = 1 round trip
+     TLS handshake  = 1-2 round trips (TLS 1.3 = 1, TLS 1.2 = 2)
+     => ~2-3 round trips of pure setup, and a "round trip" is DISTANCE-bound (L1).
+
+  Edge TLS termination (a CDN like CloudFront) helps because:
+    1. the handshake happens over a SHORT distance (user -> nearby edge = low RTT),
+       not user -> far origin;
+    2. the edge keeps a WARM, pooled connection to the origin ALB, so the actual
+       request rides a pre-established pipe and skips a fresh origin handshake.
+
+  Concrete -- user in India, origin ALB in us-east-1 (~250ms/RTT):
+    NO edge (terminate at ALB):  2-3 x 250 = 500-750ms setup PER new connection
+    Edge in Mumbai (~10ms/RTT):  2-3 x 10  = ~20-30ms, then reuse a warm pipe
+
+  Flow with an edge (note TWO TLS sessions):
+    user --HTTPS #1--> CDN edge   (TLS #1 TERMINATES -> cleartext; cache/WAF/headers)
+                        --HTTPS #2 (fresh TLS, warm pooled conn)--> ALB (origin)
+                                              (TLS #2 terminates -> cleartext) -> app
+
+
+================================================================================
+WHAT HAPPENS IF TLS DOES *NOT* TERMINATE AT A LAYER
+================================================================================
+  Case A -- NO CDN at all (this is Habu today): TLS terminates at the ALB directly.
+    Works fine, but distant users pay the FULL long-haul handshake on every new
+    connection (no edge to shorten it), and there is no edge cache/accel/edge-WAF.
+    The ALB is the ONLY termination point AND the global edge. (Also why the 2/2/1
+    compression test hit the ALB connection ceiling directly -- nothing above it
+    absorbed the flood.)
+
+  Case B -- CDN present but TLS PASSTHROUGH (not terminated): the CDN forwards
+    encrypted bytes without decrypting. It then CANNOT cache, CANNOT run WAF,
+    CANNOT reuse connections intelligently -- reduced to a dumb TCP (L4) relay, and
+    the handshake still runs end-to-end. You paid for a CDN and got almost none of
+    its value. (Sometimes done deliberately for strict end-to-end encryption, at
+    the cost of every edge feature.)
+
+  Extreme -- if NOTHING terminated until the app: the ALB could not do path
+    routing, the gateway could not read X-Forwarded-For, no WAF could inspect
+    anything. Every L7 feature lost; only raw TCP forwarding remains.
+
+
+================================================================================
+THE FULL REQUEST PATH, ANNOTATED BY LAYER (Habu -- no CDN, no WAF)
+================================================================================
+  client: https://api.habu.com/v1/cleanrooms  (Bearer JWT)
+     L7  HTTP request built (GET /v1/cleanrooms, Authorization: Bearer <JWT>)
+     L6  TLS encrypts it            -+ sealed from inspection
+     L4  TCP, port 443, handshake    | while in
+     L3  IP packet: client IP -> ALB IP
+     L2  Ethernet frames, hop by hop | transit
+     L1  bits over fiber ------------+
+          ... routed across the internet (L3) over cables (L1) ...
+  ALB (origin, internet-facing, TLS on 443):
+     L1->L4 reassembled
+     L6  TLS TERMINATES -> cleartext HTTP now visible
+     L7  ALB reads /v1/* -> routes to api-gateway
+          api-gateway reads the JWT header -> rate-limits by ORGANIZATION
+          (forward-headers-strategy: framework -> reads X-Forwarded-For = real IP)
+       -> external-api-server -> gRPC downstream (moonraker, ...)
+
+
+================================================================================
+WHERE EACH DEFENSE SITS, BY LAYER (why "match threat to identity" works)
+================================================================================
+  WAF / ALB per-IP            L3 (IP) + L4 (connection)  -- can act BEFORE decrypt
+  000 / ALB connection ceiling L4 (TCP refused)
+  api-gateway rate-limit/org   L7 (must read the JWT header -> needs TLS terminated)
+  backend concurrency bulkhead L7 request handling (per in-flight request)
+
+  => IP-shaped threats are L3/L4: block them EARLY, before decrypting, at the
+     WAF/ALB by IP. ORG-shaped threats are L7: only visible AFTER TLS terminates
+     and the JWT is read, so they belong at the gateway by org. That is the deep
+     reason a rogue ORGANIZATION cannot be handled at the WAF (L3/L4 can't see the
+     org) and a volumetric IP flood should not be handled at the gateway (too
+     late -- it already spent a connection and a decrypt).
+
+
+================================================================================
+ONE-LINE TAKEAWAYS
+================================================================================
+  - L1 = physical bits on the wire; L7 = the HTTP application request. Bottom vs
+    top of the same request.
+  - TLS lives at L6; "terminate" = decrypt so L7 (HTTP) becomes readable.
+  - You can only do L7 work (path routing, WAF, header/JWT reads, caching) AFTER
+    TLS terminates. No termination = a dumb L4 pipe.
+  - Terminate at the EDGE (CDN) to shorten the distance-bound handshake for far
+    users; Habu has no CDN, so the ALB is both the sole termination point and the
+    global edge.
+  - IP threats are L3/L4 (block early at WAF/ALB); org threats are L7 (block at the
+    gateway) -- the same layering that makes the defense-layers model correct.
