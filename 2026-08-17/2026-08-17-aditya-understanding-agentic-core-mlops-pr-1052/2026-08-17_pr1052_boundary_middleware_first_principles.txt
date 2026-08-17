@@ -1,0 +1,343 @@
+================================================================================
+PR #1052 — NAMESPACE BOUNDARY MIDDLEWARE, FROM FIRST PRINCIPLES
+LiveRamp/agentic-core  |  branch MLOP-461-Agentic-boundaries-checks-CI-hooks
+Read 2026-08-17
+================================================================================
+
+All line numbers below were verified by grep against the branch. Everything in
+this file was read at source unless a line is explicitly marked NOT VERIFIED.
+
+
+--------------------------------------------------------------------------------
+1. THE PROBLEM THAT MAKES THIS NECESSARY
+--------------------------------------------------------------------------------
+
+agentic-core runs 18+ LangGraph agents over ONE shared AsyncPostgresStore.
+Isolation between them is by namespace tuple:
+
+    agent A writes under ("A", ...)
+    agent B writes under ("B", ...)
+
+The namespace arrives at the store as a TOOL-CALL ARGUMENT. Tool-call arguments
+are produced by the model. That single fact is the whole problem:
+
+    Anything above the model -- a prompt instruction, a docstring, a naming
+    convention, a code review habit -- is ADVISORY. The model can emit any
+    namespace string it likes, whether through prompt injection or an ordinary
+    bug, and the platform will honour it.
+
+In a single-team prototype that is a bug. In a multi-tenant platform where
+namespaces are keyed by org, agent A writing into agent B's namespace is a
+CROSS-ORG DATA LEAK.
+
+So the check must move BELOW the model, into the tool-call execution path, and
+must derive identity from the caller's auth context rather than from anything
+the model can influence.
+
+Sibling ticket MLOP-451 (Geetha Vardhan, Done) had already defined the memory
+namespace as:
+
+    ("mem", scope, org_id, agent_id, [user_id], collection)
+
+built from the Aegra auth identity, with the ticket text claiming it is built
+"never [from] agent input, so cross-agent access is impossible by construction."
+
+MLOP-461 is the ENFORCEMENT for that claim. The design asserts the invariant;
+the middleware makes it true at runtime. Two halves of one control, owned by
+two different people on the same epic.
+
+
+--------------------------------------------------------------------------------
+2. WHERE THE CHECK LIVES
+--------------------------------------------------------------------------------
+
+  core/shared/rules_engine/boundary.py       249 lines, new
+  core/shared/rules_engine/middleware.py     +13 lines (lazy re-export)
+  core/shared/rules_engine/__init__.py       +13 lines
+  core/shared/rules_engine/tests/test_boundary_middleware.py   252 lines, new
+
+The class extends the existing rules-engine middleware that shipped in
+agentic-core PR #211 "Rules engine" (merged 2026-06-03, +8118 lines), also
+authored by Varsha.
+
+    class BoundaryMiddleware(RulesAgentMiddleware)      boundary.py:128
+
+It hooks LangChain's AgentMiddleware.awrap_tool_call -- the wrapper that sits
+around every tool invocation for agents built with create_agent /
+create_deep_agent.
+
+
+--------------------------------------------------------------------------------
+3. THE RUNTIME PATH, STEP BY STEP
+--------------------------------------------------------------------------------
+
+BoundaryMiddleware.awrap_tool_call            boundary.py:151
+
+  Step 1  -- kill switch
+      if not self._boundary_enabled:                    boundary.py:152-154
+          return await super().awrap_tool_call(...)
+
+  Step 2  -- pull the namespace out of the tool args
+      namespace = extract_namespace_from_args(args)     boundary.py:163
+                                                        (fn at boundary.py:57)
+
+      It scans, in order, for the FIRST of three keys:
+
+          _NAMESPACE_ARG_KEYS = ("namespace", "ns", "store_namespace")
+                                                        boundary.py:29
+
+  Step 3  -- *** THE HOLE *** no namespace found means pass-through
+      if namespace is None:                             boundary.py:164-165
+          return await super().awrap_tool_call(...)
+
+      and independently, inside is_allowed:
+
+          if ns is None:                                boundary.py:102
+              return True  # no namespace target -> not a boundary concern
+                                                        boundary.py:103
+
+  Step 4  -- resolve org identity
+      _resolve_org_id                                   boundary.py:180
+
+      Priority order:
+          self.org_id                    (constructor, most trusted)
+          tool_args["org_id"]            (MODEL-INFLUENCED)
+          state["org_id"]
+          state["configurable"]["org_id"]
+
+  Step 5  -- the actual decision
+      BoundaryCatalog.is_allowed                        boundary.py:94
+
+      Allowed when ns[0] is any of:
+          - the agent_id                                boundary.py:105-107
+          - the caller's org_id                         boundary.py:108-109
+          - a prefix registered for that agent          boundary.py:110-117
+
+      All compared across hyphen/underscore variants via:
+          _id_variants(value) -> {value, value.replace("-","_"),
+                                         value.replace("_","-")}
+                                                        boundary.py:67-69
+
+  Step 6  -- on denial, build an auditable Decision
+      _block_decision                                   boundary.py:196
+
+          Decision(
+              action           = Action.BLOCK,
+              reason           = "Store write to namespace ... blocked: first
+                                  segment ... must equal agent_id ...",
+              policy_ids       = (BOUNDARY_POLICY_ID,),   # boundary.py:26
+              tier_that_decided= Tier.PLATFORM,
+              severity         = Severity.ERROR,
+              metadata         = {namespace, org_id, allowed_prefixes},
+          )
+
+      BOUNDARY_POLICY_ID = "boundary.namespace_must_equal_agent_id"
+                                                        boundary.py:26
+
+  Step 7  -- emit the audit record
+      _emit_audit                                       boundary.py:220
+
+      Builds an ActionRequest(trigger_kind=PRE_TOOL, ...) plus an EvalContext,
+      then calls emit_decision(...) to fan out to every registered sink --
+      logger, OTel, PostgresDecisionSink -- which persists a
+      rules_engine_decisions row.
+
+      An optional explicit _decision_sink is called inside try/except that
+      LOGS rather than raises (boundary.py:244-250) -- audit failure must not
+      become request failure.
+
+  Step 8  -- return a refusal, not an exception
+      return _blocked_tool_message(tool_call_id, tool_name, decision)
+                                                        middleware.py:251
+
+      That builds a synthetic ToolMessage:
+
+          content = f"Blocked by policy: {decision.reason}"
+          additional_kwargs = {rules_engine_blocked: True,
+                               rules_engine_action, rules_engine_tier,
+                               rules_engine_severity, rules_engine_reason,
+                               rules_engine_policy_ids, ...}
+
+      The agent SEES the refusal in-conversation and can recover or explain,
+      instead of the graph dying.
+
+
+--------------------------------------------------------------------------------
+4. THE THREE DESIGN CHOICES WORTH NAMING
+--------------------------------------------------------------------------------
+
+4.1  IDENTITY COMES FROM AUTH, NOT FROM THE ARGUMENT
+     boundary.py:94-118
+
+     ns[0] is compared against agent_id (bound at construction) and org_id.
+     The agent cannot NAME its way out of its own namespace, because the thing
+     it would have to forge is not in the string it controls.
+
+     Caveat: _resolve_org_id (boundary.py:180) falls back to
+     tool_args["org_id"] when the constructor org_id is absent. That fallback
+     IS model-reachable. It only widens (an org_id match permits ns[0]==org_id),
+     so a forged org_id could unlock a namespace. Worth a review question:
+     should the tool_args fallback exist at all, or should org_id be
+     constructor/state only?
+
+
+4.2  BOUNDARY CHECKS BYPASS THE RULES-ENGINE OPT-IN GATE
+     boundary.py:130-135 (class docstring), contrast middleware.py:46
+
+     Every OTHER rule in the engine is behind a two-key gate:
+
+         should_enable_rules(agent_id)                   middleware.py:46
+             = _env_enabled()      -> RULES_ENGINE_ENABLED / config flag
+                                                         middleware.py:57
+               AND
+               _agent_flag(agent_id) -> per-agent "rules_engine": {"enabled":
+                                        true} in liveramp.agents.json
+                                                         middleware.py:66
+
+     The BoundaryMiddleware docstring is explicit about opting out of that:
+
+         "Boundary checks run independently of the rules-engine opt-in gate
+          so isolation cannot be disabled by forgetting
+          rules_engine.enabled."
+
+     The principle: a security property that a forgotten config line can turn
+     off is not a security property. Note the ASYMMETRY that makes this
+     correct -- rules like output filtering are policy (reasonable to opt into
+     per agent); tenant isolation is an invariant (never reasonable to opt out
+     of).
+
+     It does keep its own `enabled` constructor flag (boundary.py:150), so it
+     is still disableable in code -- just not by config omission.
+
+
+4.3  BLOCK IS AUDITABLE, NOT SILENT
+     boundary.py:196-250
+
+     "We blocked it" is worth nothing at a security review if you cannot
+     produce the row. The Decision carries policy_ids, tier, severity, the
+     namespace that was attempted, the org, and the prefixes that WOULD have
+     been allowed -- which is what makes a blocked event debuggable rather
+     than just alarming.
+
+
+--------------------------------------------------------------------------------
+5. THE DEFECT WORTH RAISING IN REVIEW
+--------------------------------------------------------------------------------
+
+    _NAMESPACE_ARG_KEYS = ("namespace", "ns", "store_namespace")
+                                                        boundary.py:29
+
+    if ns is None:
+        return True  # no namespace target -> not a boundary concern
+                                                        boundary.py:102-103
+
+Coverage is keyed off THREE HARDCODED PARAMETER NAMES, and the failure mode
+when a name is not recognised is ALLOW.
+
+Consequence: any store-write tool whose namespace parameter is called
+something else -- path, key, scope, collection, bucket, prefix, ns_tuple --
+receives NO ISOLATION AT ALL, and nothing anywhere reports it. On a dashboard
+it is indistinguishable from "no violations found."
+
+This is the classic fail-open-by-omission shape, and it is exactly the shape
+the middleware's own opt-in-bypass decision (4.2) was designed to avoid one
+level up. The gate cannot be disabled by forgetting a config flag, but the
+CHECK can be evaded by naming a parameter differently.
+
+Two possible hardenings to propose:
+
+  (a) FAIL CLOSED FOR KNOWN STORE-WRITE TOOLS. Keep an allowlist of tool names
+      that write to the store. If such a tool produces no recognised namespace
+      arg, BLOCK rather than allow -- the absence of a namespace on a store
+      write is itself the anomaly.
+
+  (b) ASSERT AT REGISTRATION. When a store-write tool is registered, verify it
+      declares one of the recognised parameter names, and fail startup if not.
+      Moves the failure from silent-runtime to loud-boot.
+
+(a) is stronger; (b) is cheaper and non-breaking. Either converts a silent
+hole into a visible one.
+
+Everything else on the PR's finding list is recoverable. This one is a
+security control with a quiet gap, which is why it is the review comment to
+lead with.
+
+
+--------------------------------------------------------------------------------
+6. SECONDARY OBSERVATIONS FROM THE SOURCE
+--------------------------------------------------------------------------------
+
+6.1  _DEFAULT_CATALOG is a process-wide mutable singleton
+     boundary.py:120-126
+
+         _DEFAULT_CATALOG = BoundaryCatalog()
+         def get_default_catalog() -> BoundaryCatalog:
+             """Shared process-wide catalog (tests may mutate / replace
+             entries)."""
+
+     BoundaryCatalog.register (boundary.py:83) only ever ADDS to a set; there
+     is no unregister. In a server process hosting many agents, any code path
+     that registers a prefix widens the boundary for that agent permanently,
+     for the life of the process. Worth asking whether registration is
+     startup-only in practice.
+
+6.2  _id_variants makes "a-b" and "a_b" equivalent
+     boundary.py:67-69
+
+     Convenient, and probably necessary given the repo mixes both (AGENTS.md
+     mentions a _HYPHEN_AGENTS registry list). But it does mean two agents
+     named "team-x" and "team_x" would share a boundary. Unlikely, worth
+     knowing.
+
+6.3  normalize_namespace accepts both "/" and "." as separators
+     boundary.py:41-51
+
+     "a/b/c", "a.b.c", ["a","b","c"] and ("a","b","c") all normalise to
+     ("a","b","c"). If "/" is present it splits on "/" and never on "."; a
+     namespace like "a.b/c" becomes ("a.b", "c"). Ambiguity is resolved in
+     favour of "/", which is fine as long as callers are consistent.
+
+6.4  The lazy re-export
+     middleware.py:662
+
+         def __getattr__(name: str):
+             if name in {"BoundaryCatalog", "BoundaryMiddleware",
+                         "BOUNDARY_POLICY_ID"}:
+                 from shared.rules_engine import boundary as _boundary
+                 return getattr(_boundary, name)
+
+     Module-level __getattr__ (PEP 562) to expose boundary symbols from
+     middleware without a circular import -- boundary.py imports
+     RulesAgentMiddleware and _blocked_tool_message FROM middleware.py
+     (boundary.py:22). Clean solution to a real cycle.
+
+
+--------------------------------------------------------------------------------
+7. WHAT WAS NOT VERIFIED
+--------------------------------------------------------------------------------
+
+NOT VERIFIED: whether BoundaryMiddleware is actually wired into any agent's
+              middleware chain on this branch. The class exists and has 252
+              lines of tests; adoption was not checked.
+
+NOT VERIFIED: whether it is placed FIRST in the chain. Its own docstring
+              (boundary.py:131-133) says "Place this middleware first (or
+              before other tool-arg expanders)", and RulesAgentMiddleware's
+              docstring (middleware.py:~152) repeats the requirement relative
+              to ResourceMiddleware -- "so a forbidden arg cannot leak via
+              resource-ref expansion." Nothing was found that ENFORCES the
+              ordering; it appears to be documentation only.
+
+NOT VERIFIED: whether any store-write tool in the repo uses a parameter name
+              outside the three recognised keys. This is the question that
+              decides whether section 5 is theoretical or live.
+
+NOT VERIFIED: test_boundary_middleware.py contents (252 lines) -- not read.
+
+NOT READ:     PostgresDecisionSink, emit_decision, decision.py, the
+              validators/base.py ActionRequest and EvalContext definitions.
+
+
+================================================================================
+END
+================================================================================

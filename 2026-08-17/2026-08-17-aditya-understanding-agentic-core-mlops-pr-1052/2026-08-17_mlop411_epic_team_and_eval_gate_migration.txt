@@ -1,0 +1,432 @@
+================================================================================
+MLOP-411 "FY27Q2: AGENTIC CORE X MLOPS" — THE TEAM, THE EPIC, AND THE
+EVAL-GATE MIGRATION IN PR #1052
+Read 2026-08-17
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. THE CORRECTION THAT FRAMES EVERYTHING
+--------------------------------------------------------------------------------
+
+The starting question was "any PR she REVIEWS in agentic core: PR #1052".
+
+Varsha Kota (github vkota-93) is the AUTHOR of #1052, not a reviewer.
+
+    author              vkota-93 (Varsha Kota)
+    requested reviewer  msahu-onramp
+    requested teams     dev-ops, habu-dev, ghm-agentic-core
+    state               OPEN, not draft
+    created             2026-08-17T05:28:52Z
+    base <- head        main <- MLOP-461-Agentic-boundaries-checks-CI-hooks
+    size                +6471 / -265 across 76 files
+    label               change/standard
+                        ("Trivial / minor changes that are low-impact, low risk")
+    human reviews       NONE. Only coderabbitai has commented.
+
+The change/standard label on a 76-file diff that introduces a security control
+is worth questioning -- it may be routing the PR around a heavier review path.
+
+
+--------------------------------------------------------------------------------
+1. THE TEAM
+--------------------------------------------------------------------------------
+
+Project: MLOP ("ML Operations", Jira project 12842)
+Epic:    MLOP-411 "FY27Q2: Agentic Core X MLops"
+         status On Track / priority 3-Low
+         https://liveramp.atlassian.net/browse/MLOP-411
+
+Varsha Kota is the REPORTER on every child story inspected, i.e. she wrote the
+decomposition. She is also assignee on her own workstream.
+
+Three workstreams with named owners:
+
+  A. EVAL / CI GATES / MONITORING / BOUNDARIES   -- Varsha Kota
+       MLOP-459  Model monitoring                              Done
+       MLOP-461  Agentic boundaries checks + CI hooks          Done
+       MLOP-455  Decide filestore future                       Done
+
+  B. COST ATTRIBUTION & BILLING                  -- Manoj Kumar
+       MLOP-438  Agents cost attribution design                Done
+       MLOP-428  Create cost attribution middleware            Done
+       MLOP-436  Unified cost dashboard in Grafana             Done
+       MLOP-437  Daily billing rollups in Postgres             To Do
+       MLOP-429  Pod/compute cost tracking (/metrics)          To Do, unassigned
+
+  C. SHARED MEMORY + GOVERNANCE                  -- Geetha Vardhan
+       MLOP-451  Add shared memory abstraction                 Done
+       MLOP-452  Rules engine governance for memory            Done
+       MLOP-453  Define memory registry opt-in                 To Do, unassigned
+       MLOP-458  Data access regression                        To Do
+
+*** CAVEAT: only 10 child stories were enumerated. The Jira API paged out with
+    remainingCount: 12. There may be a fourth workstream. ***
+
+THE THROUGH-LINE:
+
+    agentic-core is a multi-tenant agent platform (18+ graphs, many owning
+    teams), and MLOps is retrofitting the three things a platform needs before
+    it can be trusted in production -- cost visibility, quality regression
+    gates, and tenant isolation.
+
+Cross-workstream dependency worth noticing: MLOP-451 (Geetha) defines the
+memory namespace as ("mem", scope, org_id, agent_id, [user_id], collection)
+built from auth identity, "never agent input, so cross-agent access is
+impossible by construction." MLOP-461 (Varsha) is the runtime ENFORCEMENT of
+exactly that claim. The design asserts the invariant; the middleware makes it
+true.
+
+
+--------------------------------------------------------------------------------
+2. WHAT PR #1052 ACTUALLY CONTAINS — FOUR CHANGES, NOT ONE
+--------------------------------------------------------------------------------
+
+  (1) NAMESPACE BOUNDARY ENFORCEMENT  <- the only part matching MLOP-461
+        core/shared/rules_engine/boundary.py                     +249
+        core/shared/rules_engine/middleware.py                   +13
+        core/shared/rules_engine/tests/test_boundary_middleware.py +252
+      See the companion file:
+      2026-08-17_pr1052_boundary_middleware_first_principles.txt
+
+  (2) EVAL GATES MOVED GITHUB ACTIONS -> JENKINS
+        Jenkinsfile                                              +38
+        scripts/ci/check_eval_matrix.py                          +240
+        scripts/ci/ensure_eval_matrix_entry.py                   +169
+        scripts/ci/eval_matrix_common.py                         +108
+        scripts/ci/eval_plan.py                                  +105
+        scripts/ci/run_eval_gates.sh                             +139
+        scripts/ci/run_pr_evals.py                               +258/-37
+        scripts/ci/eval_matrix.toml                              +71/-22
+        .github/workflows/pr-eval.yml                            +9/-31
+        .github/workflows/pr-eval-on-push.yml                    +2/-14
+        AGENTS.md                                                +7
+
+  (3) POSTGRES-BACKED EVAL SERVICE (with in-memory fallback)
+        compatibility/eval/job_store.py                          +275/-4
+        compatibility/eval/baseline_store.py                     +308
+        compatibility/eval/rubrics/store.py                      +138/-4
+        compatibility/eval/migrations/001_eval_baselines.sql     +14
+        compatibility/eval/migrations/002_eval_jobs.sql          +17
+        compatibility/eval/migrations/003_eval_rubrics.sql       +11
+        compatibility/eval/routers/evals.py                      +104/-5
+
+  (4) PLATFORM METRICS + DRIFT DETECTION
+        compatibility/eval/metrics/cost_metrics.py               +237
+        compatibility/eval/metrics/policy_metrics.py             +99
+        compatibility/eval/monitoring/detectors.py               +281
+        compatibility/eval/monitoring/__init__.py                +25
+
+  Plus ~1,400 lines of tests and ~350 lines of documentation.
+
+
+--------------------------------------------------------------------------------
+3. THE STACKING PROBLEM — REVIEW HAZARD
+--------------------------------------------------------------------------------
+
+#1052 is stacked on two of the same author's still-open PRs. The commit list
+on the branch shows merge commits from mlop-459-model-monitoring-eval-hooks,
+and commit b4af93c4 "Add baseline storage and comparison functionality" is the
+head of #722.
+
+    PR    opened       size            state    subject
+    ----  -----------  --------------  -------  ------------------------------
+    #722  2026-07-20   +2018 / -24     OPEN     baseline storage + comparison
+    #1041 2026-08-14   +5944 / -265    OPEN     MLOP-459 model monitoring hooks
+    #1052 2026-08-17   +6471 / -265    OPEN     MLOP-461 boundaries + CI hooks
+
+#1041 and #1052 are nearly the same size because #1052 CONTAINS #1041.
+
+Consequences:
+  - Reviewing #1052 in isolation means re-reviewing #722 and #1041.
+  - Merging out of order produces conflicts.
+  - ~14,400 lines from one author are in flight simultaneously, and the newest
+    has no human review.
+
+Reasonable ask: split the ~250-line boundary change out so it can land on its
+own merits, independent of ~6,200 lines of eval infrastructure. It is the part
+with a security argument and the shortest review.
+
+
+--------------------------------------------------------------------------------
+4. WHY THE EVAL GATES MOVED TO JENKINS
+--------------------------------------------------------------------------------
+
+Source: docs/test-and-evaluate/eval-gates-for-agent-owners.md (new, 80 lines,
+read in full) and AGENTS.md.
+
+4.1  WHY NOT GITHUB ACTIONS
+
+     An eval is not a unit test. It needs the whole stack up:
+
+         postgres, langfuse, chromadb        (infra)
+         agent-server on :8080               (the agent under test)
+         search-server on :8081              (marketplace/example suites)
+         a google-api-key credential         (the LLM judge)
+
+     Jenkins already owns the deploy pipeline, the k8s agent pods
+     (k8sAgentYaml(cpu: '4', memory: '8Gi') in the Jenkinsfile) and the
+     credential store. GitHub Actions has none of that.
+
+     The GHA workflows are kept as workflow_dispatch MANUAL FALLBACKS rather
+     than deleted -- the migration stays reversible.
+
+     Two new Jenkins stages (named in the doc; the stage bodies themselves
+     were NOT read in the Jenkinsfile):
+         "Validate Eval Matrix"   -> scripts/ci/check_eval_matrix.py
+         "Eval Gates"             -> scripts/ci/run_eval_gates.sh
+     Jenkins archives eval-report.json and eval-reports/** from Eval Gates.
+
+
+4.2  COVERAGE BY DEFAULT, NOT BY OPT-IN — the real design idea
+
+     With 18+ graphs across many owning teams, a gate teams must opt into only
+     measures the teams who were already careful. New agents land uncovered
+     and nobody notices.
+
+     Three mechanisms make coverage the default:
+
+     (a) [agent.default] in scripts/ci/eval_matrix.toml is a generic
+         agent-server smoke. The CI runner INJECTS the registry graph_id for
+         every touched enrolled agent. The doc is explicit:
+             "no per-agent smoke entry required"
+             "do not hand-edit a per-agent smoke block"
+         Empty thresholds mean the gate is "agent responds + eval pipeline
+         completes" -- deliberately weak, but non-zero and automatic.
+
+     (b) check_eval_matrix.py runs as a Jenkins stage that FAILS THE PR on
+         coverage violations. The gate enforces its own adoption.
+
+     (c) AGENTS.md adds it to the new-agent checklist marked "do not skip":
+             1. Register _HYPHEN_AGENTS + run uv run registry / core/compile.py
+             2. Must run check_eval_matrix.py (and ensure_eval_matrix_entry.py
+                if evaluation/ exists)
+         So the instruction reaches both humans and the coding agents that
+         read AGENTS.md.
+
+
+4.3  FOLDER-SCOPED TRIGGERS
+
+     A change under core/agents/marketplace-search/ does NOT run
+     segmentation/xmi/cleanroom evals.
+
+     eval_matrix.toml maps change categories to checks via git pathspecs.
+     Categories read: prompts, tools, models, retrieval, guardrails.
+     Example:
+
+         [categories.retrieval]
+         paths = ["core/agents/marketplace-search/**",
+                  "compatibility/search/**",
+                  "core/**/*retrieval*", "core/**/*chroma*",
+                  "core/**/*embed*"]
+
+     Two run types per category:
+         eval_ci  -> scripts/eval_ci.py, JSON datasets against a live agent URL
+                     with thresholds like {faithfulness = 0.49, recall_at_5 = 0.0}
+         uv_eval  -> uv run eval <target>, Langfuse experiments / golden tests
+
+     Rationale: without scoping, every PR pays for every agent's evals, CI
+     time explodes, and teams route around the gate. A gate people avoid is
+     worse than no gate, because it also produces false confidence.
+
+     Nice detail -- deliberate rubric alignment for dedupe:
+         "# Same rubric fields as [agent.marketplace_search] rag run so
+          dedupe merges to one batch."
+
+
+4.4  GRADUATED ENFORCEMENT — the mature call
+
+     Three named, VISIBLE downgrade paths:
+
+         advisory = true      on a uv_eval block: runs, reports
+                              "ADVISORY FAIL: <target>", never blocks. Used
+                              today by several agents "while their teams fix
+                              harness issues."
+         opt_out = true       + a REQUIRED reason. Reference stubs only.
+         EVAL_REGRESSION_     POST /eval/compare regression check is advisory
+         ALLOWLIST            unless the agent is listed.
+
+     The principle:
+
+         A gate with no legitimate downgrade path gets DISABLED outright.
+         A gate with a named, visible downgrade path stays on and stays honest
+         about what is degraded.
+
+     "ADVISORY FAIL" in the log is strictly more information than a deleted
+     CI job. The re-enable path is documented as: get
+     `uv run eval <folder>` passing locally, then delete advisory = true.
+
+
+4.5  THE FAILURE-TRIAGE TABLE (from the doc, reproduced because it is the
+     most reusable artifact in the PR)
+
+     Validate Eval Matrix fails    -> invalid default smoke / bad opt-out /
+                                      bad uv_eval; advisory must be boolean
+                                      and only on uv_eval
+     eval_ci threshold / rubric    -> score below matrix threshold; fix agent
+                                      or relax threshold DELIBERATELY
+     uv run eval exit 1            -> golden threshold miss; fix agent or
+       (non-advisory)                 adjust eval_config.thresholds
+     ADVISORY FAIL: <target>       -> non-blocking; owning team should fix
+     Agent-server / health timeout -> stack did not come up; check archived
+                                      logs, ensure google-api-key exists
+     :8080 graph_id missing        -> assistant not registered; confirm
+                                      registry name maps from the agent dir
+
+
+--------------------------------------------------------------------------------
+5. WHY POSTGRES STORAGE, BASELINES, AND DETECTORS
+--------------------------------------------------------------------------------
+
+5.1  WHY PERSISTENCE
+
+     Eval jobs, rubrics and score baselines were IN-MEMORY -- they died with
+     the process. You could score a PR but not answer "is this worse than last
+     week?" A regression gate is DEFINITIONALLY a comparison against a stored
+     prior, so the gate could not exist without the tables.
+
+     Hence 001_eval_baselines.sql, 002_eval_jobs.sql, 003_eval_rubrics.sql and
+     the POST /eval/compare endpoint. An in-memory fallback is retained so
+     local dev and CI without Postgres still function.
+
+5.2  WHY THE EVAL HARNESS NEEDS ITS OWN MONITORING  (MLOP-459, PR #1041)
+
+     This is the subtle one and the best idea in the epic.
+
+         A judge call that FAILS returns value == 0.0.
+         A genuinely bad agent response ALSO scores 0.0.
+
+     Without a detector, "the eval service is broken" and "all evals green"
+     produce THE SAME DASHBOARD. The gate would report success precisely when
+     it had stopped working.
+
+     Three detectors, from the MLOP-459 ticket text:
+
+         JudgeSaturationDetector  -- judge semaphore waits / 429s. The
+                                     _judge_semaphore caps at
+                                     config.max_concurrent_judge_calls = 5,
+                                     so under load judging degrades silently.
+         ZeroScoreSpikeDetector   -- share of value == 0.0 over a threshold.
+                                     Ticket acceptance criterion: fires when
+                                     >10% of a metric's scores are 0.0.
+         ScoreDriftDetector       -- PSI (population stability index) against
+                                     a trailing-7-day baseline.
+
+     Each returns Anomaly(metric, severity, observed, expected, trace_ids).
+     Acceptance criteria require no false positives on a healthy baseline
+     sample.
+
+     *** NOT VERIFIED: detectors.py was NOT read. Everything in 5.2 comes from
+         the Jira ticket description, not the code. The thresholds, the
+         semaphore cap, and the Anomaly shape are unconfirmed. ***
+
+
+--------------------------------------------------------------------------------
+6. OPEN FINDINGS ON THE PR (CodeRabbit — bot claims, NOT reproduced)
+--------------------------------------------------------------------------------
+
+7 actionable comments, 2 Critical.
+
+  CRITICAL  scripts/ci/eval_plan.py:58
+            "A no-work eval plan turns the Eval Gates stage red."
+            run_pr_evals.cmd_detect returns 0 with no work, and the stage
+            treats that as failure. A PR touching nothing eval-relevant fails
+            CI -- the gate's own false positive, and exactly the kind of thing
+            that gets a gate disabled (see 4.4).
+
+  CRITICAL  scripts/ci/ensure_eval_matrix_entry.py:109
+            "Guard against emitting a duplicate [agent.<dir>.uv_eval] table."
+            _has_uv_eval_target does not detect an existing entry in all
+            cases. The doc promises the helper is idempotent; it is not.
+
+  MAJOR     compatibility/eval/baseline_store.py:105
+            _connect() calls psycopg.connect with NO CONNECT TIMEOUT.
+
+  MAJOR     compatibility/eval/routers/evals.py:140
+            Three `async def` endpoints make BLOCKING baseline-store calls --
+            should run in a worker thread. Blocks the event loop.
+
+  MAJOR     scripts/ci/run_eval_gates.sh:110
+            The eval-service container is never removed
+            (docker run -d --name agentic-eval-...), so RE-RUNS FAIL.
+
+  MAJOR     Jenkinsfile:259
+            Security & privacy finding.
+
+  MINOR     scripts/eval_ci.py:54
+            Functional correctness.
+
+Pattern worth noting: three of the seven (eval_plan, ensure_eval_matrix_entry,
+run_eval_gates.sh) are defects IN THE GATE ITSELF -- false-positive failures,
+broken idempotency, non-rerunnable containers. A gate that fails spuriously or
+cannot be re-run is a gate that will be bypassed. These matter more than their
+severity labels suggest.
+
+
+--------------------------------------------------------------------------------
+7. PROCESS OBSERVATIONS
+--------------------------------------------------------------------------------
+
+  - MLOP-459 and MLOP-461 are both marked DONE in Jira (updated 2026-08-16)
+    while their PRs are OPEN and un-reviewed by any human. Jira status and
+    merge state have diverged; the epic reports On Track on that basis.
+
+  - Three stacked open PRs from one author, 2026-07-20 -> 2026-08-17,
+    ~+14,400 lines total.
+
+  - PR #596 (2026-07-03, open) "Add 'Test Eval CI' stage to Jenkinsfile" was
+    the first move toward Jenkins -- also still open, 6 weeks later.
+
+  - PR #37 (2026-04-08, open) is labelled "[DONOT MERGE] Test/eval PR comment
+    marketplace assistant", +9071 lines, open 4 months.
+
+    Read together: eval-infrastructure work in this repo has a pattern of
+    large PRs that stay open for long periods. The Jenkins migration in #1052
+    is the third attempt at the same goal.
+
+
+--------------------------------------------------------------------------------
+8. PRIOR ART IN THE SAME REPO
+--------------------------------------------------------------------------------
+
+    PR    date        state    subject
+    ----  ----------  -------  -----------------------------------------------
+    #36   2026-04-06  MERGED   CI evaluation system with GitHub Actions
+                               workflows and rubric-based assessment (+3748)
+                               <- the thing #1052 is migrating OFF
+    #211  2026-06-03  MERGED   Rules engine (+8118)
+                               <- the framework BoundaryMiddleware extends
+    #596  2026-07-03  OPEN     'Test Eval CI' Jenkinsfile stage
+    #37   2026-04-08  OPEN     [DONOT MERGE] eval PR-comment experiment
+
+
+--------------------------------------------------------------------------------
+9. WHAT WAS NOT VERIFIED
+--------------------------------------------------------------------------------
+
+NOT READ:  compatibility/eval/monitoring/detectors.py
+           compatibility/eval/metrics/cost_metrics.py
+           compatibility/eval/metrics/policy_metrics.py
+           compatibility/eval/baseline_store.py
+           compatibility/eval/job_store.py
+           scripts/ci/run_eval_gates.sh
+           scripts/ci/eval_plan.py
+           scripts/ci/check_eval_matrix.py
+           scripts/ci/ensure_eval_matrix_entry.py
+
+PARTIAL:   Jenkinsfile -- first 70 lines only (environment block and early
+           stages). The "Validate Eval Matrix" and "Eval Gates" stage bodies
+           were NOT read; they are described from the docs.
+           eval_matrix.toml -- first ~110 lines, 5 of the categories.
+           AGENTS.md -- ~120 lines.
+
+UNVERIFIED CLAIMS: all 7 CodeRabbit findings are bot output and were not
+           independently reproduced.
+
+INCOMPLETE: only 10 of ~22 MLOP-411 child stories enumerated
+           (remainingCount: 12).
+
+
+================================================================================
+END
+================================================================================
