@@ -1,0 +1,1232 @@
+====================================================================================================
+XMI change-event consumer
+  queue  : https://sqs.us-east-2.amazonaws.com/930272866731/aditya-change-events.fifo
+  region : us-east-2
+====================================================================================================
+SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
+SLF4J: Defaulting to no-operation (NOP) logger implementation
+SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #1
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 185210d3-948d-41bc-965f-7d2e46740d85
+  MessageGroupId   : req-create-01-ef436b50
+  SequenceNumber   : 37350909256068063232
+  DeduplicationId  : 3a14acba23b517049a04e02b7b3fee59ff72384b3a548002fb2c239e2f168cc9
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 190bf510-05ec-5455-af00-97ea6b99a399
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-01-ef436b50
+      eventType = com.liveramp.cleanroom.data_connection.created
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 1966c173-7a5d-4d32-8310-5b1ae5637ba0   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.created
+  subject          : org-adidas-emea/DATA_CONNECTION/509912ad-2b40-4b1c-bb2a-4875496aad05
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : 509912ad-2b40-4b1c-bb2a-4875496aad05
+      objectName   : Adidas Connection 01
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-create-01-ef436b50
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "1966c173-7a5d-4d32-8310-5b1ae5637ba0",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.created",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/509912ad-2b40-4b1c-bb2a-4875496aad05",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "509912ad-2b40-4b1c-bb2a-4875496aad05",
+                         "objectName" : "Adidas Connection 01",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-01-ef436b50"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #2
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : bce5d5e2-1df0-4f73-81c9-81d5c2410a7f
+  MessageGroupId   : req-create-01-ef436b50
+  SequenceNumber   : 37350909256331743232
+  DeduplicationId  : dd006168d45d84f2ccf0edb3cd28ab8fed4bf52880006ae7936b153c9dfd3758
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 1cb4fff6-55f8-5709-b33e-9d0c3b8e37e5
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-01-ef436b50
+      eventType = com.liveramp.cleanroom.organizationjobparameter.created
+      objectType = ORGANIZATIONJOBPARAMETER
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : ffda3319-e6f8-4072-b589-bedb1f6c1273   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.organizationjobparameter.created
+  subject          : org-adidas-emea/ORGANIZATIONJOBPARAMETER/3d7d2044-5c5e-4e9c-b190-9b4029f60628
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : 3d7d2044-5c5e-4e9c-b190-9b4029f60628
+      objectName   : DataLocation
+      objectType   : ORGANIZATIONJOBPARAMETER
+      orgId        : org-adidas-emea
+      requestId    : req-create-01-ef436b50
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "ffda3319-e6f8-4072-b589-bedb1f6c1273",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.organizationjobparameter.created",
+                       "subject" : "org-adidas-emea/ORGANIZATIONJOBPARAMETER/3d7d2044-5c5e-4e9c-b190-9b4029f60628",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "3d7d2044-5c5e-4e9c-b190-9b4029f60628",
+                         "objectName" : "DataLocation",
+                         "objectType" : "ORGANIZATIONJOBPARAMETER",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-01-ef436b50"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #3
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : d79d2a37-2cf3-40bc-a257-b8c2eb97a9f4
+  MessageGroupId   : req-create-01-ef436b50
+  SequenceNumber   : 37350909256416479232
+  DeduplicationId  : 99019a50092b4c8c5cf9b80ab0cd91772c791aa7ea43def97f08588e4a24258d
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 4006caea-5837-5257-9da9-a810364052bb
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-01-ef436b50
+      eventType = com.liveramp.cleanroom.organizationjobparameter.created
+      objectType = ORGANIZATIONJOBPARAMETER
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : c49993d1-559c-4c19-9ebb-be038014d886   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.organizationjobparameter.created
+  subject          : org-adidas-emea/ORGANIZATIONJOBPARAMETER/c6e9b95b-ee6a-496f-ac5e-33cc72676cff
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : c6e9b95b-ee6a-496f-ac5e-33cc72676cff
+      objectName   : FieldDelimiter
+      objectType   : ORGANIZATIONJOBPARAMETER
+      orgId        : org-adidas-emea
+      requestId    : req-create-01-ef436b50
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "c49993d1-559c-4c19-9ebb-be038014d886",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.organizationjobparameter.created",
+                       "subject" : "org-adidas-emea/ORGANIZATIONJOBPARAMETER/c6e9b95b-ee6a-496f-ac5e-33cc72676cff",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "c6e9b95b-ee6a-496f-ac5e-33cc72676cff",
+                         "objectName" : "FieldDelimiter",
+                         "objectType" : "ORGANIZATIONJOBPARAMETER",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-01-ef436b50"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #4
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 48d2fcc0-995c-472b-91aa-ae2cd77d8832
+  MessageGroupId   : req-create-02-fe5ed5fe
+  SequenceNumber   : 37350909256487903232
+  DeduplicationId  : 59534bfeab86bab01034975ff2e7d29d5e025ff801e30cf0c7a61d348d02f5cd
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 77386dbd-16fc-5819-8f1f-0f47788b38f5
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-02-fe5ed5fe
+      eventType = com.liveramp.cleanroom.data_connection.created
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : e0fd8055-73ce-454b-86db-a0eeda08b3a0   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.created
+  subject          : org-adidas-emea/DATA_CONNECTION/8a3baa2b-f185-48a5-ab56-f54cf4bcbaa8
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : 8a3baa2b-f185-48a5-ab56-f54cf4bcbaa8
+      objectName   : Adidas Connection 02
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-create-02-fe5ed5fe
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "e0fd8055-73ce-454b-86db-a0eeda08b3a0",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.created",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/8a3baa2b-f185-48a5-ab56-f54cf4bcbaa8",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "8a3baa2b-f185-48a5-ab56-f54cf4bcbaa8",
+                         "objectName" : "Adidas Connection 02",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-02-fe5ed5fe"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #5
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : afafc8a5-c03d-4fa3-988e-7ba6a6122be1
+  MessageGroupId   : req-create-02-fe5ed5fe
+  SequenceNumber   : 37350909256572639232
+  DeduplicationId  : a9ca085e20188964766fc96ffc97bf82f139f2eff97441d7a55cdc7f356eb985
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 23408d54-e152-5986-9877-efae8f25796a
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-02-fe5ed5fe
+      eventType = com.liveramp.cleanroom.organizationjobparameter.created
+      objectType = ORGANIZATIONJOBPARAMETER
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 462ff2ab-c612-461b-8398-4b877263842f   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.organizationjobparameter.created
+  subject          : org-adidas-emea/ORGANIZATIONJOBPARAMETER/d4d34c08-7309-4ae4-bdb0-2346f9b01237
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : d4d34c08-7309-4ae4-bdb0-2346f9b01237
+      objectName   : DataLocation
+      objectType   : ORGANIZATIONJOBPARAMETER
+      orgId        : org-adidas-emea
+      requestId    : req-create-02-fe5ed5fe
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "462ff2ab-c612-461b-8398-4b877263842f",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.organizationjobparameter.created",
+                       "subject" : "org-adidas-emea/ORGANIZATIONJOBPARAMETER/d4d34c08-7309-4ae4-bdb0-2346f9b01237",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "d4d34c08-7309-4ae4-bdb0-2346f9b01237",
+                         "objectName" : "DataLocation",
+                         "objectType" : "ORGANIZATIONJOBPARAMETER",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-02-fe5ed5fe"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #6
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 7655e1ae-3857-4487-80c8-60c41f98ec62
+  MessageGroupId   : req-create-02-fe5ed5fe
+  SequenceNumber   : 37350909256654816256
+  DeduplicationId  : 0e52444d44da9032e5a5242996d48b6e3dca72c7dd8fc34cfc16c92594fa9954
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 02addb06-93b1-530d-9623-b9fcfdc673e1
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-02-fe5ed5fe
+      eventType = com.liveramp.cleanroom.organizationjobparameter.created
+      objectType = ORGANIZATIONJOBPARAMETER
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : da6b2821-a4e8-438e-8f5d-a2a947ac7937   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.organizationjobparameter.created
+  subject          : org-adidas-emea/ORGANIZATIONJOBPARAMETER/28e27b78-2940-4351-9977-2eaed3a6b7dc
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : 28e27b78-2940-4351-9977-2eaed3a6b7dc
+      objectName   : FieldDelimiter
+      objectType   : ORGANIZATIONJOBPARAMETER
+      orgId        : org-adidas-emea
+      requestId    : req-create-02-fe5ed5fe
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "da6b2821-a4e8-438e-8f5d-a2a947ac7937",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.organizationjobparameter.created",
+                       "subject" : "org-adidas-emea/ORGANIZATIONJOBPARAMETER/28e27b78-2940-4351-9977-2eaed3a6b7dc",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "28e27b78-2940-4351-9977-2eaed3a6b7dc",
+                         "objectName" : "FieldDelimiter",
+                         "objectType" : "ORGANIZATIONJOBPARAMETER",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-02-fe5ed5fe"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #7
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 8cf4b5a8-f4a4-45a2-bad7-edfa6c8a8931
+  MessageGroupId   : req-create-03-82b12f17
+  SequenceNumber   : 37350909256738271232
+  DeduplicationId  : bc061b697f0e8050c43be70b08afbafa20d450f634ef5bea6e8f8096770ab7dd
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 354d4ba8-261d-5877-9dc7-29524865889b
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-03-82b12f17
+      eventType = com.liveramp.cleanroom.data_connection.created
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 373f54f5-ddf5-4316-90a2-ebce78f74ec7   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.created
+  subject          : org-adidas-emea/DATA_CONNECTION/cc71a337-bd6c-4f60-896a-2b56e668227f
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : cc71a337-bd6c-4f60-896a-2b56e668227f
+      objectName   : Adidas Connection 03
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-create-03-82b12f17
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "373f54f5-ddf5-4316-90a2-ebce78f74ec7",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.created",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/cc71a337-bd6c-4f60-896a-2b56e668227f",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "cc71a337-bd6c-4f60-896a-2b56e668227f",
+                         "objectName" : "Adidas Connection 03",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-03-82b12f17"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #8
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 2b2dcef7-bef5-4c77-8453-8b7e8ea7e5b4
+  MessageGroupId   : req-create-03-82b12f17
+  SequenceNumber   : 37350909256836575232
+  DeduplicationId  : 12d050119a9810b0b3c949528cee5809c0a15df080ad667d83ce258215b28b4c
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 65f56104-a285-5616-b310-03feccfd56fa
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-03-82b12f17
+      eventType = com.liveramp.cleanroom.organizationjobparameter.created
+      objectType = ORGANIZATIONJOBPARAMETER
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 7a74c4a1-7d50-4f57-ba51-6597842f58e1   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.organizationjobparameter.created
+  subject          : org-adidas-emea/ORGANIZATIONJOBPARAMETER/865336cf-f00d-4c7a-990d-19cc2c4c9a9d
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : 865336cf-f00d-4c7a-990d-19cc2c4c9a9d
+      objectName   : DataLocation
+      objectType   : ORGANIZATIONJOBPARAMETER
+      orgId        : org-adidas-emea
+      requestId    : req-create-03-82b12f17
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "7a74c4a1-7d50-4f57-ba51-6597842f58e1",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.organizationjobparameter.created",
+                       "subject" : "org-adidas-emea/ORGANIZATIONJOBPARAMETER/865336cf-f00d-4c7a-990d-19cc2c4c9a9d",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "865336cf-f00d-4c7a-990d-19cc2c4c9a9d",
+                         "objectName" : "DataLocation",
+                         "objectType" : "ORGANIZATIONJOBPARAMETER",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-03-82b12f17"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #9
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 39ed544f-b3ad-4f6c-9e24-6b80647485a1
+  MessageGroupId   : req-create-03-82b12f17
+  SequenceNumber   : 37350909256913120256
+  DeduplicationId  : 2cc9b75503c1f7426c6dcde53a6d302d24082ac79bd102d1b8b61c90c3bc6feb
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 6448a0dc-ea46-54d4-b758-c226843e4438
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-03-82b12f17
+      eventType = com.liveramp.cleanroom.organizationjobparameter.created
+      objectType = ORGANIZATIONJOBPARAMETER
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : aae0af3c-ad5b-4f09-b628-cae2c98392fa   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.organizationjobparameter.created
+  subject          : org-adidas-emea/ORGANIZATIONJOBPARAMETER/c667388b-1fb1-4c59-9128-3db34a8ad784
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : c667388b-1fb1-4c59-9128-3db34a8ad784
+      objectName   : FieldDelimiter
+      objectType   : ORGANIZATIONJOBPARAMETER
+      orgId        : org-adidas-emea
+      requestId    : req-create-03-82b12f17
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "aae0af3c-ad5b-4f09-b628-cae2c98392fa",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.organizationjobparameter.created",
+                       "subject" : "org-adidas-emea/ORGANIZATIONJOBPARAMETER/c667388b-1fb1-4c59-9128-3db34a8ad784",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "c667388b-1fb1-4c59-9128-3db34a8ad784",
+                         "objectName" : "FieldDelimiter",
+                         "objectType" : "ORGANIZATIONJOBPARAMETER",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-03-82b12f17"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #10
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : d84bd6b0-9e03-4ba8-9d31-fb96f3396cab
+  MessageGroupId   : req-create-04-1c56f3c9
+  SequenceNumber   : 37350909257010655232
+  DeduplicationId  : dd9669aecca3e424f540069b972cce670121eee08ef810aca0ec9416c5423af1
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : a0eeb524-ef26-516e-bef3-d7de815f8182
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-04-1c56f3c9
+      eventType = com.liveramp.cleanroom.data_connection.created
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 1e418e03-2b94-451d-a75f-078da0f5936b   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.created
+  subject          : org-adidas-emea/DATA_CONNECTION/d01cdc1f-1f49-496b-a3f2-52928d7b3bb3
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : d01cdc1f-1f49-496b-a3f2-52928d7b3bb3
+      objectName   : Adidas Connection 04
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-create-04-1c56f3c9
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "1e418e03-2b94-451d-a75f-078da0f5936b",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.created",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/d01cdc1f-1f49-496b-a3f2-52928d7b3bb3",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "d01cdc1f-1f49-496b-a3f2-52928d7b3bb3",
+                         "objectName" : "Adidas Connection 04",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-04-1c56f3c9"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #11
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : a177d993-62c6-4d25-9c5d-a63e8dcff509
+  MessageGroupId   : req-create-04-1c56f3c9
+  SequenceNumber   : 37350909257083103488
+  DeduplicationId  : d9582f8cba1fc92b4e260b76c9e7563aae2e576ee34be8df90eb1229c0dcc6d6
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 4114329b-72f8-536d-b570-50611c81f381
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-04-1c56f3c9
+      eventType = com.liveramp.cleanroom.organizationjobparameter.created
+      objectType = ORGANIZATIONJOBPARAMETER
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 8da0d42d-09e7-4670-8f29-9f2478fd6215   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.organizationjobparameter.created
+  subject          : org-adidas-emea/ORGANIZATIONJOBPARAMETER/19af535c-969b-4e8e-b94f-ff514386a7e7
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : 19af535c-969b-4e8e-b94f-ff514386a7e7
+      objectName   : DataLocation
+      objectType   : ORGANIZATIONJOBPARAMETER
+      orgId        : org-adidas-emea
+      requestId    : req-create-04-1c56f3c9
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "8da0d42d-09e7-4670-8f29-9f2478fd6215",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.organizationjobparameter.created",
+                       "subject" : "org-adidas-emea/ORGANIZATIONJOBPARAMETER/19af535c-969b-4e8e-b94f-ff514386a7e7",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "19af535c-969b-4e8e-b94f-ff514386a7e7",
+                         "objectName" : "DataLocation",
+                         "objectType" : "ORGANIZATIONJOBPARAMETER",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-04-1c56f3c9"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #12
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : f7d68b6c-f25c-4b51-b3a7-7932d4ceddbc
+  MessageGroupId   : req-create-04-1c56f3c9
+  SequenceNumber   : 37350909257153759488
+  DeduplicationId  : 47accf78f1c730681aa9423a7fa39502199ec8496cd17560258c0da0dd764c1f
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : a21a2056-26b2-5be0-9bf9-42ac48cbcb0c
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-04-1c56f3c9
+      eventType = com.liveramp.cleanroom.organizationjobparameter.created
+      objectType = ORGANIZATIONJOBPARAMETER
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 0f9825e7-f43a-4e6a-8c95-6c4d04eddf8b   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.organizationjobparameter.created
+  subject          : org-adidas-emea/ORGANIZATIONJOBPARAMETER/96cbb29f-fa17-465a-9e29-dc17d66da4a8
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : 96cbb29f-fa17-465a-9e29-dc17d66da4a8
+      objectName   : FieldDelimiter
+      objectType   : ORGANIZATIONJOBPARAMETER
+      orgId        : org-adidas-emea
+      requestId    : req-create-04-1c56f3c9
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "0f9825e7-f43a-4e6a-8c95-6c4d04eddf8b",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.organizationjobparameter.created",
+                       "subject" : "org-adidas-emea/ORGANIZATIONJOBPARAMETER/96cbb29f-fa17-465a-9e29-dc17d66da4a8",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "96cbb29f-fa17-465a-9e29-dc17d66da4a8",
+                         "objectName" : "FieldDelimiter",
+                         "objectType" : "ORGANIZATIONJOBPARAMETER",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-04-1c56f3c9"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #13
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 62581c1b-0e01-44b4-901d-bc1a9c945f4d
+  MessageGroupId   : req-create-05-c65a01b2
+  SequenceNumber   : 37350909257227231232
+  DeduplicationId  : 54c8815862635406b1e2a1e38ec64ade713a9ed5f4ea1be5ef7f6f037e5ee1c8
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : ce299273-a9a8-5287-ac01-f089c7d2726b
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-05-c65a01b2
+      eventType = com.liveramp.cleanroom.data_connection.created
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : eac1abed-b5b0-42fb-aaaa-d0e834c94cb8   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.created
+  subject          : org-adidas-emea/DATA_CONNECTION/fc5cad39-faaf-4f78-8260-3d42f753a81e
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : fc5cad39-faaf-4f78-8260-3d42f753a81e
+      objectName   : Adidas Connection 05
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-create-05-c65a01b2
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "eac1abed-b5b0-42fb-aaaa-d0e834c94cb8",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.created",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/fc5cad39-faaf-4f78-8260-3d42f753a81e",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "fc5cad39-faaf-4f78-8260-3d42f753a81e",
+                         "objectName" : "Adidas Connection 05",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-05-c65a01b2"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #14
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 2484ecf6-6477-43c2-bc4c-75c1e7ba2ebf
+  MessageGroupId   : req-create-05-c65a01b2
+  SequenceNumber   : 37350909257295071232
+  DeduplicationId  : 7edd07a058905fae2cc264af3d57a5f786d1d93d80ed6248c3e157f56593807a
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : c644fbb7-d740-5a5c-b87e-994db93aaab0
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-05-c65a01b2
+      eventType = com.liveramp.cleanroom.organizationjobparameter.created
+      objectType = ORGANIZATIONJOBPARAMETER
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : a14d370c-3089-43d4-adb4-2123d296f069   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.organizationjobparameter.created
+  subject          : org-adidas-emea/ORGANIZATIONJOBPARAMETER/6cf6a0a2-ba3d-46c0-8556-73d546a8dbb5
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : 6cf6a0a2-ba3d-46c0-8556-73d546a8dbb5
+      objectName   : DataLocation
+      objectType   : ORGANIZATIONJOBPARAMETER
+      orgId        : org-adidas-emea
+      requestId    : req-create-05-c65a01b2
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "a14d370c-3089-43d4-adb4-2123d296f069",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.organizationjobparameter.created",
+                       "subject" : "org-adidas-emea/ORGANIZATIONJOBPARAMETER/6cf6a0a2-ba3d-46c0-8556-73d546a8dbb5",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "6cf6a0a2-ba3d-46c0-8556-73d546a8dbb5",
+                         "objectName" : "DataLocation",
+                         "objectType" : "ORGANIZATIONJOBPARAMETER",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-05-c65a01b2"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #15
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 36b8144b-a130-47a8-b30b-3c6e366c21cb
+  MessageGroupId   : req-create-05-c65a01b2
+  SequenceNumber   : 37350909257367263232
+  DeduplicationId  : 2b3cad2da065f07d6b6c68a3c3c23149b1eba8188cbc618d2a610e14afb541b5
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 94ba9d25-7585-568d-b7ba-ffdf1bffb661
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-create-05-c65a01b2
+      eventType = com.liveramp.cleanroom.organizationjobparameter.created
+      objectType = ORGANIZATIONJOBPARAMETER
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 822b210a-ba12-4ae7-8134-77a8e15f1e3a   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.organizationjobparameter.created
+  subject          : org-adidas-emea/ORGANIZATIONJOBPARAMETER/af9c1930-e239-4ca6-b961-6c5e3e65fe8d
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : CREATE
+      objectId     : af9c1930-e239-4ca6-b961-6c5e3e65fe8d
+      objectName   : FieldDelimiter
+      objectType   : ORGANIZATIONJOBPARAMETER
+      orgId        : org-adidas-emea
+      requestId    : req-create-05-c65a01b2
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "822b210a-ba12-4ae7-8134-77a8e15f1e3a",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.organizationjobparameter.created",
+                       "subject" : "org-adidas-emea/ORGANIZATIONJOBPARAMETER/af9c1930-e239-4ca6-b961-6c5e3e65fe8d",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "CREATE",
+                         "objectId" : "af9c1930-e239-4ca6-b961-6c5e3e65fe8d",
+                         "objectName" : "FieldDelimiter",
+                         "objectType" : "ORGANIZATIONJOBPARAMETER",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-create-05-c65a01b2"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #16
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 5e64e809-42ff-440c-a10e-6dde2f83afee
+  MessageGroupId   : req-update-01-4d411d90
+  SequenceNumber   : 37350909257435871232
+  DeduplicationId  : a17358ed57272da7410351ea47497e374d96ffb3801aaff4fff0e58b889935c1
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 27b8691e-a799-5ec3-b0a2-0be4c9e37e2f
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-update-01-4d411d90
+      eventType = com.liveramp.cleanroom.data_connection.updated
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 15345f68-e032-4afa-bc3f-b0c5a39e7532   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.updated
+  subject          : org-adidas-emea/DATA_CONNECTION/036255f3-3553-4b2a-bda4-2497e0018a2c
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : UPDATE
+      objectId     : 036255f3-3553-4b2a-bda4-2497e0018a2c
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-update-01-4d411d90
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "15345f68-e032-4afa-bc3f-b0c5a39e7532",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.updated",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/036255f3-3553-4b2a-bda4-2497e0018a2c",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "UPDATE",
+                         "objectId" : "036255f3-3553-4b2a-bda4-2497e0018a2c",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-update-01-4d411d90"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #17
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : d2836bf0-b791-4a8a-a2d4-2ce585a3fbe3
+  MessageGroupId   : req-update-02-f6056c62
+  SequenceNumber   : 37350909257506783488
+  DeduplicationId  : 54e19b07551b373d18cdd9145c6ffcd7966d04f7ede99f0b96f0149910007aca
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : f0a6d8d7-4ea2-572d-9ab7-ba2d20d917c1
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-update-02-f6056c62
+      eventType = com.liveramp.cleanroom.data_connection.updated
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 58e0d6a7-850d-45e7-9f29-5e18589ffd39   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.updated
+  subject          : org-adidas-emea/DATA_CONNECTION/3f0c2673-4d10-4785-aed2-186d9ae6dca8
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : UPDATE
+      objectId     : 3f0c2673-4d10-4785-aed2-186d9ae6dca8
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-update-02-f6056c62
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "58e0d6a7-850d-45e7-9f29-5e18589ffd39",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.updated",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/3f0c2673-4d10-4785-aed2-186d9ae6dca8",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "UPDATE",
+                         "objectId" : "3f0c2673-4d10-4785-aed2-186d9ae6dca8",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-update-02-f6056c62"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #18
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : c795a455-d990-4b00-9307-f567b8e4f024
+  MessageGroupId   : req-update-03-11279158
+  SequenceNumber   : 37350909257598431488
+  DeduplicationId  : c7638b0f8e48a7aeaac7052949364f2a750971b647c8049b22d01931b85b88ab
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 53ffd02e-8869-5bad-99a2-b2d4e612ab41
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-update-03-11279158
+      eventType = com.liveramp.cleanroom.data_connection.updated
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : f8aebcd3-34bd-4b26-8e53-e6dc54187d63   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.updated
+  subject          : org-adidas-emea/DATA_CONNECTION/58a74561-0988-45d9-98e1-72cdb4d5c879
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : UPDATE
+      objectId     : 58a74561-0988-45d9-98e1-72cdb4d5c879
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-update-03-11279158
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "f8aebcd3-34bd-4b26-8e53-e6dc54187d63",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.updated",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/58a74561-0988-45d9-98e1-72cdb4d5c879",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "UPDATE",
+                         "objectId" : "58a74561-0988-45d9-98e1-72cdb4d5c879",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-update-03-11279158"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #19
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 7e930338-3850-4961-949a-ffc2721688d8
+  MessageGroupId   : req-update-04-c607db4a
+  SequenceNumber   : 37350909257681631232
+  DeduplicationId  : 4f7ba52fa0facdd609aec7681f6d29b6be9d236ebf767125b32a31d3c56f09d8
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 7ba9b443-f241-550d-8861-d6b99c3af5e1
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-update-04-c607db4a
+      eventType = com.liveramp.cleanroom.data_connection.updated
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 580cd248-9f60-4fcb-b56c-16c3b0b18200   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.updated
+  subject          : org-adidas-emea/DATA_CONNECTION/40d60c0b-cae6-484d-a659-2467a9473c1e
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : UPDATE
+      objectId     : 40d60c0b-cae6-484d-a659-2467a9473c1e
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-update-04-c607db4a
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "580cd248-9f60-4fcb-b56c-16c3b0b18200",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.updated",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/40d60c0b-cae6-484d-a659-2467a9473c1e",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "UPDATE",
+                         "objectId" : "40d60c0b-cae6-484d-a659-2467a9473c1e",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-update-04-c607db4a"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #20
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : e4ccf0b6-61ea-4650-a362-7435cd7b2a7a
+  MessageGroupId   : req-update-05-fe41216b
+  SequenceNumber   : 37350909257750751232
+  DeduplicationId  : 8217a5cd1d4f9b238e9746ba7db53c3c6e7b4a81cfecf2836437ebc7a664ed61
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 030d9448-ae41-540f-8005-f6b2c03dd4e3
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-update-05-fe41216b
+      eventType = com.liveramp.cleanroom.data_connection.updated
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : a05ef433-daaa-4f7c-af29-48911781016c   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.updated
+  subject          : org-adidas-emea/DATA_CONNECTION/9f7d18d4-eba5-42b7-bcf2-430eb4f21132
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : UPDATE
+      objectId     : 9f7d18d4-eba5-42b7-bcf2-430eb4f21132
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-update-05-fe41216b
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "a05ef433-daaa-4f7c-af29-48911781016c",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.updated",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/9f7d18d4-eba5-42b7-bcf2-430eb4f21132",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "UPDATE",
+                         "objectId" : "9f7d18d4-eba5-42b7-bcf2-430eb4f21132",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-update-05-fe41216b"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #21
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : 0290baf1-4e52-4814-bc51-5f0057c729b5
+  MessageGroupId   : req-delete-01-c7941ec9
+  SequenceNumber   : 37350909257826271232
+  DeduplicationId  : 8f96093e595eec1a2a4e18d3b346df5bfcfe66cc008563dd7894c3d848bb4088
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : c599a752-8318-56f5-b57e-c5a8ed642619
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-delete-01-c7941ec9
+      eventType = com.liveramp.cleanroom.data_connection.deleted
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 767fa873-4311-4f9a-87d7-0f33063806e7   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.deleted
+  subject          : org-adidas-emea/DATA_CONNECTION/036255f3-3553-4b2a-bda4-2497e0018a2c
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : DELETE
+      objectId     : 036255f3-3553-4b2a-bda4-2497e0018a2c
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-delete-01-c7941ec9
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "767fa873-4311-4f9a-87d7-0f33063806e7",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.deleted",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/036255f3-3553-4b2a-bda4-2497e0018a2c",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "DELETE",
+                         "objectId" : "036255f3-3553-4b2a-bda4-2497e0018a2c",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-delete-01-c7941ec9"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #22
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : e0a42a49-e1c4-4528-8857-be6231838d5d
+  MessageGroupId   : req-delete-02-6f06ef6e
+  SequenceNumber   : 37350909257907935232
+  DeduplicationId  : 209b8261b20854c848ae8dae9a153d01eb9c99a25f83ae8c3fee4ca09f960505
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : a9a8cdba-41c4-50c3-bdce-af402fb8e02f
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-delete-02-6f06ef6e
+      eventType = com.liveramp.cleanroom.data_connection.deleted
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 41adad15-b601-4d62-a4fc-6236dd9c8a0c   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.deleted
+  subject          : org-adidas-emea/DATA_CONNECTION/3f0c2673-4d10-4785-aed2-186d9ae6dca8
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : DELETE
+      objectId     : 3f0c2673-4d10-4785-aed2-186d9ae6dca8
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-delete-02-6f06ef6e
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "41adad15-b601-4d62-a4fc-6236dd9c8a0c",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.deleted",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/3f0c2673-4d10-4785-aed2-186d9ae6dca8",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "DELETE",
+                         "objectId" : "3f0c2673-4d10-4785-aed2-186d9ae6dca8",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-delete-02-6f06ef6e"
+                       }
+                     }
+
+----------------------------------------------------------------------------------------------------
+MESSAGE #23
+----------------------------------------------------------------------------------------------------
+[SQS - assigned by AWS]
+  MessageId        : fa3c8e9b-b44c-4a9b-9f0c-49ffb9a420df
+  MessageGroupId   : req-delete-03-a03c680d
+  SequenceNumber   : 37350909257980383232
+  DeduplicationId  : 8510c6223c2e729d2de0874e4b5981a09448504b5c2a52a644d74d748a5998e5
+  ReceiveCount     : 1
+[SNS envelope]
+  MessageId        : 9f54010c-d1b3-51c7-8c61-63f6bfce012b
+  TopicArn         : arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  MessageAttributes (usable in an SNS subscription filter policy):
+      requestId = req-delete-03-a03c680d
+      eventType = com.liveramp.cleanroom.data_connection.deleted
+      objectType = DATA_CONNECTION
+[CloudEvent - minted by the producer]
+  specversion      : 1.0
+  id               : 13f720ae-a72d-4e61-9263-a2646c0e72bc   <-- dedupe on THIS
+  source           : urn:liveramp:cleanroom:local:forebitt
+  type             : com.liveramp.cleanroom.data_connection.deleted
+  subject          : org-adidas-emea/DATA_CONNECTION/58a74561-0988-45d9-98e1-72cdb4d5c879
+  time             : 2026-08-15T13:40:04Z
+  datacontenttype  : application/json
+  data:
+      action       : DELETE
+      objectId     : 58a74561-0988-45d9-98e1-72cdb4d5c879
+      objectType   : DATA_CONNECTION
+      orgId        : org-adidas-emea
+      requestId    : req-delete-03-a03c680d
+  CloudEvents v1.0 : VALID (all required attributes present)
+  full payload     : {
+                       "specversion" : "1.0",
+                       "id" : "13f720ae-a72d-4e61-9263-a2646c0e72bc",
+                       "source" : "urn:liveramp:cleanroom:local:forebitt",
+                       "type" : "com.liveramp.cleanroom.data_connection.deleted",
+                       "subject" : "org-adidas-emea/DATA_CONNECTION/58a74561-0988-45d9-98e1-72cdb4d5c879",
+                       "time" : "2026-08-15T13:40:04Z",
+                       "datacontenttype" : "application/json",
+                       "data" : {
+                         "action" : "DELETE",
+                         "objectId" : "58a74561-0988-45d9-98e1-72cdb4d5c879",
+                         "objectType" : "DATA_CONNECTION",
+                         "orgId" : "org-adidas-emea",
+                         "requestId" : "req-delete-03-a03c680d"
+                       }
+                     }
+(no messages; empty poll 1/2)
+(no messages; empty poll 2/2)
+
+====================================================================================================
+SUMMARY - 23 message(s)
+====================================================================================================
+CloudEvents v1.0 valid : 23/23
+
+THE TWO IDS - AWS assigns one, the producer mints the other:
+  SQS MessageId                           CloudEvents id                          type
+  185210d3-948d-41bc-965f-7d2e46740d85    1966c173-7a5d-4d32-8310-5b1ae5637ba0    com.liveramp.cleanroom.data_connection.created
+  bce5d5e2-1df0-4f73-81c9-81d5c2410a7f    ffda3319-e6f8-4072-b589-bedb1f6c1273    com.liveramp.cleanroom.organizationjobparameter.created
+  d79d2a37-2cf3-40bc-a257-b8c2eb97a9f4    c49993d1-559c-4c19-9ebb-be038014d886    com.liveramp.cleanroom.organizationjobparameter.created
+  48d2fcc0-995c-472b-91aa-ae2cd77d8832    e0fd8055-73ce-454b-86db-a0eeda08b3a0    com.liveramp.cleanroom.data_connection.created
+  afafc8a5-c03d-4fa3-988e-7ba6a6122be1    462ff2ab-c612-461b-8398-4b877263842f    com.liveramp.cleanroom.organizationjobparameter.created
+  7655e1ae-3857-4487-80c8-60c41f98ec62    da6b2821-a4e8-438e-8f5d-a2a947ac7937    com.liveramp.cleanroom.organizationjobparameter.created
+  8cf4b5a8-f4a4-45a2-bad7-edfa6c8a8931    373f54f5-ddf5-4316-90a2-ebce78f74ec7    com.liveramp.cleanroom.data_connection.created
+  2b2dcef7-bef5-4c77-8453-8b7e8ea7e5b4    7a74c4a1-7d50-4f57-ba51-6597842f58e1    com.liveramp.cleanroom.organizationjobparameter.created
+  39ed544f-b3ad-4f6c-9e24-6b80647485a1    aae0af3c-ad5b-4f09-b628-cae2c98392fa    com.liveramp.cleanroom.organizationjobparameter.created
+  d84bd6b0-9e03-4ba8-9d31-fb96f3396cab    1e418e03-2b94-451d-a75f-078da0f5936b    com.liveramp.cleanroom.data_connection.created
+  a177d993-62c6-4d25-9c5d-a63e8dcff509    8da0d42d-09e7-4670-8f29-9f2478fd6215    com.liveramp.cleanroom.organizationjobparameter.created
+  f7d68b6c-f25c-4b51-b3a7-7932d4ceddbc    0f9825e7-f43a-4e6a-8c95-6c4d04eddf8b    com.liveramp.cleanroom.organizationjobparameter.created
+  62581c1b-0e01-44b4-901d-bc1a9c945f4d    eac1abed-b5b0-42fb-aaaa-d0e834c94cb8    com.liveramp.cleanroom.data_connection.created
+  2484ecf6-6477-43c2-bc4c-75c1e7ba2ebf    a14d370c-3089-43d4-adb4-2123d296f069    com.liveramp.cleanroom.organizationjobparameter.created
+  36b8144b-a130-47a8-b30b-3c6e366c21cb    822b210a-ba12-4ae7-8134-77a8e15f1e3a    com.liveramp.cleanroom.organizationjobparameter.created
+  5e64e809-42ff-440c-a10e-6dde2f83afee    15345f68-e032-4afa-bc3f-b0c5a39e7532    com.liveramp.cleanroom.data_connection.updated
+  d2836bf0-b791-4a8a-a2d4-2ce585a3fbe3    58e0d6a7-850d-45e7-9f29-5e18589ffd39    com.liveramp.cleanroom.data_connection.updated
+  c795a455-d990-4b00-9307-f567b8e4f024    f8aebcd3-34bd-4b26-8e53-e6dc54187d63    com.liveramp.cleanroom.data_connection.updated
+  7e930338-3850-4961-949a-ffc2721688d8    580cd248-9f60-4fcb-b56c-16c3b0b18200    com.liveramp.cleanroom.data_connection.updated
+  e4ccf0b6-61ea-4650-a362-7435cd7b2a7a    a05ef433-daaa-4f7c-af29-48911781016c    com.liveramp.cleanroom.data_connection.updated
+  0290baf1-4e52-4814-bc51-5f0057c729b5    767fa873-4311-4f9a-87d7-0f33063806e7    com.liveramp.cleanroom.data_connection.deleted
+  e0a42a49-e1c4-4528-8857-be6231838d5d    41adad15-b601-4d62-a4fc-6236dd9c8a0c    com.liveramp.cleanroom.data_connection.deleted
+  fa3c8e9b-b44c-4a9b-9f0c-49ffb9a420df    13f720ae-a72d-4e61-9263-a2646c0e72bc    com.liveramp.cleanroom.data_connection.deleted
+  SQS MessageId  : new on every publish, even for the same business event.
+  CloudEvents id : identifies the CHANGE. Stable across a republish. Dedupe on this.
+
+MESSAGE GROUPS - FIFO guarantees order only WITHIN a group:
+  (the producer sets MessageGroupId to the originating request id)
+
+  group req-create-01-ef436b50  (3 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.created       objectId=509912ad-2b40-4b1c-bb2a-4875496aad05
+     2. com.liveramp.cleanroom.organizationjobparameter.created objectId=3d7d2044-5c5e-4e9c-b190-9b4029f60628
+     3. com.liveramp.cleanroom.organizationjobparameter.created objectId=c6e9b95b-ee6a-496f-ac5e-33cc72676cff
+
+  group req-create-02-fe5ed5fe  (3 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.created       objectId=8a3baa2b-f185-48a5-ab56-f54cf4bcbaa8
+     2. com.liveramp.cleanroom.organizationjobparameter.created objectId=d4d34c08-7309-4ae4-bdb0-2346f9b01237
+     3. com.liveramp.cleanroom.organizationjobparameter.created objectId=28e27b78-2940-4351-9977-2eaed3a6b7dc
+
+  group req-create-03-82b12f17  (3 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.created       objectId=cc71a337-bd6c-4f60-896a-2b56e668227f
+     2. com.liveramp.cleanroom.organizationjobparameter.created objectId=865336cf-f00d-4c7a-990d-19cc2c4c9a9d
+     3. com.liveramp.cleanroom.organizationjobparameter.created objectId=c667388b-1fb1-4c59-9128-3db34a8ad784
+
+  group req-create-04-1c56f3c9  (3 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.created       objectId=d01cdc1f-1f49-496b-a3f2-52928d7b3bb3
+     2. com.liveramp.cleanroom.organizationjobparameter.created objectId=19af535c-969b-4e8e-b94f-ff514386a7e7
+     3. com.liveramp.cleanroom.organizationjobparameter.created objectId=96cbb29f-fa17-465a-9e29-dc17d66da4a8
+
+  group req-create-05-c65a01b2  (3 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.created       objectId=fc5cad39-faaf-4f78-8260-3d42f753a81e
+     2. com.liveramp.cleanroom.organizationjobparameter.created objectId=6cf6a0a2-ba3d-46c0-8556-73d546a8dbb5
+     3. com.liveramp.cleanroom.organizationjobparameter.created objectId=af9c1930-e239-4ca6-b961-6c5e3e65fe8d
+
+  group req-update-01-4d411d90  (1 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.updated       objectId=036255f3-3553-4b2a-bda4-2497e0018a2c
+
+  group req-update-02-f6056c62  (1 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.updated       objectId=3f0c2673-4d10-4785-aed2-186d9ae6dca8
+
+  group req-update-03-11279158  (1 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.updated       objectId=58a74561-0988-45d9-98e1-72cdb4d5c879
+
+  group req-update-04-c607db4a  (1 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.updated       objectId=40d60c0b-cae6-484d-a659-2467a9473c1e
+
+  group req-update-05-fe41216b  (1 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.updated       objectId=9f7d18d4-eba5-42b7-bcf2-430eb4f21132
+
+  group req-delete-01-c7941ec9  (1 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.deleted       objectId=036255f3-3553-4b2a-bda4-2497e0018a2c
+
+  group req-delete-02-6f06ef6e  (1 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.deleted       objectId=3f0c2673-4d10-4785-aed2-186d9ae6dca8
+
+  group req-delete-03-a03c680d  (1 message(s), in delivery order)
+     1. com.liveramp.cleanroom.data_connection.deleted       objectId=58a74561-0988-45d9-98e1-72cdb4d5c879
+
+  13 group(s). Messages in different groups may arrive in any order;
+  messages within one group are delivered in the order they were published.

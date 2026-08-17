@@ -1,0 +1,262 @@
+2026-08-17  What is emitted, how XMI filters it, and the 15-event verification run
+================================================================================
+For the XMI team. Two runs back this: 2026-08-15 (23 mixed events) and
+2026-08-17 (15 DATA_CONNECTION events, create + update + delete).
+
+
+================================================================================
+1. THE PAYLOAD  (verbatim, 2026-08-17 run, message #1)
+================================================================================
+{
+  "specversion" : "1.0",
+  "id" : "4a096ee2-e987-4458-8b29-497796f542ba",
+  "source" : "urn:liveramp:cleanroom:local:forebitt",
+  "type" : "com.liveramp.cleanroom.data_connection.created",
+  "subject" : "org-adidas-emea/DATA_CONNECTION/a1111111-1111-4111-8111-111111111111",
+  "time" : "2026-08-17T09:03:11Z",
+  "datacontenttype" : "application/json",
+  "data" : {
+    "action" : "CREATE",
+    "objectId" : "a1111111-1111-4111-8111-111111111111",
+    "objectName" : "Adidas EMEA S3 Feed",
+    "objectType" : "DATA_CONNECTION",
+    "orgId" : "org-adidas-emea",
+    "requestId" : "req-create-01"
+  }
+}
+
+  CloudEvents v1.0 validated: 15/15 in this run, 23/23 in the 2026-08-15 run.
+  Checked against the required context attributes: specversion, id, source, type.
+
+  This is a NOTIFICATION, not a state transfer. It says an object changed; it
+  does not say what the object now contains. Consumers GET the resource by
+  data.objectId. Deliberate: keeps the event small and avoids leaking
+  field-level data onto a shared topic.
+
+  objectName is ABSENT on DELETE. audit.go only sets it when non-empty, and a
+  delete carries no name. Confirmed in the run -- all 5 delete events omit it.
+  XMI must not require the field.
+
+  type = com.liveramp.cleanroom.<lowercased business type>.<past tense verb>.
+  Business type is a stable alias, not the Go model name, so a model rename is
+  not a breaking change (change_events.go:320-332):
+      DataImportJob     -> DATA_CONNECTION
+      CleanRoomFlow     -> FLOW
+      CleanRoomFlowRun  -> FLOW_RUN
+      Dataset           -> DATASET
+      unmapped          -> strings.ToUpper(modelName)  <-- where ORGANIZATIONJOBPARAMETER came from
+
+
+================================================================================
+2. THREE ID LAYERS, NOT TWO  (2026-08-17 run made this visible)
+================================================================================
+  #  SQS MessageId (AWS, queue)             SNS MessageId (AWS, topic)             CloudEvents id (producer)
+  1  234a1554-5751-4ba4-860b-6bd3244de4d2   d8890bdf-85a7-5bb5-842d-692354094e7a   4a096ee2-e987-4458-8b29-497796f542ba
+  2  780fd1f7-7dbf-429b-bf26-ace2a064c8cf   e9d836bc-a091-53bd-908a-544071212e8e   197da939-c1ed-4ac3-947a-567ab720d342
+  3  0cdb4e81-7bfd-44d5-9212-5c0e7961c4e5   bbf58a4f-788a-5344-a2b3-e8b3a93b922b   3402a80e-055a-4111-9d1b-0f91cd78504e
+
+  SQS MessageId      assigned by AWS per message ON THE QUEUE. New on redelivery
+                     to a different queue. Useless for dedupe.
+  SNS MessageId      assigned by AWS per publish TO THE TOPIC. Different value
+                     from the SQS one for the same event. Also not business identity.
+  CloudEvents id     minted by the producer with uuid.New() in toCloudEvent()
+                     (change_events.go:307), once per business event. Survives a
+                     retry or republish unchanged.
+
+  ==> XMI DEDUPES ON THE CloudEvents id. Not on either AWS id.
+
+  There is also a content-based DeduplicationId that AWS derives by SHA-256 of
+  the body (ContentBasedDeduplication=true on the topic). Not business identity
+  either -- two genuinely distinct events with identical bodies would collide
+  inside the 5-minute dedup window.
+
+
+================================================================================
+3. HOW XMI FILTERS -- and why it cannot be on `subject`
+================================================================================
+  An SNS subscription filter_policy matches on MESSAGE ATTRIBUTES by default,
+  not on the message body. `subject` lives inside the CloudEvent JSON, so it is
+  NOT usable in the pegleg-style policy as written.
+
+  Confirmed on the wire, 2026-08-17, all 15 messages carry all five:
+      action       (3 distinct) : CREATE, DELETE, UPDATE
+      eventType    (3 distinct) : com.liveramp.cleanroom.data_connection.{created,updated,deleted}
+      objectType   (1 distinct) : DATA_CONNECTION
+      orgId        (1 distinct) : org-adidas-emea
+      requestId    (6 distinct) : req-create-01/02, req-update-01/02, req-delete-01/02
+
+  IMPORTANT PLUMBING DETAIL: with RawMessageDelivery=false, the SQS-level
+  MessageAttributes are EMPTY. The SNS attributes arrive inside the body under
+  body.MessageAttributes. Verified in the run. This does NOT affect filtering --
+  the filter policy is evaluated at SNS BEFORE delivery -- but it does affect
+  consumer code: read them from the parsed SNS envelope, not from the SQS message.
+
+3a. NAMING MISMATCH TO SETTLE
+  The existing habu-events module filters on a DIFFERENT key:
+      orinjade/aws/modules/habu-events/locals.tf:6
+          event_attribute_object_key = "object"
+      pegleg.tf values: "organization", "cleanroom", "cleanRoomQuestion",
+                        "dataImportJob", "dataset", ...          (camelCase)
+
+  The new emitter uses key "objectType" with SCREAMING_SNAKE ("DATA_CONNECTION").
+  Two keys, two casings, one concept. Pick one:
+    (a) XMI writes against the new objectType / DATA_CONNECTION contract, or
+    (b) hank ALSO emits an "object" attribute with the legacy camelCase value,
+        so pegleg and janus keep working untouched. One extra line in the attrs
+        map at change_events.go:197. Cheaper.
+
+3b. THE SUBSCRIPTION XMI SHOULD WRITE  (attribute scope, recommended)
+    resource "aws_sns_topic_subscription" "xmi" {
+      topic_arn              = aws_sns_topic.event_topic.arn
+      protocol               = "sqs"
+      endpoint               = module.xmi_sqs.sqs_queue_arn
+      endpoint_auto_confirms = true
+
+      filter_policy = jsonencode({
+        objectType = ["DATA_CONNECTION", "FLOW", "FLOW_RUN", "DATASET"]
+        action     = ["CREATE", "UPDATE", "DELETE"]
+      })
+    }
+
+  Keys are ANDed; values within a key are ORed.
+  Applied to the 2026-08-15 run this delivers 13 of 23 and drops all 10
+  ORGANIZATIONJOBPARAMETER events -- the child-row noise from the gorm hook
+  firing per row. Applied to the 2026-08-17 run it delivers all 15.
+
+  Finer grained, on eventType -- takes creates and updates but not deletes:
+      filter_policy = jsonencode({
+        eventType = [
+          "com.liveramp.cleanroom.data_connection.created",
+          "com.liveramp.cleanroom.data_connection.updated",
+        ]
+      })
+
+  Single tenant, one queue per org:
+      filter_policy = jsonencode({
+        orgId      = ["org-adidas-emea"]
+        objectType = ["DATA_CONNECTION"]
+      })
+
+3c. IF XMI REALLY WANTS subject
+      filter_policy_scope = "MessageBody"
+      filter_policy = jsonencode({
+        subject = [{ prefix = "org-adidas-emea/DATA_CONNECTION/" }]
+      })
+
+  Caveats to state up front:
+   - filter_policy_scope is per subscription. Body scope and attribute scope
+     CANNOT be mixed in one policy. Going to body scope means giving up every
+     attribute match in 3b.
+   - subject is a composite "<orgId>/<TYPE>/<objectId>" built by eventSubject()
+     (change_events.go:349). Prefix matching on it is just matching orgId and
+     objectType in a more fragile way than matching the attributes directly.
+   - body filtering inspects the SNS Message payload, so it depends on the
+     envelope shape rather than on a declared attribute contract.
+
+  RECOMMENDATION: attribute scope on objectType / eventType / orgId. Treat
+  subject as a human-readable routing key inside the payload, not a filter
+  surface. If per-tenant routing is the real requirement, filter on orgId.
+
+
+================================================================================
+4. THE 2026-08-17 RUN -- 15 DATA_CONNECTION events
+================================================================================
+  Topic  arn:aws:sns:us-east-2:930272866731:aditya-change-events.fifo
+  Queue  https://sqs.us-east-2.amazonaws.com/930272866731/aditya-change-events.fifo
+  Consumer  Aditya_XMI_Consumer (Java, SQS long-poll)
+  Log    aditya_final_version_xmi_events/2026-08-17_consumer_run_output_15_dataconnection_events.log
+
+  5 data connections x (create, update, delete) = 15 events, in 6 request groups
+  so ordering-within-a-group is observable:
+      req-create-01  3 creates     req-update-01  3 updates    req-delete-01  3 deletes
+      req-create-02  2 creates     req-update-02  2 updates    req-delete-02  2 deletes
+
+  Result: 15/15 received, 15/15 CloudEvents v1.0 valid.
+
+  Pre-consume peek confirmed all 15 sat on the queue with the expected
+  SequenceNumbers in true publish order before the worker ran.
+
+
+================================================================================
+5. THE FINDING FROM THIS RUN -- CROSS-GROUP ORDER IS ARBITRARY, PROVEN
+================================================================================
+  Delivery order of the groups, as the worker received them:
+
+      req-update-01  (3)   <-- UPDATES ARRIVED FIRST
+      req-update-02  (2)
+      req-create-01  (3)   <-- creates arrived AFTER the updates
+      req-create-02  (2)
+      req-delete-01  (3)
+      req-delete-02  (2)
+
+  Events were published create -> update -> delete. XMI received the UPDATE for
+  a1111111-1111-4111-8111-111111111111 BEFORE the CREATE for it.
+
+  Within each group, order was perfect: all three members of req-create-01 came
+  back in publish order, same for every other group. FIFO did exactly what it
+  promises. The promise is just narrower than it looks.
+
+  WHY: MessageGroupId = the originating requestId (hank/aws/sns/service.go:48).
+  FIFO guarantees order only WITHIN a group. Different requests are different
+  groups and interleave freely -- which is what gives throughput, since one slow
+  tenant cannot head-of-line block another.
+
+  WHAT XMI MUST DESIGN FOR:
+   1. Do NOT assume create-before-update-before-delete for a given objectId.
+      The same objectId appears in three different groups across its lifecycle.
+      Also seen in the 2026-08-15 run: 036255f3-3553-4b2a-bda4-2497e0018a2c was
+      updated under req-update-01 and deleted under req-delete-01.
+   2. Because the payload is a notification and the consumer GETs by objectId,
+      out-of-order delivery is SURVIVABLE: an update arriving before a create
+      still resolves to whatever the resource currently is. A delete arriving
+      early resolves to 404 -> treat as absent. This is the main reason the
+      notification contract was chosen over state transfer. Worth XMI hearing
+      explicitly, because it turns an ordering bug into a non-issue.
+   3. Do NOT infer completeness from a group. Once a filter policy drops the
+      child-row events, a group that published 3 messages may deliver 1.
+      Ordering within a group is guaranteed; group completeness is not.
+
+  IF per-object ordering is genuinely required, MessageGroupId would have to
+  become the objectId rather than the requestId. That is a producer-side change
+  with a real throughput cost (all events for one object serialize), and a real
+  decision -- not a config toggle. Recommend NOT doing it: the GET-by-id
+  contract already absorbs the problem.
+
+
+================================================================================
+6. OPERATIONAL FINDING -- THE DLQ CLIFF  (found the hard way)
+================================================================================
+  Queue RedrivePolicy: maxReceiveCount = 5, DLQ aditya-change-events-dlq.fifo.
+
+  While peeking at the queue without deleting, 8 receive passes pushed ALL 15
+  messages to the DLQ at once. Nothing lost, but nothing left on the main queue
+  either, and the consumer then reported 0 messages.
+
+  For XMI's runbook: a consumer that receives and does not delete -- crashed
+  mid-handler, throwing on every message, or merely "looking" -- moves the
+  ENTIRE batch to the DLQ after 5 attempts. No partial degradation, no warning.
+   - Alarm on DLQ ApproximateNumberOfMessages > 0 from day one.
+   - Grant sqs:StartMessageMoveTask to whoever operates the redrive. It was NOT
+     granted on the test IAM user, so the batch could not be moved back and had
+     to be republished.
+   - When inspecting a queue by hand, cap receive passes well under
+     maxReceiveCount, or use a dedicated inspection subscription.
+
+
+================================================================================
+7. OPEN ITEMS FOR THE XMI CONVERSATION
+================================================================================
+  1. objectType vs object, SCREAMING_SNAKE vs camelCase -- pick one, or dual-emit.
+  2. Confirm XMI dedupes on the CloudEvents id, not either AWS MessageId.
+  3. Confirm XMI accepts notification semantics and will GET by objectId rather
+     than expecting full state in the event.
+  4. Confirm XMI tolerates objectName being absent on DELETE.
+  5. Is per-request ordering enough? (Recommend yes -- see §5.)
+  6. Which object types does XMI actually want? The allow-list exists producer-
+     side (HANK_CHANGE_EVENTS_OBJECT_TYPES) as well as consumer-side (filter
+     policy) -- two places to keep in sync. Current stance: leave the producer
+     unset (publish everything) and let consumers narrow. Confirm XMI agrees.
+  7. DLQ ownership and alarming -- who operates it, who gets paged.
+  8. FLOW / FLOW_RUN / DATASET have NOT been swept for silently-skipped writes
+     (unhygienix, picanmix). DATA_CONNECTION is verified clean. See the method
+     doc before promising those three types.

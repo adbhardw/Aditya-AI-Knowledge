@@ -1,0 +1,246 @@
+2026-08-17  How the SNS publisher is wired into hank, and why there is no
+             per-operation client
+================================================================================
+Question that started this
+  "I generally followed the earlier way where for each operation New was used and
+   a new client was created. This approach seems different."
+
+  Old pattern (per-call construction):
+      func PublishEvent(ctx context.Context, config hevent.Config, message hevent.EventStruct) error {
+          eventInstance, err := hevent.New(config)     // new client, EVERY call
+          if err != nil { return err }
+          _, publishErr := eventInstance.Publish(ctx, message)
+          if publishErr != nil { return publishErr }
+          return nil
+      }
+
+  New pattern: the client is built ONCE and every operation FINDS it. There is no
+  per-operation call site at all -- the publish is a side effect of the row write.
+
+
+================================================================================
+1. THE MAPPING, OLD vs NEW
+================================================================================
+                         OLD (hevent.New per call)        NEW (publisher on the DB)
+  client built           every publish call               once, at hdb.New (service.go:75)
+  where it lives         local var, GC'd after the call   sync.Map on *gorm.DB, key "hank:change_events"
+  how the emitter finds  closure / parameter              scope.DB().Get(changeEventsKey) (change_events.go:236)
+  who triggers it        the handler, explicitly          gorm AfterCreate/AfterUpdate/AfterDelete
+  cost per event         new AWS session, + STS           one channel send
+                         AssumeRole if RoleArn set
+  failure mode           returns error, caller decides    logged, dropped, never surfaces
+  miss an operation?     silently no event                impossible IF the model embeds hdb.Audit
+                                                          (but see the "context" gate -- separate doc)
+
+  Emission is a LOOKUP, not a construction:
+      v, ok := scope.DB().Get(changeEventsKey)   // find the ONE publisher
+      if !ok { return }                          // not enabled in this service
+      p, ok := v.(*publisher)
+  values.Store held a *publisher, so every clone hands back the same pointer:
+  one SNS client, one goroutine, however many thousand clones exist.
+
+
+================================================================================
+2. THE THREE LINES THAT DO IT  (hank/db/service.go:74-84)
+================================================================================
+    if ceCfg := ChangeEventConfigFromEnv(); ceCfg.Enabled && ceCfg.TopicARN != "" {
+        if p, err := newPublisher(ceCfg); err != nil {
+            logrus.Errorf("change events disabled: %v", err)     // never fatal
+        } else {
+            go p.run()                                  // ONE goroutine, lives forever
+            database.InstantSet(changeEventsKey, p)      // stash on the DB
+            logrus.Infof("change events enabled: topic=%s types=%v", ceCfg.TopicARN, ceCfg.ObjectTypes)
+        }
+    }
+
+  newPublisher (change_events.go:138) calls hsns.NewSNS exactly once.
+  Config comes from os.Getenv, not viper, because viper keys are registered by
+  each service's own cobra command and are service-name prefixed -- which would
+  mean a different variable name per service for the same platform setting.
+  Env gives one name everywhere. Mirrors getHabuPlatformSuperUser in audit.go.
+
+  A bad topic ARN logs and moves on. The service still boots.
+
+
+================================================================================
+3. WHY InstantSet AND NOT Set  (this is the part that actually matters)
+================================================================================
+    // gorm@v1.9.16/main.go:774
+    func (s *DB) Set(name string, value interface{}) *DB {
+        return s.clone().InstantSet(name, value)   // clones, returns the CLONE
+    }
+
+    // main.go:779
+    func (s *DB) InstantSet(name string, value interface{}) *DB {
+        s.values.Store(name, value)                // mutates in place
+        return s
+    }
+
+  New() returns `database`. With Set, the publisher would land on a throwaway
+  clone and the returned `database` would not have it. InstantSet mutates the
+  object being returned.
+
+
+================================================================================
+4. HOW IT REACHES EVERY OPERATION  (gorm@v1.9.16/main.go:844)
+================================================================================
+    func (s *DB) clone() *DB {
+        db := &DB{...}
+        s.values.Range(func(k, v interface{}) bool {
+            db.values.Store(k, v)      // <-- values ride along on every clone
+            return true
+        })
+        ...
+    }
+
+  Every chain method -- Where, Model, Create, Save, Delete, Begin -- calls
+  clone(). So the publisher propagates to every derived *gorm.DB in the process,
+  including inside transactions. Copying a pointer into a sync.Map, not copying
+  a client.
+
+  Propagation is DOWNWARD ONLY. A clone never writes back to its parent. That is
+  what makes the same mechanism safe for both process-scoped and request-scoped
+  values -- see §6.
+
+
+================================================================================
+5. HOW THE HOOK FIRES WITHOUT PER-MODEL REGISTRATION
+================================================================================
+  applyEmbeddedHooks (service.go:101) registers only the BEFORE callbacks:
+      gorm:audit_before_create, gorm:audit_before_update
+
+  The AFTER ones are gorm BUILT-INS calling by reflection:
+      gorm@v1.9.16/callback_create.go:192   scope.CallMethod("AfterCreate")
+      gorm@v1.9.16/callback_update.go:115   scope.CallMethod("AfterUpdate")
+      gorm@v1.9.16/callback_delete.go:61    scope.CallMethod("AfterDelete")
+
+  hdb.Audit defines AfterCreate / AfterUpdate / AfterDelete, and every forebitt
+  model embeds hdb.Audit -- artifact_connection_file.go:14, attribute.go:29,
+  import_job_consent.go:10, import_data_source_parameter.go:14, dozens more. Go
+  promotes the embedded method; CallMethod finds it. Lands at audit.go:165.
+
+  So it is not wired per OPERATION. It is wired per MODEL EMBEDDING.
+  Editing a mapping emits an event with zero lines of code in the mapping
+  handler. That is also why one db.Create(&job) produced 3 events in the
+  2026-08-15 run: the hook fires per ROW, not per API call. A DataImportJob
+  insert cascades two OrganizationJobParameter child rows.
+
+
+================================================================================
+6. THE SAME MECHANISM CARRIES THE REQUEST CONTEXT
+================================================================================
+  change_events.go:57-59 says "Same mechanism BeginTxDB uses for context." Both
+  live in the same values map and are read the same way:
+
+    // audit.go:224-234 -- set per REQUEST
+    func BeginDB(ctx context.Context, db *gorm.DB) *gorm.DB {
+        tx := db.Begin()
+        tx.InstantSet("context", ctx)      // same call, different receiver
+        return tx
+    }
+
+    // audit.go:33-41 -- read in the hook
+    func claims(scope *gorm.Scope) (*token.AuthClaims, context.Context, bool) {
+        dbContext, _ := scope.DB().Get("context")
+        if dbContext == nil { return nil, nil, false }
+        ctx := dbContext.(context.Context)
+        tokenClaims, parsed := ctx.Value(&token.AuthenticationClaims{}).(*token.AuthClaims)
+        return tokenClaims, ctx, parsed
+    }
+
+  The ONLY difference is which *gorm.DB you call InstantSet on, and that alone
+  sets the scope:
+
+    key                    set on                        set when          visible to
+    ---------------------  ----------------------------  ----------------  --------------------------------
+    hank:change_events     the root database from New()  once, at boot     every clone in the process, forever
+    context                the tx from db.Begin()        every request     only clones of that transaction
+
+  Because clone() copies values downward and never upward, a per-request
+  InstantSet on a tx cannot leak into another request. Process-scoped
+  infrastructure and request-scoped state ride the same rail without colliding.
+  Nice piece of design, and worth naming as such.
+
+  They meet in the hook. AfterCreate (audit.go:151) calls claims(scope) to pull
+  the request-scoped ctx, then passes it down to publishChangeEvent, which pulls
+  the process-scoped publisher out of the same map.
+
+  claims() is called in exactly five places, all in hank/db/audit.go, and it is
+  the FIRST statement in each:
+      :126  BeforeCreateHook    :151  AfterCreate     :170  BeforeUpdateHook
+      :187  AfterUpdate         :206  AfterDelete
+  Every one of them bails on !parsed with `return nil` -- no error. So claims()
+  is the single gate in front of BOTH audit logging and change events.
+  Consequences of that: see the separate silently-skipped-events method doc.
+
+
+================================================================================
+7. HOW THE EVENT IS ACTUALLY EMITTED  (the buf <- is only the handoff)
+================================================================================
+  1) HOOK -- non-blocking handoff  (change_events.go:277)
+       select {
+       case p.buf <- queuedEvent{ev: p.toCloudEvent(a, orgID, requestID), requestID: requestID}:
+       default:
+           // buffer full -> drop + Warn. Never blocks the transaction.
+       }
+     This is where the caller is released. Everything after runs off the tx.
+
+  2) WORKER LOOP  (change_events.go:176) -- the goroutine started at boot
+       for qe := range p.buf { p.publishOne(qe) }
+
+  3) publishOne  (change_events.go:190) -- builds attributes, REBUILDS a context
+       ctx := context.Background()
+       if qe.requestID != "" { ctx = contexts.SetReqIdCtx(ctx, qe.requestID) }
+       p.sns.Publish(ctx, ev, p.topicARN, attrs)
+
+     This is why queuedEvent carries requestID as its own field rather than
+     relying on the body. The worker is a DIFFERENT goroutine on a
+     context.Background() -- it has no request context. Without re-stamping,
+     GetReqIdCtx mints a fresh uuid per message and every event lands in its own
+     FIFO group, i.e. no ordering at all. See change_events.go:102-106.
+
+  4) THE ACTUAL AWS CALL  (hank/aws/sns/service.go:33)
+       reqId := contexts.GetReqIdCtx(ctx)
+       messageAttributes["requestId"] = &sns.MessageAttributeValue{...aws.String(reqId)}
+       res, err := s.client.Publish(&sns.PublishInput{
+           MessageGroupId:    aws.String(reqId),      // <-- the grouping seen in the runs
+           Message:           aws.String(string(snsMessage)),
+           TopicArn:          aws.String(topicARN),
+           MessageAttributes: messageAttributes,
+       })
+
+     Both the requestId attribute and MessageGroupId come from the same reqId,
+     which is why all events of one request share a group.
+
+
+================================================================================
+8. WHY THE PUBLISH IS ASYNCHRONOUS AND NEVER RETURNS AN ERROR
+================================================================================
+  The audit hooks run INSIDE the database transaction. gorm registers
+  gorm:after_create immediately before gorm:commit_or_rollback_transaction, and
+  an error returned from a hook causes CommitOrRollback to roll the transaction
+  back. So:
+
+   - A synchronous SNS call would hold row locks for a network round trip.
+   - An SNS outage would start failing customer writes.
+
+  Cost of the choice: because the hook fires BEFORE commit, an event can be
+  published for a transaction that later rolls back. That is why the contract is
+  "consumers GET the resource by data.objectId" -- such an event resolves to
+  "nothing changed" rather than to a wrong state.
+
+  Second cost: the error from s.client.Publish surfaces at change_events.go:221
+  as a logrus.Errorf and nowhere else. The transaction committed long before.
+  No retry, no producer-side DLQ. A transient SNS failure loses that event
+  permanently. Survivable given the GET-by-id contract, but it means XMI cannot
+  treat the stream as complete, and it is the strongest argument for keeping
+  whatever reconciliation path exists today rather than deleting it on day one.
+
+
+================================================================================
+9. GAP FOUND: publisher.Close() IS DEAD CODE
+================================================================================
+  Defined at change_events.go:185. Nothing calls it -- grepped hank and forebitt.
+  On shutdown the buffered channel is never drained, so in-flight events are
+  lost. If that should be honoured it needs an exported CloseChangeEvents(db)
+  in hank/db, called from the service's shutdown path.

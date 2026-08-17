@@ -1,0 +1,267 @@
+2026-08-17  METHOD: finding change events that are SILENTLY skipped
+             (run this against unhygienix and picanmix for flows and exports)
+================================================================================
+Purpose
+  hank emits change events from a gorm model-layer hook. The hook is gated on
+  something unrelated to eventing, so a write can succeed, be audited nowhere,
+  and emit no event, with no error and no log line. This is the procedure for
+  finding every such write in a service.
+
+  Verified against forebitt on 2026-08-17. Found 7 write paths that emit nothing.
+
+
+================================================================================
+1. WHY EVENTS GO MISSING  (understand this before running the greps)
+================================================================================
+The emit chain is:
+
+  service code
+    -> db.Create / db.Save / db.Delete / db.Update
+       -> gorm builtin callback  (callback_create.go:192 scope.CallMethod("AfterCreate")
+                                  callback_update.go:115 "AfterUpdate"
+                                  callback_delete.go:61  "AfterDelete")
+          -> hdb.Audit.AfterCreate / AfterUpdate / AfterDelete   (hank/db/audit.go)
+             -> claims(scope)                                    (hank/db/audit.go:33)
+                -> publishChangeEvent(ctx, scope, auditLog)       (audit.go:165/201/220)
+                   -> scope.DB().Get("hank:change_events")        (change_events.go:236)
+                      -> p.buf <- queuedEvent{...}
+                         -> p.run() -> p.publishOne() -> hsns.Publish -> SNS
+
+Two independent things must both be true at the hook:
+
+  (A) the model embeds hdb.Audit
+      Without it, gorm's CallMethod finds no AfterCreate/AfterUpdate/AfterDelete
+      and the hook never runs at all.
+
+  (B) the *gorm.DB the write runs on carries the "context" value
+      claims() reads scope.DB().Get("context"). "context" is ONLY ever set by
+      hdb.BeginDB / hdb.BeginTxDB (audit.go:224-234, via tx.InstantSet).
+      If it is absent, claims() returns parsed=false and EVERY hook returns nil
+      early. No audit log. No change event. No error. No warning.
+
+  The publisher itself is NOT the problem. It is attached once at hdb.New
+  (service.go:81 database.InstantSet(changeEventsKey, p)) and rides along on
+  every clone of the DB forever, because gorm's clone() copies the values map
+  (gorm@v1.9.16/main.go:844). It is always reachable. It is just never asked.
+
+  THE ASYMMETRY THAT MATTERS: (B) fails far more often on DELETE and UPDATE than
+  on CREATE, because creates are usually written as ...InTransaction(tx *gorm.DB)
+  helpers (they need atomicity across parent and child rows) while deletes get
+  written as one-line convenience functions on the raw handle. So the typical
+  failure is a consumer that sees .created and never sees .deleted -- worse than
+  emitting nothing, because it silently diverges instead of being obviously empty.
+
+
+================================================================================
+2. THE PROCEDURE
+================================================================================
+
+STEP 0 -- confirm the service actually wires change events at all
+--------------------------------------------------------------------------------
+  grep -rn "HANK_CHANGE_EVENTS" <service>/ | head
+  grep -rn "hdb.New\|db.New" <service>/ --include="*.go" | head
+
+  The publisher is opt-in via env (change_events.go:45-55). If nothing sets
+  HANK_CHANGE_EVENTS_ENABLED for the service, nothing is emitted anywhere and
+  the rest of this procedure is moot. Check fiddley/dyogram values.yaml too.
+
+
+STEP 1 -- confirm which models are eligible (condition A)
+--------------------------------------------------------------------------------
+  grep -rn "hdb.Audit" <service>/models/ | wc -l
+  grep -rln "hdb.Audit" <service>/models/
+
+  Then for the specific business types you care about:
+  grep -n "CleanRoomFlow struct" -A 12 <service>/models/*.go
+  grep -n "CleanRoomFlowRun struct" -A 12 <service>/models/*.go
+
+  A model WITHOUT hdb.Audit emits nothing, ever, no matter how it is written.
+  That is a separate class of gap from the one below -- record it separately.
+
+
+STEP 2 -- baseline: how many writes DO go through a transaction
+--------------------------------------------------------------------------------
+  cd <service>
+  grep -rn "hdb.BeginDB\|hdb.BeginTxDB" --include="*.go" . | wc -l
+  grep -rn "hdb.BeginDB\|hdb.BeginTxDB" --include="*.go" . | head -12
+
+  forebitt baseline: 81 call sites, ALL of them inside forebitt/db/, NONE in
+  api/server/. So the convention is: the gRPC handler passes the root s.DB down,
+  and the db-layer function opens its own tx. That convention is exactly why a
+  db-layer function that forgets is invisible -- there is no single choke point.
+
+  Establish the convention for the service you are auditing BEFORE step 3, or
+  you will misread the results.
+
+
+STEP 3 -- the main sweep: writes in functions with no transaction
+--------------------------------------------------------------------------------
+Run from the service root. Per-function awk: remembers the enclosing func, notes
+whether it opens a tx or receives one, collects write calls, and reports only
+functions that write with no tx in sight.
+
+  for f in $(find ./db -name "*.go" -not -name "*_test.go"); do
+  awk -v F="$f" '
+  /^func /{fn=$0; start=NR; hasTx=0; delete w; nw=0}
+  /hdb\.BeginDB|hdb\.BeginTxDB/{hasTx=1}
+  /^func .*\(tx \*gorm\.DB|, tx \*gorm\.DB/{hasTx=1}
+  /\.Create\(|\.Save\(|\.Delete\(|\.Updates?\(|\.FirstOrCreate\(/{ if (fn!="") { w[nw++]=NR": "$0 } }
+  /^}/{ if (fn!="" && nw>0 && hasTx==0) { printf "%s:%d  %s\n", F, start, substr(fn,1,80); for(i=0;i<nw;i++) print "      "w[i] } ; fn=""; nw=0; hasTx=0 }
+  ' "$f"
+  done 2>/dev/null
+
+  Narrow to one business type by adding a guard to the write line, e.g. for flows:
+  /\.Create\(|\.Save\(|\.Delete\(|\.Updates?\(/{ if (fn!="" && /CleanRoomFlow/) { w[nw++]=NR": "$0 } }
+
+
+STEP 4 -- triage the output (most of it is a FALSE POSITIVE)
+--------------------------------------------------------------------------------
+  The awk is per-function and cannot see callers. Classify each hit:
+
+  FALSE POSITIVE -- signature is (tx *gorm.DB, ...) or ...InTransaction(...).
+    The caller opened the tx, so "context" is present. Ignore.
+    NOTE: a MULTI-LINE signature defeats the /, tx \*gorm\.DB/ guard, so
+    functions like SetFieldConfigurationInTransaction( \n tx *gorm.DB, ...
+    show up spuriously. Read the signature before believing a hit.
+
+  REAL -- signature is (db *gorm.DB, ...) and the write happens on db or on a
+    scope chained off db, with no BeginTxDB anywhere in the function.
+
+  REAL AND WORST -- signature takes ctx context.Context AND db *gorm.DB, and
+    still never calls BeginTxDB. The context was available and thrown away.
+    This is the highest-confidence bug shape: search for it directly.
+
+      grep -rn "ctx context.Context" -A 6 ./db/*.go \
+        | grep -B 3 "db\.Scopes(\|db\.Delete(\|db\.Create(\|db\.Model(" | head -40
+
+
+STEP 5 -- confirm each real hit end to end (do not skip)
+--------------------------------------------------------------------------------
+  a) does the model embed hdb.Audit?  (if not, it was never going to emit)
+       grep -n "<Model> struct" -A 12 models/*.go
+  b) who calls it, and do they pass a root DB?
+       grep -rn "<FuncName>(" --include="*.go" . | grep -v "func \|\.pb\.go"
+  c) is there a sibling function on the SAME model that DOES emit?
+       That pair is the proof, and it is what you show the team.
+
+  forebitt's proof pair, both in db/job_run_mapping.go on the same model:
+       :13  CreateQuestionRunMapping(ctx, db, ...)  -> hdb.BeginTxDB -> EMITS
+       :64  DeleteQuestionRunMapping(ctx, db, ...)  -> raw db.Scopes() -> SILENT
+
+
+STEP 6 -- decide whether it actually breaks the XMI contract
+--------------------------------------------------------------------------------
+  Map the model through businessObjectType (change_events.go:320-332):
+      DataImportJob -> DATA_CONNECTION,  CleanRoomFlow -> FLOW,
+      CleanRoomFlowRun -> FLOW_RUN,      Dataset -> DATASET
+      anything unmapped -> strings.ToUpper(modelName)
+
+  If the type is NOT one of the four mapped names, it is not in XMI's filter
+  policy, so the gap is real but currently harmless. If it IS one of the four,
+  it breaks the contract and must be fixed before XMI onboards.
+
+  Verified for forebitt: every write to models.DataImportJob goes through a tx.
+  DATA_CONNECTION is clean. All 7 gaps are on satellite models.
+  FLOW / FLOW_RUN / DATASET live in unhygienix and picanmix -- NOT yet swept.
+
+
+================================================================================
+3. FINDINGS -- forebitt, 2026-08-17
+================================================================================
+7 write paths that commit without emitting a change event or an audit log.
+
+  #  file:line                          function                                      model                              verb
+  -  ---------------------------------  --------------------------------------------  ---------------------------------  ------
+  1  db/job_run_mapping.go:64           DeleteQuestionRunMapping                      DataImportJobQuestionRunMapping    DELETE
+  2  db/job.go:508                      UpdateSegmentReconciliationStatusBySegmentID  SegmentReconciliationStatus        UPDATE
+  3  db/job.go:533                      DeleteSegmentMetadataByID                     SegmentMetadata                    DELETE
+  4  db/field_description.go:108        DeleteFieldDescriptionsByJobID                FieldDescription                   DELETE
+  5  db/field_description.go:113        DeleteFieldDescriptionByJobIDAndFieldName      FieldDescription                   DELETE
+  6  db/fieldconfiguration.go:160       DeleteFieldConfigurationsByDataImportJobID    DataImportJobFieldConfiguration    DELETE
+  7  db/job_parameters.go:58            PopulateIDOfOrganizationJobParameter          OrganizationJobParameter           UPDATE
+
+  6 of 7 are DELETE or UPDATE. Zero are CREATE. That is the asymmetry from §1.
+
+  #1 is the worst and the one to show the team: it takes ctx and ignores it, its
+  create sibling in the same file emits correctly, and the handler
+  (api/server/import_job_v2.go:192) passes s.DB straight through. Net effect:
+  XMI sees the mapping created and never sees it deleted.
+
+  #7 touches OrganizationJobParameter, which produced 10 of the 23 events in the
+  2026-08-15 run. Its creates emit; this id rewrite does not.
+
+  NOT AFFECTED: models.DataImportJob (= DATA_CONNECTION). Every write goes
+  through a tx -- InsertJobInTransaction (job.go:162), UpdateJobStageInTransaction
+  (job.go:242), UpdateJoViewFieldsInTransaction (job.go:437).
+
+  THE FIX, per site: one line.
+      tx := hdb.BeginTxDB(ctx, db, &sql.TxOptions{})
+  ...plus threading ctx into the signature where it is not already there, plus
+  Commit/Rollback. Sites #2-#7 need the ctx added; #1 already has it.
+
+
+================================================================================
+4. TO RUN AGAINST unhygienix AND picanmix
+================================================================================
+  Business types to care about: FLOW, FLOW_RUN, DATASET
+  (from businessObjectTypes, change_events.go:320-325)
+
+  cd /Users/adbhar/Documents/project-sprint-understanding-1/unhygienix    # then picanmix
+  # STEP 0
+  grep -rn "HANK_CHANGE_EVENTS" . | head
+  # STEP 1
+  grep -rln "hdb.Audit" models/
+  grep -n "CleanRoomFlow struct" -A 12 models/*.go
+  grep -n "CleanRoomFlowRun struct" -A 12 models/*.go
+  grep -n "Dataset struct" -A 12 models/*.go
+  # STEP 2
+  grep -rn "hdb.BeginDB\|hdb.BeginTxDB" --include="*.go" . | wc -l
+  # STEP 3 -- the awk sweep above, then STEP 4-6 triage
+
+  Watch for these service-specific differences before trusting the numbers:
+   - the db layer may not be under ./db (adjust the find path)
+   - the service may open the tx in the HANDLER rather than the db layer, which
+     inverts the convention and changes what counts as a false positive
+   - flow RUNS are written by async workers, not gRPC handlers. A worker has no
+     request context at all, so it may never call BeginTxDB anywhere. If so,
+     FLOW_RUN emits nothing and that is a design gap, not a missed line.
+     Check this FIRST for picanmix -- it is the likeliest large finding.
+   - exports may write through raw SQL or Exec(), which no gorm callback sees.
+     grep -rn "\.Exec(\|\.Raw(" --include="*.go" . | grep -i "insert\|update\|delete"
+
+
+================================================================================
+5. THE STRUCTURAL POINT TO RAISE WITH JOSH AND ANIL
+================================================================================
+  The emit is gated on something unrelated to emitting. A "context" key that
+  exists to carry auth claims for the audit_updated_by column now also decides
+  whether an external partner sees an event. Nothing looks broken at the call
+  site, no test fails, no log line fires.
+
+  Options:
+   (a) fix the 7 sites and accept the fragility  -- cheap now, recurs forever;
+       every new delete helper is a chance to silently drop a partner event.
+   (b) make publishChangeEvent independent of claims: read orgId/requestId from
+       the context when present, but emit regardless. An event with an empty
+       orgId still dedupes on objectId and is useful; no event is not.
+   (c) add a startup assertion or a lint that any file writing on a bare
+       *gorm.DB parameter is a build failure in the db layer.
+
+  Recommend (b) plus (a). (b) removes the class of bug; (a) fixes today's.
+  Note (b) changes audit-log behaviour too, so it needs Anil's sign-off, not
+  just a code review.
+
+
+================================================================================
+6. RELATED OPERATIONAL FINDING (found the hard way, 2026-08-17)
+================================================================================
+  The test queue has RedrivePolicy maxReceiveCount=5. While peeking at the queue
+  without deleting, 8 receive passes pushed all 15 messages to the DLQ.
+
+  For XMI's runbook: a consumer that receives and does not delete -- because it
+  crashed mid-handler, or threw on every message, or was only "looking" -- will
+  move the ENTIRE batch to the DLQ after 5 attempts. There is no partial
+  degradation and no warning. Alarm on DLQ ApproximateNumberOfMessages > 0 from
+  day one, and make sure the DLQ redrive permission (sqs:StartMessageMoveTask)
+  is actually granted to whoever operates it. It was NOT granted on the test
+  user, so the messages could not be moved back.
