@@ -1,0 +1,167 @@
+2026-08-20 — Viper env binding internals
+=========================================
+How the key `events.sns.aws.rolearn` becomes the lookup
+`FOREBITT_EVENTS_SNS_AWS_ROLEARN`, where that happens, and when.
+
+Viper: github.com/spf13/viper v1.12.0
+Paths below are relative to /Users/adbhar/go/pkg/mod/github.com/spf13/viper@v1.12.0
+and to the hank module cache directory.
+
+
+1. Where the wiring runs: PersistentPreRunE
+--------------------------------------------
+The chain from process start:
+
+    cmd/forebitt/main.go:8
+        commands.Commands.Execute()
+
+    cmd/forebitt/commands/root.go:9
+        var Commands = commands.NewRootCommand(&cobra.Command{
+            Use:     version.Name,      // "forebitt"  (version/version.go:14)
+            Short:   version.Description,
+            Version: version.String(),
+        })
+
+    hank/cmd/commands/commands.go:71-77
+        func NewRootCommand(c *cobra.Command) *RootCommand {
+            c.TraverseChildren = true                  // :72
+            c.PersistentPreRunE = Setup(c.Name())      // :73  <- c.Name() == "forebitt"
+            return &RootCommand{c: c}
+        }
+
+Cobra invokes PersistentPreRunE AFTER parsing argv and BEFORE `Run`. Ordering
+for `forebitt server start`:
+
+    1. package init() functions register every flag
+       (cmd/forebitt/commands/server.go:58-93)
+    2. cobra parses argv
+    3. Setup("forebitt") runs                       <- viper is configured here
+    4. Run: commands.Simple(startServer)
+    5. startServer -> cfg.Unmarshal()               (server.go:34)
+
+The env prefix FOREBITT therefore comes from the ROOT command's name, which is
+why every variable in .env starts with it. There is no `forebitt.` viper key —
+"forebitt" is only an env-var prefix. The root key of the tree is `events`.
+
+
+2. What Setup actually sets
+----------------------------
+hank/cmd/commands/commands.go:79-99
+
+    viper.AutomaticEnv()                                                    // :81
+    viper.SetEnvPrefix(strings.ToUpper(name))                               // :82  -> "FOREBITT"
+    viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_", ".", "_"))        // :83
+
+    env := Env()
+    envFiles := []string{".env"}
+    if Env().IsLocal() { envFiles = append(envFiles, ".env.local") }
+    else               { envFiles = append(envFiles, ".env."+env.String()) }
+    _ = godotenv.Overload(envFiles...)                                      // :94
+
+    err := viper.BindPFlags(cmd.Flags())                                    // :96
+
+Note :94 — the error is DISCARDED. A missing or malformed .env is silent.
+
+`godotenv.Overload` writes into the real process environment (os.Setenv),
+overwriting any pre-existing value — unlike godotenv.Load, which does not
+overwrite. Later files in the list win over earlier ones. Within a single file,
+godotenv parses into a map, so a duplicated key means the LAST occurrence wins.
+
+
+3. BindPFlags: registration, not value copying
+-----------------------------------------------
+    viper.go:1133   BindPFlags(flags)  -> BindFlagValues(pflagValueSet{flags})
+    viper.go:1156   BindFlagValues     -> VisitAll, calling
+    viper.go:1168   BindFlagValue(flag.Name(), flag)
+    viper.go:1172       v.pflags[strings.ToLower(key)] = flag
+
+Two things worth noting:
+
+  * strings.ToLower at :1172 — this is why the flag registered as
+    `events.sns.aws.sessionToken` becomes the viper key
+    `events.sns.aws.sessiontoken`, and hence FOREBITT_EVENTS_SNS_AWS_SESSIONTOKEN.
+  * viper keeps a HANDLE to the flag, not its value. Values are read lazily.
+
+`cmd.Flags()` at the time Setup runs is the `start` subcommand's flag set, which
+(with TraverseChildren) includes the persistent flags from the root.
+
+
+4. The env name is computed per lookup, never stored
+-----------------------------------------------------
+Inside viper.find(), the AutomaticEnv branch:
+
+    viper.go:1276-1284
+        if v.automaticEnvApplied {
+            if val, ok := v.getEnv(v.mergeWithEnvPrefix(lcaseKey)); ok {
+                return val
+            }
+            if nested && v.isPathShadowedInAutoEnv(path) != "" {
+                return nil
+            }
+        }
+
+    viper.go:521-527
+        func (v *Viper) mergeWithEnvPrefix(in string) string {
+            if v.envPrefix != "" {
+                return strings.ToUpper(v.envPrefix + "_" + in)
+            }
+            return strings.ToUpper(in)
+        }
+
+    viper.go:545-553
+        func (v *Viper) getEnv(key string) (string, bool) {
+            if v.envKeyReplacer != nil {
+                key = v.envKeyReplacer.Replace(key)
+            }
+            val, ok := os.LookupEnv(key)
+            return val, ok && (v.allowEmptyEnv || val != "")
+        }
+
+Transform table for one key:
+
+    step                          code                       result
+    ----------------------------  -------------------------  --------------------------------
+    lcaseKey                      viper.go:1224              events.sns.aws.rolearn
+    mergeWithEnvPrefix            viper.go:521-527           FOREBITT_EVENTS.SNS.AWS.ROLEARN
+    envKeyReplacer.Replace        viper.go:546-548 ("."->"_") FOREBITT_EVENTS_SNS_AWS_ROLEARN
+    os.LookupEnv                  viper.go:550               the value
+
+The env-var NAME exists only for the duration of that call. It is not cached and
+not stored anywhere.
+
+SUBTLETY at viper.go:552: `ok && (v.allowEmptyEnv || val != "")`.
+`allowEmptyEnv` defaults to false, so an env var set to the EMPTY STRING counts
+as NOT SET and viper falls through to the next source. That is why the first,
+blank block at .env:80-85 is harmless even independently of godotenv's
+last-wins behaviour.
+
+
+5. Full precedence order inside find()
+---------------------------------------
+    1. Set() override                          viper.go:1238
+    2. pflag — ONLY if flag.HasChanged()       viper.go:1247
+       (i.e. only when actually typed as --events.sns.aws.rolearn=... on argv)
+    3. AutomaticEnv                            viper.go:1276   <- our .env lands here
+    4. BindEnv-registered env keys             viper.go:1286
+    5. config file                             viper.go:1297
+    6. defaults                                viper.go:1310-ish
+    7. flag DEFAULT value, if a flag exists    viper.go:1327   <- the "" from AddAWS
+
+Layer 2 vs layer 7 is the part people misread: the flag participates twice. Once
+at high priority but only if explicitly changed, and once at the very bottom as
+its default. The env sits between them.
+
+
+6. The one-line rule
+---------------------
+    viper key  ==  lowercase dotted path
+    env var    ==  "FOREBITT_" + that path, uppercased, dots -> underscores
+
+    events.sns.aws.region   <->  FOREBITT_EVENTS_SNS_AWS_REGION
+    events.topic            <->  FOREBITT_EVENTS_TOPIC
+    s3.region               <->  FOREBITT_S3_REGION
+
+...and the corollary that costs the most time:
+
+    A FOREBITT_* var whose corresponding dotted key was never registered
+    resolves to nothing during Unmarshal, silently.

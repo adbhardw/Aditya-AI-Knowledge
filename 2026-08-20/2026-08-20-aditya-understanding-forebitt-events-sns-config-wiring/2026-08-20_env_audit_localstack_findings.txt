@@ -1,0 +1,204 @@
+2026-08-20 — .env audit for the local LocalStack SNS setup
+==========================================================
+Audit of the "# Events Config" block at forebitt/.env:96-103 against the keys
+that are actually registered.
+
+STATUS OF EVIDENCE
+  VERIFIED  — read from source, line numbers grep-confirmed.
+  INFERRED  — follows from documented AWS/LocalStack behaviour but was NOT
+              executed in this session. No server was started, no message
+              published, no LocalStack container inspected.
+
+
+1. The block under audit
+-------------------------
+forebitt/.env:96-103
+
+    # Events Config
+    FOREBITT_EVENTS_SNS_AWS_ROLEARN=arn:aws:iam::000000000000:role/dummy   :97
+    FOREBITT_EVENTS_SNS_AWS_REGION=us-east-2                               :98
+    FOREBITT_EVENTS_SNS_AWS_ACCESSKEY=dummy-key                            :99
+    FOREBITT_EVENTS_SNS_AWS_SECRETKEY=dummy-secret                         :100
+    FOREBITT_EVENTS_SNS_ENDPOINT=http://localhost:4566                     :101
+    FOREBITT_EVENTS_SNS_DISABLESSL=true                                    :102
+    FOREBITT_EVENTS_TOPIC=dummy-topic.fifo                                 :103
+
+There is an earlier, blank duplicate block at .env:80-85:
+
+    FOREBITT_EVENTS_SNS_AWS_ROLEARN=                                       :81
+    FOREBITT_EVENTS_SNS_AWS_REGION=us-east-2                               :82
+    FOREBITT_EVENTS_SNS_AWS_ACCESSKEY=                                     :83
+    FOREBITT_EVENTS_SNS_AWS_SECRETKEY=                                     :84
+    FOREBITT_EVENTS_TOPIC=                                                 :85
+
+
+2. Binding status of each variable  [VERIFIED]
+-----------------------------------------------
+    .env line                              viper key                 registered?  effect
+    -------------------------------------  ------------------------  -----------  ------
+    FOREBITT_EVENTS_SNS_AWS_ROLEARN  :97   events.sns.aws.rolearn    yes          applied
+    FOREBITT_EVENTS_SNS_AWS_REGION   :98   events.sns.aws.region     yes          applied
+    FOREBITT_EVENTS_SNS_AWS_ACCESSKEY:99   events.sns.aws.accesskey  yes          applied
+    FOREBITT_EVENTS_SNS_AWS_SECRETKEY:100  events.sns.aws.secretkey  yes          applied
+    FOREBITT_EVENTS_SNS_ENDPOINT     :101  events.sns.endpoint       NO           DEAD
+    FOREBITT_EVENTS_SNS_DISABLESSL   :102  events.sns.disablessl     NO           DEAD
+    FOREBITT_EVENTS_TOPIC            :103  events.topic              yes          applied
+
+Registered set comes from hank/aws/config.go:32-41 plus services/events/config.go:49.
+
+
+3. FINDING 1 — the endpoint is one nesting level too high  [VERIFIED]
+----------------------------------------------------------------------
+`sns.Config` (hank/aws/sns/config.go:8-10) has exactly ONE field:
+
+    type Config struct {
+        AWS aws.Config
+    }
+
+There is no Endpoint at that level. Endpoint lives on aws.Config
+(hank/aws/config.go:14), i.e. at key `events.sns.aws.endpoint`.
+
+Two independent reasons the current line does nothing:
+  (a) no flag named `events.sns.endpoint` is registered, so the key is absent
+      from AllKeys() and Unmarshal never even looks it up;
+  (b) even if the key existed, mapstructure would find no matching field on
+      sns.Config and drop it (no ErrorUnused in viper's defaultDecoderConfig,
+      viper.go:1091+ — unknown keys are silently ignored).
+
+Consequence: cfg.AWS.Endpoint == "". hank/aws/service.go:52 then passes an empty
+Endpoint into the session, and the AWS SDK resolves the default regional
+endpoint. [INFERRED] That means sns.us-east-2.amazonaws.com — real AWS, not
+LocalStack.
+
+FIX:
+    FOREBITT_EVENTS_SNS_AWS_ENDPOINT=http://localhost:4566
+
+
+4. FINDING 2 — DisableSSL is unreachable through this path at all  [VERIFIED]
+------------------------------------------------------------------------------
+`aws.Config.DisableSSL` exists (hank/aws/config.go:16) and is consumed
+(hank/aws/service.go:54, and :26 in the non-assume-role New). But:
+
+  * hank/aws/config.go:20-29 has no DisableSSL const;
+  * hank/aws/config.go:32-41 (AddAWS) registers no such flag.
+
+So neither FOREBITT_EVENTS_SNS_DISABLESSL nor the "correct-looking"
+FOREBITT_EVENTS_SNS_AWS_DISABLESSL can reach it. AutomaticEnv is not
+enumerable — it sets one boolean (viper.go:1403-1404) and contributes nothing to
+AllKeys() (viper.go:1940-1950) — so an env var with no registered key is
+invisible to Unmarshal.
+
+Practical impact: none, provided the endpoint carries an explicit scheme.
+`http://localhost:4566` already selects plaintext; DisableSSL only matters for a
+scheme-less endpoint.
+
+RECOMMENDATION: delete .env:102. If DisableSSL is ever genuinely needed, it must
+be fixed upstream in hank by adding a `DisableSSL = "disablessl"` const and a
+`flags.Bool(config.MakePrefixKey(DisableSSL, prefix), false, ...)` line to AddAWS.
+
+
+5. FINDING 3 — RoleArn forces an STS AssumeRole  [VERIFIED code / INFERRED failure]
+------------------------------------------------------------------------------------
+hank/aws/service.go:61-65
+
+    if len(cfg.RoleArn) > 0 {
+        return sess, stscreds.NewCredentials(sess, cfg.RoleArn, func(opt *stscreds.AssumeRoleProvider) {
+            opt.Duration = duration
+        }), nil
+    }
+    return sess, creds, nil                                   // :66
+
+With .env:97 set, the static dummy credentials built at :41-45 are replaced by
+lazily-resolved AssumeRole credentials. stscreds builds its STS client from the
+session, so it inherits the session's endpoint.
+
+[INFERRED] As configured today (endpoint empty, see Finding 1), the first
+Publish triggers a real STS AssumeRole call for
+arn:aws:iam::000000000000:role/dummy against real AWS, which will fail. Fixing
+the endpoint sends STS to LocalStack instead, which accepts arbitrary role ARNs.
+
+SIMPLEST LOCAL FIX: leave the role empty —
+    FOREBITT_EVENTS_SNS_AWS_ROLEARN=
+so :66 returns the static dummy credentials directly. Note that an empty value
+is treated as unset by viper (viper.go:552), and `len(cfg.RoleArn) > 0` is false
+either way, so both spellings work.
+
+Because credentials are lazy, none of this fails at startup. It fails at the
+first Publish, which is why the misconfiguration is easy to miss.
+
+
+6. FINDING 4 — Topic must be a full ARN  [VERIFIED code / INFERRED failure]
+----------------------------------------------------------------------------
+hank/aws/sns/service.go:47-52
+
+    res, err := s.client.Publish(&sns.PublishInput{
+        MessageGroupId:    aws.String(reqId),
+        Message:           aws.String(string(snsMessage)),
+        TopicArn:          aws.String(topicARN),        // :50
+        MessageAttributes: messageAttributes,
+    })
+
+`topicARN` is `e.topic`, set from cfg.Topic at hank/events/service.go:26. The
+value passes through untouched. `dummy-topic.fifo` is a topic NAME, not an ARN.
+
+FIX:
+    FOREBITT_EVENTS_TOPIC=arn:aws:sns:us-east-2:000000000000:dummy-topic.fifo
+(and the topic must actually be created in LocalStack, as a FIFO topic).
+
+
+7. HYPOTHESIS RAISED AND THEN DISPROVED — empty MessageGroupId
+---------------------------------------------------------------
+During the session it was suggested that an empty request id would make the FIFO
+publish fail, since MessageGroupId is required for FIFO topics and comes from
+`contexts.GetReqIdCtx(ctx)` (hank/aws/sns/service.go:37, :48).
+
+That concern does not hold. hank/contexts/contexts.go:22-34 falls through three
+sources and the last one is:
+
+    // Else generate a new id
+    return uuid.New().String()                                // :33
+
+so GetReqIdCtx never returns an empty string. MessageGroupId is always populated.
+Recorded here because the elimination is the reusable part: the FIFO group id is
+per-REQUEST, which is a separate and real ordering consideration, but it is never
+absent.
+
+
+8. FINDING 5 — duplicated .env block  [VERIFIED]
+-------------------------------------------------
+.env:80-85 and .env:96-103 both define FOREBITT_EVENTS_*. godotenv parses the
+file into a map, so the later block (96-103) wins. Additionally the earlier
+block's values are empty strings, which viper treats as unset (viper.go:552).
+The current behaviour is therefore correct, but the duplication is a trap for
+the next person: adding a variable to the FIRST block would appear to have no
+effect.
+
+RECOMMENDATION: delete .env:80-85 and keep one block.
+
+
+9. Proposed corrected block
+----------------------------
+    # Events Config (LocalStack)
+    FOREBITT_EVENTS_SNS_AWS_ROLEARN=
+    FOREBITT_EVENTS_SNS_AWS_REGION=us-east-2
+    FOREBITT_EVENTS_SNS_AWS_ACCESSKEY=dummy-key
+    FOREBITT_EVENTS_SNS_AWS_SECRETKEY=dummy-secret
+    FOREBITT_EVENTS_SNS_AWS_ENDPOINT=http://localhost:4566
+    FOREBITT_EVENTS_TOPIC=arn:aws:sns:us-east-2:000000000000:dummy-topic.fifo
+
+Changed vs current: ROLEARN emptied, SNS_ENDPOINT -> SNS_AWS_ENDPOINT,
+DISABLESSL removed, TOPIC becomes a full ARN. Not applied to .env in this
+session — proposed only.
+
+
+10. How to verify a key is live, generally
+-------------------------------------------
+Grep the registration side, not the .env side:
+
+    grep -rn "MakePrefixKey" <hank>/aws/config.go       # what leaves exist
+    grep -rn "AddEvents\|AddSNS\|AddAWS" forebitt/      # what prefixes are used
+
+If a FOREBITT_* variable does not correspond to a `flags.X(MakePrefixKey(...))`
+registration somewhere in the chain, it does nothing. There is no error, no
+warning, and no log line — which is the single most important operational fact
+in this whole document.

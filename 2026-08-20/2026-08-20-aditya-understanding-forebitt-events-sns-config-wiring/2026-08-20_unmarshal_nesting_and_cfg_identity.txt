@@ -1,0 +1,186 @@
+2026-08-20 — Unmarshal nesting, and why cfg.Region is not cfg.events_sns_aws_region
+===================================================================================
+The question that prompted this document:
+
+    "how did cfg here just get the Region value, it should be the full
+     events.sns.aws.region right?"
+
+Short answer: no. The dotted path is a LOOKUP ADDRESS used exactly once, to
+decide where in a nested map the value gets placed. After that it is gone. What
+survives is a struct with a field named `Region`.
+
+
+1. Unmarshal flattens the dotted keys back into a nested map
+-------------------------------------------------------------
+viper@v1.12.0/viper.go:1085-1087
+
+    func (v *Viper) Unmarshal(rawVal interface{}, opts ...DecoderConfigOption) error {
+        return decode(v.AllSettings(), defaultDecoderConfig(rawVal, opts...))
+    }
+
+viper.go:2021-2038
+
+    func (v *Viper) AllSettings() map[string]interface{} {
+        m := map[string]interface{}{}
+        for _, k := range v.AllKeys() {              // k = "events.sns.aws.accesskey"
+            value := v.Get(k)                        // <- the env lookup happens HERE
+            if value == nil { continue }
+            path := strings.Split(k, v.keyDelim)     // ["events","sns","aws","accesskey"]
+            lastKey := strings.ToLower(path[len(path)-1])          // "accesskey"
+            deepestMap := deepSearch(m, path[0:len(path)-1])       // m["events"]["sns"]["aws"]
+            deepestMap[lastKey] = value              // <- ONLY the leaf name is the map key
+        }
+        return m
+    }
+
+viper@v1.12.0/util.go:182-201 — deepSearch walks/creates the intermediate maps:
+
+    func deepSearch(m map[string]interface{}, path []string) map[string]interface{} {
+        for _, k := range path {
+            m2, ok := m[k]
+            if !ok {
+                m3 := make(map[string]interface{})
+                m[k] = m3
+                m = m3
+                continue
+            }
+            m3, ok := m2.(map[string]interface{})
+            if !ok {                        // intermediate key held a value -> replace with a map
+                m3 = make(map[string]interface{})
+                m[k] = m3
+            }
+            m = m3
+        }
+        return m
+    }
+
+So the map handed to mapstructure looks like this (values from .env:97-103):
+
+    map[string]any{
+      "events": map[string]any{
+        "sns": map[string]any{
+          "aws": map[string]any{
+            "accesskey":        "dummy-key",
+            "secretkey":        "dummy-secret",
+            "sessiontoken":     "",
+            "rolearn":          "arn:aws:iam::000000000000:role/dummy",
+            "region":           "us-east-2",
+            "endpoint":         "",            <- see the env-audit doc
+            "s3forcepathstyle": false,
+            "maxfilesize":      int64(0),
+          },
+        },
+        "topic": "dummy-topic.fifo",
+      },
+      "s3":     map[string]any{ "region": "us-west-1", ... },
+      "db":     map[string]any{ ... },
+      "server": map[string]any{ ... },
+    }
+
+Note there is no "forebitt" level in this map, and no key anywhere in it is
+called "events.sns.aws.region".
+
+
+2. Each dot segment is spent on one struct hop
+-----------------------------------------------
+mapstructure then walks the map and the struct in lockstep. Field matching is
+case-insensitive (mapstructure default; viper's defaultDecoderConfig at
+viper.go:1091+ sets WeaklyTypedInput and decode hooks but leaves that default).
+
+    map key       struct hop                                    declared at
+    -----------   -------------------------------------------   -------------------------------
+    "events"      server.Config.Events  *hevent.Config           api/server/server.go:72
+      "sns"       hevent.Config.SNS      sns.Config              hank/events/config.go:8
+        "aws"     sns.Config.AWS         aws.Config              hank/aws/sns/config.go:9
+          "region"  aws.Config.Region    string                  hank/aws/config.go:13
+
+Resulting object:
+
+    server.Config
+     |__ Events *events.Config                 <- "events" consumed here
+          |__ SNS sns.Config                   <- "sns"    consumed here
+          |    |__ AWS aws.Config              <- "aws"    consumed here
+          |         |__ AccessKey = "dummy-key"
+          |         |__ SecretKey = "dummy-secret"
+          |         |__ RoleArn   = "arn:aws:iam::000000000000:role/dummy"
+          |         |__ Region    = "us-east-2"        <- "region" lands here
+          |         |__ Endpoint  = ""
+          |__ Topic = "dummy-topic.fifo"
+
+By the time you are standing INSIDE aws.Config, all three prefix segments have
+already been spent getting you there. The field is just `Region`.
+
+
+3. Four different variables all named cfg
+------------------------------------------
+This is the actual source of the confusion. Each function has its own `cfg` of a
+different type; the name is reused, the type is not.
+
+    file:line                          declaration                        type of cfg
+    ---------------------------------  ---------------------------------  ---------------
+    cmd/forebitt/commands/server.go:32 var cfg server.Config              server.Config
+    hank/events/service.go:18          func New(cfg Config)               events.Config
+    hank/aws/sns/service.go:20         func NewSNS(cfg *Config)           sns.Config
+    hank/aws/service.go:40             func NewWithAssumeRoleDuration(cfg *Config, ...)  aws.Config
+
+So `cfg.Region` at hank/aws/service.go:48 is the FOURTH cfg — an aws.Config,
+which has exactly one field named Region and no knowledge of any prefix.
+
+The same value has four equivalent spellings depending on where you stand, and
+all four read the same bytes in memory:
+
+    cfg.Events.SNS.AWS.Region     // in startServer                (server.Config)
+    cfg.SNS.AWS.Region            // in hevent.New                 (events.Config)
+    cfg.AWS.Region                // in hsns.NewSNS                (sns.Config)
+    cfg.Region                    // in NewWithAssumeRoleDuration  (aws.Config)
+
+
+4. The handoff, value by value
+-------------------------------
+    cmd/forebitt/commands/server.go:32   var cfg server.Config
+    cmd/forebitt/commands/server.go:34   err := cfg.Unmarshal()
+        -> api/server/server.go:158-160  return config.Unmarshal(c)
+        -> hank/cmd/config/parameters.go:18-20  return viper.Unmarshal(v)
+        => cfg.Events.SNS.AWS.Region == "us-east-2"
+
+    api/server/events.go:65   events.PublishEvent(ctx, *s.Options.Events, message)
+        dereferences *events.Config and copies it into a param named `config`
+
+    services/events/service.go:10   hevent.New(config)
+        -> hank/events/service.go:18, param now named `cfg` (events.Config)
+
+    hank/events/service.go:19   hsns.NewSNS(&cfg.SNS)
+        takes the ADDRESS of the SNS field; param named `cfg` (*sns.Config)
+
+    hank/aws/sns/service.go:21  haws.NewWithAssumeRoleDuration(&cfg.AWS, 3600*time.Second)
+        address of the AWS field; param named `cfg` (*aws.Config)
+
+    hank/aws/service.go:48      Region: aws.String(cfg.Region)   ->  "us-east-2"
+
+`&cfg.AWS` is a pointer straight into the middle of the struct that was
+unmarshalled. No copy of keys, no map, no viper. hank/aws/service.go does not
+import viper at all — it could not see a key even if it wanted to.
+
+
+5. The proof that the prefix cannot be in the field name
+---------------------------------------------------------
+cmd/forebitt/commands/server.go:85-86
+
+    haws.AddAWS(startServerCommand.Flags(), "s3")        // -> s3.region, s3.accesskey, ...
+    events.AddEvents(startServerCommand.Flags(), "events") // -> events.sns.aws.region, ...
+
+The SAME aws.Config type is filled from two different prefixes: FOREBITT_S3_REGION
+(= us-west-1, .env:76) and FOREBITT_EVENTS_SNS_AWS_REGION (= us-east-2, .env:98).
+If the prefix were part of the field name, one struct type could not serve both.
+The prefix is an address in the tree; the field name is a leaf.
+
+
+6. Reusable rule
+-----------------
+    dotted key  = where to put it   (used once, by AllSettings/deepSearch)
+    struct path = how to get to it  (each segment consumed by one hop)
+    field name  = the leaf only
+
+    Corollary: to know which env var feeds a Go field, read the struct nesting
+    from the top-level Config down, collect the field names, lowercase them, join
+    with dots, uppercase with underscores, prefix with the ROOT COBRA COMMAND NAME.

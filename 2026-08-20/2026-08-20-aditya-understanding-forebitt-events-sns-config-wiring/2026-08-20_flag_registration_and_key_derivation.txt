@@ -1,0 +1,163 @@
+2026-08-20 — Flag registration and config-key derivation
+=========================================================
+How `events.AddEvents(startServerCommand.Flags(), "events")` turns into the
+config keys `events.sns.aws.*` and `events.topic`.
+
+Repo:   /Users/adbhar/Documents/project-sprint-understanding-1/forebitt
+Branch: enforced-ptp/dv-12695
+Dep:    github.com/deklareddotcom/hank v1.23.1-0.20250813161745-c53aa6f6741a
+        (module cache: /Users/adbhar/go/pkg/mod/github.com/deklareddotcom/hank@v1.23.1-...)
+Viper:  github.com/spf13/viper v1.12.0  (go.mod:121, "// indirect")
+Pflag:  github.com/spf13/pflag v1.0.5   (go.mod:32)
+
+All line numbers below were read directly from source, not recalled.
+
+
+1. The registration call
+------------------------
+cmd/forebitt/commands/server.go:86
+
+    events.AddEvents(startServerCommand.Flags(), "events")
+
+`startServerCommand` is the cobra command for `forebitt server start`, built in
+`init()` at cmd/forebitt/commands/server.go:50-56. `.Flags()` returns its
+*pflag.FlagSet. Everything that follows only ever writes into that FlagSet.
+
+
+2. Three nested helpers, each appending one prefix segment
+----------------------------------------------------------
+services/events/config.go:47-50
+
+    func AddEvents(flags *pflag.FlagSet, prefix ...string) {
+        sns.AddSNS(flags, append(prefix, "sns")...)                     // :48
+        flags.String(config.MakePrefixKey(Topic, prefix), "", "topic")  // :49
+    }
+
+hank/aws/sns/config.go:13-15
+
+    func AddSNS(flags *pflag.FlagSet, prefix ...string) {
+        aws.AddAWS(flags, append(prefix, "aws")...)                     // :14
+    }
+
+hank/aws/config.go:32-41
+
+    func AddAWS(flags *pflag.FlagSet, prefix ...string) {
+        flags.String(config.MakePrefixKey(AccessKey, prefix), "", "aws access key")        // :33
+        flags.String(config.MakePrefixKey(SecretKey, prefix), "", "aws secret access key") // :34
+        flags.String(config.MakePrefixKey(SessionToken, prefix), "", "aws session token")  // :35
+        flags.String(config.MakePrefixKey(RoleArn, prefix), "", "aws role arn")            // :36
+        flags.String(config.MakePrefixKey(Region, prefix), "", "aws region")               // :37
+        flags.String(config.MakePrefixKey(Endpoint, prefix), "", "aws endpoint")           // :38
+        flags.Int64(config.MakePrefixKey(MaxFileSize, prefix), 0, "...")                   // :39
+        flags.Bool(config.MakePrefixKey(S3ForcePathStyle, prefix), false, "...")           // :40
+    }
+
+The prefix grows by one element per hop, purely through `append`:
+
+    AddEvents  prefix = ["events"]
+    AddSNS     prefix = ["events","sns"]
+    AddAWS     prefix = ["events","sns","aws"]
+
+
+3. MakePrefixKey is a string join — nothing more
+------------------------------------------------
+hank/cmd/config/parameters.go:56-62
+
+    func MakePrefixKey(key string, prefix []string) string {
+        if len(prefix) == 0 {
+            return key
+        }
+        return strings.Join(prefix, ".") + "." + key
+    }
+
+So `MakePrefixKey("accesskey", ["events","sns","aws"])` == "events.sns.aws.accesskey".
+
+The leaf names come from consts at hank/aws/config.go:20-29:
+
+    AccessKey        = "accesskey"
+    SecretKey        = "secretkey"
+    SessionToken     = "sessionToken"      <- note the camelCase; viper lowercases it later
+    RoleArn          = "rolearn"
+    Region           = "region"
+    Endpoint         = "endpoint"
+    S3ForcePathStyle = "s3forcepathstyle"
+    MaxFileSize      = "maxfilesize"
+
+and Topic = "topic" at services/events/config.go:10.
+
+
+4. The complete set of keys registered by that one line
+-------------------------------------------------------
+    events.sns.aws.accesskey
+    events.sns.aws.secretkey
+    events.sns.aws.sessionToken
+    events.sns.aws.rolearn
+    events.sns.aws.region
+    events.sns.aws.endpoint
+    events.sns.aws.maxfilesize
+    events.sns.aws.s3forcepathstyle
+    events.topic
+
+IMPORTANT: `disablessl` is NOT in this list. `aws.Config` has a `DisableSSL bool`
+field (hank/aws/config.go:16) and `hank/aws/service.go:54` reads it, but AddAWS
+registers no flag for it and there is no const for it at :20-29. It is therefore
+unreachable through this configuration path. See the env-audit document.
+
+
+5. Where the key strings physically live
+----------------------------------------
+Two in-memory maps. Nothing on disk.
+
+(a) The pflag FlagSet.
+    `flags.String(name, "", usage)` allocates a *string holding "" and stores a
+    *pflag.Flag{Name: "events.sns.aws.accesskey", DefValue: "", Value: ...} in
+    the FlagSet's internal `formal` map. The dots are not special to pflag — this
+    is just a flag whose name happens to contain dots. It could be passed on the
+    command line as `--events.sns.aws.accesskey=xyz`.
+
+(b) viper's `pflags` map, after binding (see the env-binding document):
+    viper@v1.12.0/viper.go:1172
+
+        v.pflags[strings.ToLower(key)] = flag
+
+    viper stores the key name and a handle to the flag. It stores NO value.
+
+The values themselves live in `os.Environ()`, loaded from .env by godotenv.
+viper never copies them in; it does a live os.LookupEnv on every read.
+
+
+6. Why registration matters even though the flags are never typed on the CLI
+-----------------------------------------------------------------------------
+Registration is what makes a key *exist* for viper. viper.Unmarshal decodes
+`AllSettings()`, which iterates `AllKeys()` (viper.go:1940-1950):
+
+    m = v.flattenAndMergeMap(m, castMapStringToMapInterface(v.aliases), "")
+    m = v.flattenAndMergeMap(m, v.override, "")
+    m = v.mergeFlatMap(m, castMapFlagToMapInterface(v.pflags))       <- our keys
+    m = v.mergeFlatMap(m, castMapStringSliceToMapInterface(v.env))   <- BindEnv only
+    m = v.flattenAndMergeMap(m, v.config, "")
+    m = v.flattenAndMergeMap(m, v.kvstore, "")
+    m = v.flattenAndMergeMap(m, v.defaults, "")
+
+`v.env` is populated only by explicit `BindEnv` calls (viper.go:1192).
+`AutomaticEnv` sets a single boolean (viper.go:1403-1404) and enumerates nothing.
+
+CONSEQUENCE, and this is the reusable rule:
+
+    An environment variable whose key was never registered as a flag
+    (or default, or config-file entry, or BindEnv) is INVISIBLE to
+    viper.Unmarshal. It will not error. It will silently do nothing.
+
+This is exactly why two of the seven FOREBITT_EVENTS_* vars in .env are dead.
+
+
+7. The same helper, a different prefix
+---------------------------------------
+cmd/forebitt/commands/server.go:85
+
+    haws.AddAWS(startServerCommand.Flags(), "s3")
+
+Same function, same struct type, prefix ["s3"] -> keys `s3.accesskey`,
+`s3.region`, ... filled from FOREBITT_S3_* (.env:75-78). One `aws.Config` type
+serves both because the prefix lives in the *access path*, never in the field
+name. See the unmarshal/nesting document.
