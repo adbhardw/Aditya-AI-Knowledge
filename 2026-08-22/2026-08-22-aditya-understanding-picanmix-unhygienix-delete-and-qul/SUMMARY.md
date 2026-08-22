@@ -204,6 +204,20 @@ read from source, not reproduced, not raised with owners.
 - gorm layer trace (handler → ORM → SQL) — [`02-gorm-v1-soft-delete-mechanism.md`](02-gorm-v1-soft-delete-mechanism.md)
 - QUL lifecycle table T1–T12 — [`03-question-user-list-vs-export-job-model.md`](03-question-user-list-vs-export-job-model.md)
 - Wall-clock dual-pipeline trace + `job_runs` layer trace — [`04-orchestration-segment-code-and-job-runs.md`](04-orchestration-segment-code-and-job-runs.md)
+- Export-vs-QUL comparison table — [`07-export-path-in-depth.md`](07-export-path-in-depth.md)
+
+### Document map
+
+| Doc | Covers |
+|---|---|
+| [`01`](01-soft-vs-hard-delete.md) | delete semantics, both services, first principles |
+| [`02`](02-gorm-v1-soft-delete-mechanism.md) | gorm v1 mechanism, `DeletedAt` × `Unscoped`, fail-open boundary |
+| [`03`](03-question-user-list-vs-export-job-model.md) | QUL data model, why the third table exists |
+| [`04`](04-orchestration-segment-code-and-job-runs.md) | orchestration, `partner_segment_code`, `job_runs` lifecycle |
+| [`05`](05-findings-and-bugs.md) | findings F1-F8 |
+| [`06`](06-session-question-index.md) | question-by-question index of the session |
+| [`07`](07-export-path-in-depth.md) | the export path at QUL depth |
+| [`08`](08-explanation-method-and-environment.md) | explanation method + Claude Code memory scoping |
 
 ## 11. Open questions
 
