@@ -33,6 +33,7 @@ Repo roots referenced throughout:
 | [`06-session-question-index.md`](06-session-question-index.md) | Every question asked in the session, in order, with the one-line answer and a link to the document holding the evidence. Start here if you remember a phrase but not where it was discussed. |
 | [`07-export-path-in-depth.md`](07-export-path-in-depth.md) | The `EXPORTS` path traced to the same depth as QUL: the twelve guards in `CreateExportJobs`, the three tables one call writes, the `@daily` DAG chain into tenansix `ExportCommand`, the dataset-vs-question fork, the TEE clean-room exclusion, the `TriggerOnDemandExport` validation chain, and an export-vs-QUL comparison table. |
 | [`08-explanation-method-and-environment.md`](08-explanation-method-and-environment.md) | Process, not picanmix: the three table formats used here (state-at-each-moment, wall-clock, layer trace), the rules that made the citations trustworthy, and the finding that Claude Code memory is per-working-directory (15 separate stores) while `~/.claude/CLAUDE.md` is the only globally-loaded file. |
+| [`2026-08-22_go_pointer_value_explaination.txt`](2026-08-22_go_pointer_value_explaination.txt) | **Learning card.** The shadowed-variable bug in `CreateJobRunV2` (`picanmix/api/server/job_run.go:171`) — the two mismatched return types that caused it, what actually happens to the row, the fix, what does *not* work, and why Java would have rejected it at compile time. Plain text, self-contained. |
 
 ## The two ideas worth remembering
 

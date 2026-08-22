@@ -1,0 +1,129 @@
+GO POINTER vs VALUE — THE SHADOWED VARIABLE BUG
+===============================================
+Date: 2026-08-22
+
+
+WHERE
+-----
+Repo      picanmix
+File      api/server/job_run.go
+Function  CreateJobRunV2          (lines 160-178)
+Bad line  :171                    jobRun := models.NewJobRunForJobID(...)
+Compare   CreateJobRun (V1)       (lines 142-158)  -- correct, same commit
+
+Introduced  commit 35dbe42 "Feature/dv4057 (#149)", shruthi-habu, 2023-03-28
+Status      dead code - no caller anywhere; proto/job.proto:1125 has no HTTP route
+
+
+THE CODE AS WRITTEN
+-------------------
+    jobRun, notFound := db.FetchJobRunByJobIDSourceID(s.DB, in.JobID, sourceJobRunID)
+    if notFound {
+        jobRun := models.NewJobRunForJobID(in.JobID, in.JobRunType.String(), sourceJobRunID)
+        err = db.CreateJobRun(ctx, s.DB, jobRun)
+        if err != nil {
+            return nil, err
+        }
+    }
+    return &proto.CreateJobRun_Response{JobRun: jobRun.ToProto()}, nil
+
+
+THE TWO TYPES
+-------------
+    db/job_run.go:165   FetchJobRunByJobIDSourceID -> (models.JobRun, bool)   VALUE
+    models/job.go:120   NewJobRunForJobID          -> *JobRun                 POINTER
+
+So `jobRun = models.NewJobRunForJobID(...)` does NOT compile:
+    cannot use *JobRun as JobRun
+
+The author reached for `:=` to make it compile. `:=` inside an if-block creates a
+NEW block-scoped variable. Go accepts this silently.
+
+
+WHAT ACTUALLY HAPPENS
+---------------------
+    :166  outer jobRun = zero value (ID "", JobStatus "")
+    :171  inner jobRun = new pointer  <-- SHADOW, outer untouched
+    :172  db.CreateJobRun -> INSERT + COMMIT succeed
+          gorm BeforeCreate hook (models/audit.go:17-19) writes the UUID
+          back THROUGH THE POINTER, so inner jobRun.ID = real uuid
+    :175  block ends, inner pointer discarded
+    :176  jobRun.ToProto() runs on the OUTER zero value
+          -> ID ""
+          -> JobStatus "" misses the enum map -> 0 = UNKNOWN_JOB_RUN_STATUS
+
+Row is written and committed. Only the RESPONSE is empty.
+No error, no rollback, no log. The id exists and nobody has it.
+
+
+THE FIX (what I would ship)
+---------------------------
+    jobRun, notFound := db.FetchJobRunByJobIDSourceID(s.DB, in.JobID, sourceJobRunID)
+    if notFound {
+        newRun := models.NewJobRunForJobID(in.JobID, in.JobRunType.String(), sourceJobRunID)
+        if err = db.CreateJobRun(ctx, s.DB, newRun); err != nil {
+            return nil, err
+        }
+        jobRun = *newRun        // deref AFTER create - carries the UUID
+    }
+    return &proto.CreateJobRun_Response{JobRun: jobRun.ToProto()}, nil
+
+One renamed variable, one added line.
+The deref MUST come after db.CreateJobRun - that is where the UUID is set.
+
+
+ALTERNATIVE FIX (outer becomes a pointer, shadow impossible)
+------------------------------------------------------------
+    jobRun := &models.JobRun{}
+    existing, notFound := db.FetchJobRunByJobIDSourceID(s.DB, in.JobID, sourceJobRunID)
+    if notFound {
+        jobRun = models.NewJobRunForJobID(in.JobID, in.JobRunType.String(), sourceJobRunID)
+        if err = db.CreateJobRun(ctx, s.DB, jobRun); err != nil {
+            return nil, err
+        }
+    } else {
+        jobRun = &existing
+    }
+
+
+WHAT DOES *NOT* WORK
+--------------------
+    jobRun = *jobRun
+
+Inside the block `jobRun` is the inner *models.JobRun, so this assigns a
+models.JobRun to a pointer variable -> compile error. And even if it typed,
+it writes to the shadow, not the outer.
+
+
+LEARNING POINTS
+---------------
+1. The assignment is needed in ANY language. `new X()` makes a new object;
+   something has to be pointed at it. References do not remove that.
+
+2. Java would have REJECTED this at compile time. JLS 6.4: an inner block
+   may not redeclare an enclosing local. Java forces `jobRun = new JobRun(...)`,
+   which is correct. Go allows the shadow - same feature that makes
+   `if err := f(); err != nil` idiomatic.
+
+3. Pointer-ness does not remove the assignment, it removes the TYPE MISMATCH
+   that pushed the author to `:=`. Two functions returning the same shape
+   (both value or both pointer) and this bug cannot occur.
+
+4. ineffassign / staticcheck SA4006 do NOT catch it - the inner variable IS
+   read (passed to CreateJobRun). Only a shadow-aware analyzer sees it.
+
+5. picanmix .golangci.yml DOES enable govet shadow, and excludes only
+   `err` and `ctx`. It would report:
+       job_run.go:171:3: shadow: declaration of "jobRun" shadows declaration at line 166
+   It never fires because Makefile:126 runs
+       golangci-lint run --new-from-rev="$(REV_NUMBER)"
+   which only lints lines changed since the merge-base with master.
+   The line stopped being "new" in 2023.
+
+
+REVIEW RULE TO REMEMBER
+-----------------------
+A `:=` inside an if-block, on a name that already exists in the enclosing
+scope, is always worth a second look. If the two sides differ in
+pointer-ness, that is the tell that the author was fighting the type system
+rather than expressing intent.
