@@ -1,0 +1,545 @@
+=============================================================================
+THE RELAY, GO TRANSACTIONS, AND WHAT HAPPENS WHEN SNS IS DOWN
+Q&A follow-up to 2026-08-21_change_events_outbox_step_trace.txt
+=============================================================================
+Date: 2026-08-21
+Repo root: /Users/adbhar/Documents/project-sprint-understanding-1/
+
+Companion doc: 2026-08-21_change_events_outbox_step_trace.txt in this folder
+covers the before/after step trace for creating a data connection. This one
+answers the follow-up questions: the Go transaction mechanics, how the relay
+actually works and where it is started, and the SNS-outage behaviour.
+
+
+=============================================================================
+Q1. Are we adding the event to the QUEUE, or to the change_event_outbox TABLE?
+=============================================================================
+
+To the TABLE only. That is the entire point.
+
+Under the outbox design, NOTHING goes to SNS during the request. There is no
+network call anywhere in the request path any more. The audit hook writes a
+row, the transaction commits, the HTTP response returns. Done.
+
+The SNS call still exists -- but it has moved OUT of the request path into a
+background loop that runs on a timer, described in Q5.
+
+This matters more than it sounds: today an SNS slowdown can back up the
+publisher goroutine, fill the 1024-slot channel
+(hank/db/change_events.go:62,171), and start silently dropping events at
+hank/db/change_events.go:282-284. After the change, SNS being slow or down has
+no effect on writes at all, because writes never talk to SNS.
+
+
+=============================================================================
+Q2. What is the Go transaction here, and why does one substituted line matter?
+=============================================================================
+
+Start with what BeginTxDB actually is. hank/db/audit.go:230-234:
+
+    func BeginTxDB(ctx context.Context, db *gorm.DB, opts *sql.TxOptions) *gorm.DB {
+        tx := db.BeginTx(ctx, opts)
+        tx.InstantSet("context", ctx)
+        return tx
+    }
+
+Called from forebitt/db/job_v2.go:19. What it does:
+
+  - takes ONE connection out of the pool
+  - issues BEGIN on that connection
+  - returns a *gorm.DB whose internal handle is a *sql.Tx, not a *sql.DB
+  - stashes ctx on it so the audit hooks can read the auth claims later
+
+From that moment, on THAT handle:
+
+  - every tx.Create(...) / tx.Model(...).Updates(...) runs on THAT connection,
+    inside THAT transaction
+  - nothing written is visible to any other connection until tx.Commit()
+  - tx.Rollback() discards all of it
+
+Now compare the two versions of the emit line by WHAT THEY TOUCH.
+
+TODAY -- hank/db/change_events.go:279
+
+    p.buf <- queuedEvent{...}
+
+  p.buf is a Go channel, created at hank/db/change_events.go:171 as
+  make(chan queuedEvent, size). THIS IS NOT A DATABASE OPERATION. It is a
+  write to process memory. Consequences:
+
+    - Postgres does not know it happened
+    - it is not in the transaction
+    - tx.Rollback() cannot undo it
+    - the run() goroutine at hank/db/change_events.go:177-182 can pick it up
+      and publish to SNS WHILE THE TRANSACTION IS STILL OPEN
+
+PROPOSED
+
+    scope.DB().Create(&ChangeEventOutbox{...})
+
+  scope.DB() IS that same tx handle. So this is
+  INSERT INTO change_event_outbox ... on the same connection, inside the same
+  transaction. Consequences:
+
+    - invisible to every other connection, INCLUDING THE RELAY, until COMMIT
+    - tx.Rollback() destroys it along with the business rows
+    - it shares the business row's commit decision, by construction
+
+THAT IS THE WHOLE LEVER. One write goes to memory and escapes instantly with
+no coordination. The other goes into the transaction and inherits its fate.
+
+Verification that scope.DB() really is the transaction (gorm v1.9.11):
+gorm:begin_transaction calls scope.Begin() (gorm scope.go:403-411), which only
+opens a transaction when SQLDB() is a *sql.DB. Inside BeginTxDB the handle is
+already a *sql.Tx, the type assertion at scope.go:404 fails, no nested
+transaction is started, and CommitOrRollback (gorm callback_save.go:12-14)
+no-ops because "gorm:started_transaction" was never set. So the audit hook
+always runs inside whatever transaction is active.
+
+
+=============================================================================
+Q3. Is the outbox row UPDATED at the moment the data connection is committed?
+=============================================================================
+
+No. The row was INSERTED earlier, while the transaction was still open. COMMIT
+merely makes that already-written row durable. published_at is NULL before the
+commit and NULL after it.
+
+Timeline for one data connection (1 DataImportJob + 10 OrganizationJobParameter):
+
+ TIME  CODE                       data_import_jobs      change_event_outbox              SNS
+ ----  -------------------------  --------------------  -------------------------------  --------
+ T1    forebitt/db/job_v2.go:19   --                    --                               --
+       BEGIN
+ T2    forebitt/db/job_v2.go:20   1 row (UNCOMMITTED)   --                               --
+       tx.Create(&job)
+ T3    hank/db/audit.go:165 ->    1 row (UNCOMMITTED)   1 row, published_at=NULL          --
+       change_events.go:279                             (UNCOMMITTED)
+       outbox INSERT
+ T4    forebitt/db/job_v2.go:25   +10 (UNCOMMITTED)     +10 NULL (UNCOMMITTED)           --
+       parameter inserts
+ T5    forebitt/db/job_v2.go:31   11 rows DURABLE       11 rows DURABLE,                 --
+       tx.Commit()                                      ALL STILL published_at=NULL
+ ....  ..... gap, seconds .....
+ T6    relay SELECT               11                    11 NULL -- relay sees them       --
+                                                        FOR THE FIRST TIME
+ T7    relay Publish              11                    11 NULL                          11 msgs
+ T8    relay UPDATE               11                    11 with timestamps               11 msgs
+
+Two things to read off this table:
+
+1. At T5 the outbox row is NOT updated. It was inserted at T3. published_at
+   stays NULL through the commit and only changes at T8, by a different
+   process, seconds or hours later.
+
+2. The relay CANNOT see the row before T5. That is ordinary transaction
+   isolation, and it is doing real work for free -- there is no way for the
+   relay to publish an event for an uncommitted write. Today's channel has no
+   such protection, which is failure mode F1 in the companion doc.
+
+If T5 were tx.Rollback() (forebitt/db/job_v2.go:22 or :28) instead of Commit,
+all 22 rows vanish together and the relay never learns they existed.
+
+
+=============================================================================
+Q4. What moves published_at from NULL to a timestamp?
+    Is it hank? Is it the next transaction?
+=============================================================================
+
+NEITHER.
+
+  - NOT the audit hooks in hank/db/audit.go
+  - NOT the next request
+  - NOT the next transaction
+  - NOTHING in the request path ever touches published_at
+
+It is set by a separate loop that runs on a TIMER, forever, independent of
+traffic. If forebitt serves zero requests for three hours, those rows are still
+published, because the loop ticks on time, not on requests.
+
+This is the piece that makes the guarantee work. If publishing depended on the
+next write coming along, a service that went quiet after a failed publish would
+never deliver the event.
+
+State machine for a row, in full -- there are only two states:
+
+    published_at IS NULL         =  STILL OWED. The relay will keep picking
+                                    this row up on every poll, forever, until
+                                    it succeeds.
+    published_at IS NOT NULL     =  DONE. Never selected again. Eligible for
+                                    the reaper after N days.
+
+
+=============================================================================
+Q5. How does the relay work, and how is it started?
+=============================================================================
+
+5.1 THE EASIEST WAY TO SEE IT: the relay IS run(), with the channel swapped
+    for a table.
+
+TODAY -- hank/db/change_events.go:177-182
+
+    func (p *publisher) run() {
+        defer close(p.done)
+        for qe := range p.buf {     // 1. get next pending item
+            p.publishOne(qe)        // 2. publish it
+        }
+    }
+
+RELAY
+
+    for {
+        rows := poll(`WHERE published_at IS NULL`)   // 1. get next pending items
+        publish(rows)                                 // 2. publish them
+        markPublished(rows)                           // 3. record success  <-- NEW
+    }
+
+Same loop, same job, started in the same place. Two differences:
+
+  1. The pending list lives in Postgres instead of RAM.
+  2. THERE IS A THIRD STEP that records success.
+
+Step 3 is the entire fix, and here is why:
+
+    With a CHANNEL, popping IS the acknowledgment -- and it happens BEFORE the
+    publish. hank/db/change_events.go:177 pops the item; if the publish then
+    fails at :219, the item has already been acknowledged out of existence.
+
+    With a TABLE, reading is NOT acknowledgment. The UPDATE is, and it happens
+    AFTER a successful publish.
+
+    CHANNEL ACKNOWLEDGES ON READ.  TABLE ACKNOWLEDGES ON SUCCESS.
+
+That one sentence is the difference between at-most-once and at-least-once.
+
+
+5.2 THE CODE
+
+    func (r *relay) run(ctx context.Context) {
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-ticker.C:
+                for r.drainOnce(ctx) {
+                    // keep draining while batches come back full
+                }
+            }
+        }
+    }
+
+    func (r *relay) drainOnce(ctx context.Context) bool {
+        tx := r.db.Begin()                        // the RELAY's own transaction
+        var rows []ChangeEventOutbox
+        tx.Raw(`SELECT * FROM change_event_outbox
+                WHERE published_at IS NULL
+                ORDER BY created_at
+                LIMIT 100
+                FOR UPDATE SKIP LOCKED`).Scan(&rows)
+
+        var done []string
+        for _, row := range rows {
+            if err := r.sns.Publish(ctx, row.Payload, r.topicARN, row.Attrs); err != nil {
+                break                  // stop the batch; unmarked rows retry next tick
+            }
+            done = append(done, row.ID)
+        }
+
+        if len(done) > 0 {
+            tx.Exec(`UPDATE change_event_outbox
+                     SET published_at = now()
+                     WHERE id IN (?)`, done)
+        }
+        tx.Commit()
+        return len(rows) == 100
+    }
+
+Three pieces worth understanding individually:
+
+  WHERE published_at IS NULL
+      This is the definition of "still owed". It is the whole state machine.
+      Nothing else needs to track pending work.
+
+  FOR UPDATE SKIP LOCKED
+      Row-level locks, with "skip anything already locked". This is what lets
+      you run 3 forebitt pods, each with a relay, and have them cooperate with
+      NO leader election and NO coordination: pod A locks rows 1-100, pod B's
+      query SKIPS those and takes 101-200. Without SKIP LOCKED, pod B would
+      block waiting for pod A. Postgres-specific; that is fine, forebitt is on
+      Postgres.
+
+  Publish, THEN update -- in that order, never inverted
+      publish -> mark : crash in between = DUPLICATE = at-least-once  [WANTED]
+      mark -> publish : crash in between = LOSS      = at-most-once   [WRONG]
+      Duplicates are already handled -- XMI dedupes on the CloudEvents id
+      generated at hank/db/change_events.go:307, per the SUMMARY.md in
+      2026-08-17-aditya-understanding-hank-change-events/.
+
+
+5.3 HOW IT IS STARTED -- exact location today
+
+The publisher goroutine is started in hank/db/service.go:73-84, inside
+hdb.New (hank/db/service.go:31):
+
+    if ceCfg := ChangeEventConfigFromEnv(); ceCfg.Enabled && ceCfg.TopicARN != "" {
+        if p, err := newPublisher(ceCfg); err != nil {
+            logrus.Errorf("change events disabled: %v", err)
+        } else {
+            go p.run()                                   // <-- line 78
+            database.InstantSet(changeEventsKey, p)       // <-- line 81
+            logrus.Infof("change events enabled: ...")
+        }
+    }
+
+So today, at line 78, one goroutine is already spawned per service process to
+drain the channel and publish to SNS.
+
+The relay replaces exactly that line:
+
+        go p.run()          becomes          go r.run(ctx)
+
+Everything else in that block stays: same opt-in via HANK_CHANGE_EVENTS_*
+environment variables (hank/db/change_events.go:47-57), same
+"failure here is never fatal" behaviour, same InstantSet at :81 so the audit
+hooks can reach it via scope.DB().Get(changeEventsKey) at
+hank/db/change_events.go:237.
+
+Note what this means operationally: the relay is NOT a new deployment, NOT a
+sidecar, NOT a cron job, and NOT a new service. It is a goroutine inside each
+service process that already exists, started at the same line that already
+starts one. Every service picks it up by upgrading hank and running one
+migration.
+
+
+=============================================================================
+Q6. What happens when SNS is DOWN, under the outbox approach?
+=============================================================================
+
+6.1 SHORT ANSWER
+
+Writes are completely unaffected. Rows pile up with published_at = NULL. The
+relay retries on every tick and keeps failing. When SNS returns, the next poll
+drains the whole backlog oldest-first. ZERO EVENTS LOST, delivery delayed by
+the outage duration. No human action required at any point.
+
+6.2 WALL-CLOCK TRACE
+
+  10:00:00  Data connection committed (forebitt/db/job_v2.go:31)
+            -> 11 outbox rows durable, all published_at = NULL
+
+  10:00:03  relay tick. poll -> 11 rows
+            publish #1 OK, #2 OK, #3 OK, #4 OK
+            publish #5 -> SNS returns 503 -> break out of the loop
+            UPDATE ... WHERE id IN (4 ids)
+            -> 4 rows timestamped, 7 rows still NULL
+
+  10:00:08  relay tick. poll -> THE SAME 7 ROWS
+            (they still match published_at IS NULL, so the query returns them
+            again -- nothing had to "re-queue" them)
+            publish #1 -> 503 -> break
+            done is empty -> no UPDATE runs
+            -> still 7 NULL
+
+  10:00:13  relay tick. poll -> the same 7. Same outcome.
+
+  10:00:18  ... and so on, every 5 seconds, for as long as SNS is down.
+
+    Meanwhile: customers keep creating data connections. Every one commits
+    normally at forebitt/db/job_v2.go:31 and adds more NULL rows. Nothing
+    user-facing is broken, because the write path never touches SNS.
+    The backlog grows. That is the only symptom.
+
+  13:00:00  SNS recovers.
+            relay tick. poll -> the original 7 plus everything accumulated,
+            ORDER BY created_at so the oldest go first
+            publish OK for all -> UPDATE all
+            drainOnce returns true (batch was full) so it loops immediately
+            and keeps draining without waiting for the next tick
+
+  13:00:0x  backlog is zero. SELECT count(*) WHERE published_at IS NULL = 0
+
+WHAT RECOVERY REQUIRED FROM A HUMAN: nothing. No replay script, no
+dead-letter drain, no operator action, no code path that says "retry". The
+query kept returning the same rows because they kept matching the predicate,
+and they kept matching because the UPDATE never ran.
+
+6.3 THE SAME OUTAGE TODAY, FOR CONTRAST
+
+  10:00:03  hank/db/change_events.go:177  run() pops the event off p.buf
+            hank/db/change_events.go:219  p.sns.Publish -> 503
+            hank/db/change_events.go:224  Errorf logged
+                                          publishOne returns
+                                          qe goes out of scope, garbage collected
+
+            THE EVENT NOW EXISTS NOWHERE. The channel gave it away at :177 and
+            does not have it any more. Postgres never knew about it.
+
+  10:00:03+ every subsequent event: same fate. Three hours of change events
+            destroyed, one Errorf line each.
+
+  13:00:00  SNS recovers. Nothing happens, because there is nothing left to
+            publish. XMI never learns about three hours of data connections.
+
+  RECOVERY: impossible from the application. You would have to reconstruct
+  which rows changed during the window from updated_at columns and hand-craft
+  the events.
+
+The difference in one sentence: TODAY THE FAILURE DESTROYS THE EVIDENCE; WITH
+THE OUTBOX THE EVIDENCE IS A COMMITTED ROW AND FAILURE JUST LEAVES IT ALONE.
+
+6.4 THREE THINGS TO GET RIGHT FOR A LONG OUTAGE
+
+  (a) BACKOFF. The loop above hammers SNS every 5 seconds for 3 hours. Add
+      exponential backoff on consecutive failures (5s -> 10s -> 30s -> 60s cap)
+      and reset on first success. Otherwise you generate a lot of pointless
+      traffic and log noise during exactly the incident someone is already
+      looking at.
+
+  (b) HEAD-OF-LINE BLOCKING -- the important one. Because of
+      ORDER BY created_at plus break-on-error, ONE permanently poisoned row
+      blocks every row behind it FOREVER. The realistic cause is a payload over
+      SNS's 256KB message limit: it will never succeed, so the relay retries it
+      every tick and never gets past it. The backlog grows without bound and
+      looks exactly like an SNS outage.
+      Fix: add an attempts int column. Increment on failure. After N attempts
+      (say 10), set a failed_at / last_error and let the poll skip it
+      (WHERE published_at IS NULL AND attempts < 10). Alert on rows with
+      attempts >= 10. This converts an invisible total stall into a visible,
+      bounded, per-row failure.
+
+  (c) BACKLOG ALERTING. The whole point is that loss became a visible backlog,
+      so actually watch it:
+          SELECT count(*) FROM change_event_outbox WHERE published_at IS NULL;
+          SELECT now() - min(created_at) FROM change_event_outbox
+            WHERE published_at IS NULL;      -- age of oldest unpublished
+      The second one is the better alert -- count spikes on a burst, age only
+      grows when delivery is genuinely stuck.
+
+
+=============================================================================
+Q7. So the publish line never executes, and therefore markPublished never runs?
+=============================================================================
+
+Almost -- one precision, and it matters.
+
+The publish line DOES execute. r.sns.Publish is called, does its network
+attempt, and RETURNS AN ERROR. The relay has no way of knowing in advance that
+SNS is down; it finds out by trying, every single tick.
+
+What does not run is step 3, the marking:
+
+    for _, row := range rows {
+        if err := r.sns.Publish(...); err != nil {
+            break              // <-- publish RAN and FAILED; loop exits here
+        }
+        done = append(done, row.ID)     // <-- skipped for this row
+    }
+    if len(done) > 0 {                  // <-- false when the first row fails
+        tx.Exec(`UPDATE ... SET published_at = now() ...`)   // <-- never runs
+    }
+
+So: step 2 runs and fails; step 3 is skipped; the row keeps published_at = NULL
+and is therefore selected again by the very next poll.
+
+Your conclusion is exactly right -- "markPublished doesn't go through, so the
+row stays NULL, so it gets picked up again." That IS the retry mechanism. There
+is no retry code anywhere. The retry is a consequence of the row still matching
+WHERE published_at IS NULL.
+
+
+=============================================================================
+Q8. Does the relay create more load on the pod, or is it light?
+=============================================================================
+
+8.1 LIGHT -- and lighter than it looks, because most of it already exists
+
+Compared to TODAY, the relay is not net-new machinery:
+
+  - the goroutine already exists       (go p.run(), hank/db/service.go:78)
+  - the SNS calls already happen        (hank/db/change_events.go:219)
+  - the CloudEvent is already built     (hank/db/change_events.go:288)
+
+You are not adding a goroutine or adding SNS traffic. You are changing WHERE
+the goroutine reads its work from: a channel becomes a table.
+
+8.2 WHAT IS ACTUALLY ADDED
+
+  ADDED COST                                     WEIGHT
+  ---------------------------------------------  ------------------------------
+  1 poll query per tick (default 5s)             Negligible WITH the partial
+                                                 index -- an empty backlog means
+                                                 an empty index, so this is a
+                                                 sub-millisecond index scan
+                                                 returning 0 rows. 12 queries
+                                                 per minute per pod.
+  1 UPDATE per drained batch                     One statement per 100 rows.
+                                                 Cheap.
+  2 inserts per audited write instead of 1       THE REAL COST -- and note this
+                                                 is the HOOK, not the relay. It
+                                                 is on the request path. For the
+                                                 data connection example, 11
+                                                 business rows becomes 22 rows.
+  1 pooled connection held during a drain        See 8.4 -- the one genuine
+                                                 operational risk.
+
+8.3 SIZING IT
+
+At 1000 audited writes/hour that is ~0.3 outbox rows/second. One relay draining
+100 rows every 5 seconds handles 20/second. Roughly two orders of magnitude of
+headroom, so in steady state the relay spends nearly all its time running one
+query that returns zero rows and going back to sleep.
+
+8.4 WHAT MAKES IT HEAVY IF YOU GET IT WRONG
+
+  (a) NO PARTIAL INDEX. This is the number one way to make it expensive.
+      Without
+          CREATE INDEX ... ON change_event_outbox (created_at)
+            WHERE published_at IS NULL;
+      the poll scans an ever-growing table every 5 seconds. With it, the index
+      only ever contains the unpublished rows -- usually zero.
+
+  (b) NO REAPER. Published rows accumulate forever. Even with the partial index
+      keeping the poll fast, disk, autovacuum and backups all suffer. Delete
+      published rows older than N days on a schedule.
+
+  (c) HOLDING THE TRANSACTION OPEN ACROSS THE SNS CALLS. This is the
+      non-obvious one and it is connection-pool pressure, not CPU. FOR UPDATE
+      requires the relay's transaction to stay open while it publishes the
+      whole batch. At 100 rows x 50ms per publish, that is 5 seconds holding
+      one pooled connection and 100 row locks. Mitigations: smaller batch (25),
+      or use SNS PublishBatch (10 messages per call), or both. Worth deciding
+      deliberately rather than discovering under load.
+
+  (d) TOO AGGRESSIVE A POLL INTERVAL. 100ms x N pods x M services is a lot of
+      pointless queries. 5 seconds is generous given XMI is coming off polling
+      on a much longer cycle.
+
+8.5 IF THE POLLING ITSELF BOTHERS YOU
+
+Postgres LISTEN/NOTIFY: the hook issues NOTIFY after the insert, and the relay
+wakes immediately instead of waiting for the tick. Two nice properties -- NOTIFY
+fires on COMMIT (exactly the semantics you want), and it is best-effort, so a
+missed notification costs nothing because the timer poll is still there as the
+backstop.
+
+It buys latency, not correctness, and adds a listening connection per pod plus
+another failure mode to reason about. Not worth it for a consumer that is
+currently polling on a much slower cycle. Keep the timer; revisit only if
+someone asks for sub-second event latency.
+
+
+=============================================================================
+SUMMARY -- the four sentences that carry the whole design
+=============================================================================
+1. The audit hook writes the event as a ROW ON THE SAME TRANSACTION as the
+   business change, so COMMIT decides both together and ROLLBACK destroys both.
+2. published_at IS NULL means "still owed"; it is the entire state machine, and
+   nothing in the request path ever changes it.
+3. A background loop -- the same goroutine that exists today at
+   hank/db/service.go:78 -- polls for owed rows, publishes, and only then marks
+   them; the channel acknowledged on READ, the table acknowledges on SUCCESS.
+4. Therefore a failed publish is no longer terminal: it leaves a committed row
+   untouched, the next poll finds it again, and delivery is merely delayed
+   instead of lost.

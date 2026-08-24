@@ -1,0 +1,457 @@
+=============================================================================
+HOW A TRANSACTIONAL OUTBOX FIXES THE HANK CHANGE-EVENT DELIVERY GAPS
+Traced step by step through one real operation: creating a data connection
+=============================================================================
+Date: 2026-08-21
+Author: Aditya Bhardwaj (analysis session)
+Repo root: /Users/adbhar/Documents/project-sprint-understanding-1/
+
+The question this answers
+-------------------------
+"If publishChangeEvent is still there, why won't the message still fail to be
+sent? And when it reaches the queue, does the queue wait until it sees the
+state in the outbox?"
+
+Short answer to the second half first, because it is a misconception worth
+killing early: NO. SNS and SQS never read the outbox table. They have no
+knowledge that it exists. The flow is strictly one-way --
+
+    relay reads outbox row  ->  relay publishes to SNS  ->  relay marks row
+
+Nothing on the AWS side ever waits, checks, or coordinates. All of the
+guarantee lives on OUR side of that arrow.
+
+Short answer to the first half: you are correct that a publish call still
+exists and can still fail. What changes is not whether publish fails. What
+changes is WHAT HAPPENS TO THE KNOWLEDGE THAT A PUBLISH IS OWED when it does.
+Section 4 is the whole answer; everything before it is the setup needed to
+make section 4 checkable.
+
+
+=============================================================================
+1. THE CONCRETE CASE
+=============================================================================
+Operation:  create a data connection
+Service:    forebitt
+Entry:      forebitt/api/server/job_service.go:1396  CreateDataConnection
+              -> forebitt/api/server/job_service.go:1293  CreateImportJobV2
+              -> forebitt/api/server/job_service.go:1082  CreateImportJob
+              -> forebitt/db/job_v2.go:13               InsertJobV2
+
+InsertJobV2 is where the transaction lives, and it is the right example
+because it writes MORE THAN ONE ROW inside one transaction. That is what
+creates the window:
+
+    forebitt/db/job_v2.go:19   tx := hdb.BeginTxDB(ctx, db, &sql.TxOptions{})
+    forebitt/db/job_v2.go:20   err := tx.Create(&job).Error
+    forebitt/db/job_v2.go:22       tx.Rollback()   <-- failure path
+    forebitt/db/job_v2.go:25   SetOrganizationJobParametersInTransaction(tx, ...)
+    forebitt/db/job_v2.go:28       tx.Rollback()   <-- failure path
+    forebitt/db/job_v2.go:31   err = tx.Commit().Error
+
+One DataImportJob row plus N OrganizationJobParameter rows. The 2026-08-15
+consumer run in the sibling folder captured exactly this shape: 23 events, of
+which 10 were ORGANIZATIONJOBPARAMETER child rows from a single create.
+
+For the walkthrough below assume 1 job + 10 parameters = 11 change events from
+one user action.
+
+
+=============================================================================
+2. BEFORE -- what happens today, step by step
+=============================================================================
+
+ STEP  WHERE                                   WHAT HAPPENS
+ ----  --------------------------------------  --------------------------------
+ B1    forebitt/db/job_v2.go:19                BEGIN. Postgres transaction open.
+ B2    forebitt/db/job_v2.go:20                INSERT data_import_jobs row.
+                                               UNCOMMITTED.
+ B3    gorm callback_create.go:17              gorm runs "gorm:after_create".
+                                               Registered immediately BEFORE
+                                               "gorm:commit_or_rollback_transaction"
+                                               (callback_create.go:18), so this
+                                               executes INSIDE the transaction.
+ B4    hank/db/audit.go:150-167                Audit.AfterCreate fires.
+                                               claims() gate at :152 passes.
+                                               Audit log line written at :161.
+                                               :165 calls publishChangeEvent.
+ B5    hank/db/change_events.go:288            toCloudEvent builds the envelope.
+       hank/db/change_events.go:307            CloudEvents id = uuid.New().
+ B6    hank/db/change_events.go:279            select { case p.buf <- ... }
+                                               *** THE HANDOFF ***
+                                               The event is now in a Go channel:
+                                               in-process RAM, capacity 1024
+                                               (defaultBufferSize, :62).
+                                               It has LEFT the transaction's
+                                               control. Postgres knows nothing
+                                               about it and never will.
+ B7    hank/db/change_events.go:177-182        A SEPARATE goroutine, run(),
+                                               ranges over p.buf and pops it.
+                                               Timing is the Go scheduler's
+                                               choice. Usually microseconds.
+                                               Frequently BEFORE step B10.
+ B8    hank/db/change_events.go:191-227        publishOne. The popped event now
+                                               exists only as local variable qe.
+ B9    hank/db/change_events.go:219            p.sns.Publish(...) -- network call
+                                               to AWS. Event is on the topic.
+ B10   forebitt/db/job_v2.go:25                Back in forebitt: the 10 parameter
+                                               inserts. Steps B3-B9 repeat for
+                                               each one. Still uncommitted.
+ B11   forebitt/db/job_v2.go:31                tx.Commit()
+       -- or --
+       forebitt/db/job_v2.go:22 or :28         tx.Rollback()
+
+The defect is structural and visible in the numbering: B9 (event is on the SNS
+topic, irrevocably) happens BEFORE B11 (the database decides whether any of
+this is real). Two independent commit decisions -- the channel handoff at B6
+and the Postgres COMMIT at B11 -- with nothing coordinating them.
+
+
+2.1 THE FOUR FAILURE MODES, INJECTED INTO THE BEFORE PATH
+---------------------------------------------------------
+
+F1 -- ROLLBACK AFTER PUBLISH
+  Inject at B11: parameter insert fails, tx.Rollback() at forebitt/db/job_v2.go:28.
+  State afterwards: 11 CloudEvents are on the SNS topic. Zero rows in Postgres.
+  Who recovers: nobody, but it is harmless by CONTRACT -- XMI is required to GET
+  the resource by objectId, gets not-found, treats it as a no-op.
+  This is the one failure the current design deliberately accepts, and it is
+  documented at hank/db/change_events.go:42-45.
+
+F2 -- SNS OUTAGE  ("queue outage")
+  Inject at B9: p.sns.Publish returns an error.
+  hank/db/change_events.go:224-227 logs it with Errorf and returns.
+  State afterwards: publishOne returns, qe goes out of scope, garbage collected.
+  The channel already popped it at B7. THE EVENT NOW EXISTS NOWHERE.
+  Meanwhile B11 commits successfully -- the data connection is real and visible
+  in the product.
+  Who recovers: NOBODY. There is no retry, because there is nothing left to
+  retry from. XMI will never learn this data connection exists. The only trace
+  is an Errorf line in forebitt's logs.
+
+F3 -- BUFFER FULL  ("queue full")
+  Inject at B6: 1024 events already queued and the drain goroutine has not kept
+  up. The select falls to default at hank/db/change_events.go:282-284, logs
+  "change event dropped: buffer full", and returns.
+  State afterwards: identical to F2 -- committed row, no event, nobody knows.
+  Who recovers: NOBODY.
+
+F4 -- PROCESS DEATH
+  Inject between B6 and B9: pod receives SIGKILL.
+  Close() at hank/db/change_events.go:186-190 drains the buffer on GRACEFUL
+  shutdown only; SIGKILL does not run it.
+  State afterwards: everything in p.buf was RAM. Gone. If B11 already committed,
+  committed rows with no events.
+  Who recovers: NOBODY.
+
+F2, F3 and F4 are ONE class: committed-but-never-delivered. None has any
+mitigation. This is the at-least-once violation.
+
+
+=============================================================================
+3. AFTER -- the same operation with change_event_outbox
+=============================================================================
+
+Steps A1 through A5 are IDENTICAL to B1 through B5. Same handler, same
+transaction, same gorm callback, same audit hook, same CloudEvent construction,
+same uuid. The change is ONE substituted line at step 6.
+
+ STEP  WHERE                                   WHAT HAPPENS
+ ----  --------------------------------------  --------------------------------
+ A1    forebitt/db/job_v2.go:19                BEGIN.                [IDENTICAL]
+ A2    forebitt/db/job_v2.go:20                INSERT data_import_jobs.
+                                                                     [IDENTICAL]
+ A3    gorm callback_create.go:17              gorm:after_create.    [IDENTICAL]
+ A4    hank/db/audit.go:150-167                AfterCreate -> :165
+                                               publishChangeEvent.   [IDENTICAL]
+ A5    hank/db/change_events.go:288,:307       CloudEvent + uuid.    [IDENTICAL]
+ A6    hank/db/change_events.go:279            *** THE ONE CHANGE ***
+                                               was:  p.buf <- queuedEvent{...}
+                                               now:  scope.DB().Create(
+                                                        &ChangeEventOutbox{...})
+                                               INSERT into change_event_outbox,
+                                               published_at = NULL,
+                                               ON THE SAME tx, UNCOMMITTED.
+ A7    --                                      NOTHING ELSE HAPPENS. No
+                                               goroutine, no channel, no network
+                                               call. The event is now just a row.
+ A8    forebitt/db/job_v2.go:25                The 10 parameter inserts. A3-A6
+                                               repeat -> 10 more outbox rows on
+                                               the same tx.
+ A9    forebitt/db/job_v2.go:31                tx.Commit() -- 1 job row + 10
+                                               param rows + 11 outbox rows all
+                                               become durable together.
+       -- or --
+       forebitt/db/job_v2.go:22 or :28         tx.Rollback() -- all 22 rows
+                                               disappear together.
+
+  ................. transaction is over; time passes .................
+
+ A10   forebitt relay (own goroutine/process)  Polls forebitt's OWN database:
+                                                 SELECT * FROM change_event_outbox
+                                                 WHERE published_at IS NULL
+                                                 ORDER BY created_at
+                                                 LIMIT 100
+                                                 FOR UPDATE SKIP LOCKED;
+ A11   relay                                   p.sns.Publish(...) per row. Same
+                                               SNS call as B9, same topic, same
+                                               message attributes.
+ A12   relay                                   UPDATE change_event_outbox
+                                               SET published_at = now()
+                                               WHERE id = ...;
+                                               ONLY after A11 succeeded.
+
+Why A6 works: scope.DB() IS the active transaction handle. Verified --
+gorm:begin_transaction calls scope.Begin() (gorm scope.go:403-411), which only
+opens a transaction when SQLDB() is a *sql.DB. Inside hdb.BeginTxDB the handle
+is already a *sql.Tx, the type assertion fails, no nested transaction starts,
+and CommitOrRollback (gorm callback_save.go:12-14) no-ops because
+"gorm:started_transaction" was never set. So the audit hook always runs inside
+whatever transaction is active, and the outbox row joins it.
+
+Note the inversion: "the hook fires before COMMIT" is the BUG in the before
+path and the REQUIREMENT in the after path. Same fact, opposite sign.
+
+
+3.1 WHICH TABLE, WHICH SERVICE, WHICH DATABASE
+-----------------------------------------------
+Table name:     change_event_outbox
+Owned by:       each service, in ITS OWN database
+                forebitt      -> change_event_outbox in forebitt's DB
+                unhygienix    -> change_event_outbox in unhygienix's DB
+                picanmix      -> change_event_outbox in picanmix's DB
+Written at:     step A6, by hank's audit hook, inside the caller's transaction
+Read at:        step A10, by that service's relay
+Shipped by:     hank -- the model, the migration, the modified
+                publishChangeEvent, and the relay are all library code.
+                Each service picks them up by upgrading hank and running the
+                migration. No per-service logic.
+
+WHY IT MUST BE PER-SERVICE, IN THE SAME DATABASE:
+A single COMMIT can only cover rows in one database. If the outbox lived in a
+shared central events database, writing the business row and writing the event
+row would again be two independent commits -- exactly the problem being solved,
+just moved. The outbox has to sit next to the data it describes.
+
+Suggested columns:
+    id           uuid PK   -- IS the CloudEvents id from change_events.go:307,
+                              so it is also the consumer's dedupe key
+    payload      jsonb     -- the CloudEvent envelope
+    attributes   jsonb     -- eventType / objectType / action / orgId, needed
+                              because SNS filter policies match on attributes
+    request_id   text      -- feeds MessageGroupId; see section 6
+    created_at   timestamptz
+    published_at timestamptz NULL   -- NULL means "still owed"
+
+    CREATE INDEX ... ON change_event_outbox (created_at)
+      WHERE published_at IS NULL;    -- partial index stays small
+
+Recursion guard: the ChangeEventOutbox model MUST NOT embed hdb.Audit. If it
+did, inserting an outbox row would fire AfterCreate -> publishChangeEvent ->
+insert another outbox row, forever. gorm v1 dispatches hooks via
+scope.CallMethod("AfterCreate"); a model without the embed has no such method
+and the chain stops. Worth an explicit comment on the struct, because adding
+Audit "for consistency" is exactly the kind of change someone makes later.
+
+
+=============================================================================
+4. THE ACTUAL ANSWER: WHY A STILL-FAILING PUBLISH STOPS LOSING DATA
+=============================================================================
+
+The publish call is the same call. It fails just as often. Here is the
+difference, and it is entirely about where the OBLIGATION to publish is stored.
+
+BEFORE -- the obligation lives in RAM and is consumed by the attempt:
+
+    B7   run() pops the event off the channel.
+         Now the only copy is a local variable, qe.
+    B9   p.sns.Publish fails.
+    B9   hank/db/change_events.go:224-227 logs it.
+         publishOne returns. qe goes out of scope. Garbage collected.
+
+    The channel already gave the event away at B7 and does not have it any
+    more. Nothing in Postgres, nothing on disk, nothing anywhere records that
+    this event was ever owed. There is no retry because THERE IS NOTHING LEFT
+    TO RETRY FROM. The attempt destroyed the obligation.
+
+AFTER -- the obligation is a committed row and survives the attempt:
+
+    A9    COMMIT makes the row durable with published_at = NULL.
+    A11   p.sns.Publish fails.
+    A12   DOES NOT RUN. The row is untouched.
+    A10   next poll, 5 seconds later, runs
+              WHERE published_at IS NULL
+          which still matches this row. It is selected again.
+    A11   tried again. Fails again. Row still untouched.
+          ... repeat until SNS answers.
+
+    The retry is not a feature anyone implemented. It is a consequence of the
+    query. The relay asks "what is still unpublished" and the answer keeps
+    including this row until the publish actually succeeds.
+
+    SO: publish failing stops being TERMINAL. It becomes merely SLOW.
+
+That is the whole mechanism. Everything else is bookkeeping.
+
+The ordering at A11/A12 is the other half and must not be inverted:
+    publish, THEN mark       -> crash in between = duplicate  = AT-LEAST-ONCE
+    mark, THEN publish       -> crash in between = loss       = at-most-once
+Duplicates are already handled: the sibling folder's SUMMARY.md documents three
+ID layers and specifies that XMI dedupes on the CloudEvents id (produced at
+hank/db/change_events.go:307), NOT on the SQS MessageId. The consumer contract
+needed for an outbox is therefore ALREADY IN PLACE. XMI changes nothing.
+
+
+=============================================================================
+5. THE FOUR FAILURE MODES REPLAYED AGAINST THE AFTER PATH
+=============================================================================
+
+F1 -- ROLLBACK AFTER PUBLISH
+  Inject at A9 as tx.Rollback().
+  The 11 outbox rows were written at A6/A8 on that same transaction, so they
+  roll back with the job and the parameters. All 22 rows vanish together.
+  The relay at A10 never sees them, because they never existed.
+  Result: NO event is emitted for a transaction that did not happen.
+  FIXED -- and note this is an upgrade from "mitigated by contract" to
+  "structurally impossible". The phantom-event class is eliminated, not merely
+  tolerated.
+
+F2 -- SNS OUTAGE  ("queue outage")   <-- the one you asked about
+  Inject at A11: p.sns.Publish returns an error, for three hours.
+  A12 never runs for any of those rows. Every row keeps published_at = NULL.
+  Writes continue normally the whole time -- customers create data connections,
+  transactions commit at A9, outbox rows accumulate. Nothing user-facing breaks,
+  because the publish is not on the request path.
+  When SNS recovers: the very next poll at A10 selects the backlog
+  ORDER BY created_at and drains it oldest-first.
+  Result: ZERO EVENTS LOST. Delivery is delayed by the outage duration.
+  Contrast BEFORE: three hours of events silently destroyed at B9, discoverable
+  only by grepping Errorf lines, and unrecoverable even once you find them.
+
+F3 -- BUFFER FULL  ("queue full")
+  This failure mode does not survive the redesign, because THE FIXED-SIZE
+  BUFFER IS GONE. There is no p.buf and no defaultBufferSize = 1024
+  (hank/db/change_events.go:62). The buffer is now a table, bounded by disk.
+  Inject the equivalent: a burst of 5000 events arriving faster than the relay
+  drains. Under BEFORE, events 1025+ hit the default case at
+  hank/db/change_events.go:282-284 and are silently dropped. Under AFTER, 5000
+  rows are inserted and the relay works through them over the next few polls.
+  Result: FIXED, but be precise about how -- the failure does not disappear, it
+  CHANGES INTO A VISIBLE ONE. If the relay genuinely cannot keep up long-term,
+  the table grows. That is a number you can query and alarm on:
+      SELECT count(*) FROM change_event_outbox WHERE published_at IS NULL;
+  Backpressure becomes an observable backlog instead of unobservable data loss.
+  Trading a silent failure for a loud one is the actual win here.
+
+F4 -- PROCESS DEATH
+  Inject between A9 and A10: pod SIGKILLed right after COMMIT.
+  The outbox rows are committed to Postgres, on disk. Pod restarts, relay
+  starts, A10 finds them, publishes.
+  Result: FIXED.
+
+  Inject between A11 and A12: published to SNS, killed before marking.
+  Row still has published_at = NULL. Next poll republishes.
+  XMI receives the same CloudEvent id twice and dedupes it.
+  Result: a DUPLICATE, which is the defined and accepted behaviour of
+  at-least-once, not a defect.
+
+
+5.1 SUMMARY TABLE
+------------------
+  FAILURE                     BEFORE                      AFTER
+  --------------------------  --------------------------  ---------------------
+  Tx rolls back after publish  Phantom event; mitigated    Impossible; the event
+                               only by consumer contract   rolls back too
+  SNS/queue outage             Event destroyed, no retry,  Row retained, retried
+                               permanent silent loss       until success
+  Buffer / queue full          Silent drop at 1024         No fixed buffer;
+                                                           becomes a visible,
+                                                           alertable backlog
+  Pod killed with events       RAM contents lost           Rows on disk; relay
+                               permanently                 resumes after restart
+  Duplicate delivery           Rare                        Expected; XMI already
+                                                           dedupes on CloudEvents
+                                                           id
+
+
+=============================================================================
+6. WHAT DOES NOT CHANGE, AND WHAT THIS DOES NOT FIX
+=============================================================================
+
+UNCHANGED:
+  - The call site. hank/db/audit.go:165 (create), :201 (update), :220 (delete)
+    are untouched.
+  - The CloudEvent envelope, its id, its message attributes, the topic.
+  - The XMI consumer. Same payload, same dedupe key, same read-back contract.
+  - The object-type allow-list at hank/db/change_events.go:264-266.
+  - The empty-ObjectID skip at hank/db/change_events.go:270-276.
+
+NOT FIXED -- and this is the larger hole:
+  The claims gate. hank/db/audit.go:152 (and :93, :127, :171, :188, :207):
+
+        tokenClaims, ctx, parsed := claims(scope)
+        if !parsed {
+            return nil
+        }
+
+  This returns BEFORE publishChangeEvent is ever reached at :165. No outbox row
+  is written because the code never gets there. Any write that does not carry
+  parsed auth claims -- background workers, anything not going through
+  BeginDB/BeginTxDB -- emits nothing, atomically or otherwise.
+
+  Flow-run completion, the primary XMI use case, is one of those paths.
+
+  ORDERING CONSEQUENCE: the outbox is worthless on paths the gate already
+  silences. The gate fix is the PREREQUISITE, not the follow-up. Recommendation
+  #2 in 2026-08-17-aditya-understanding-hank-change-events/SUMMARY.md
+  (decouple emission from claims()) needs Anil's sign-off because it changes
+  audit-log behaviour too.
+
+
+=============================================================================
+7. COSTS AND GOTCHAS
+=============================================================================
+
+  1. FIFO ORDERING. Today MessageGroupId comes from the request id on the
+     context (hank/db/change_events.go:211-217). The outbox row needs a
+     request_id column and the relay must re-set the context the same way at
+     A11, or per-request ordering is lost. Additionally, ORDER BY created_at
+     with FOR UPDATE SKIP LOCKED gives NO global ordering across multiple relay
+     replicas -- each grabs a disjoint batch and they publish concurrently. If
+     per-group ordering matters, the group key must be the lock unit (single
+     relay, or partition by orgId).
+
+  2. WRITE AMPLIFICATION. Every audited write becomes two inserts. For the data
+     connection example: 11 business rows becomes 22 rows. This is the direct
+     price of the guarantee and it is on the hot path.
+
+  3. TABLE GROWTH. Needs a reaper deleting published rows older than N days,
+     plus the partial index in section 3.1. Without both, this becomes the
+     largest table in the database.
+
+  4. LATENCY. Channel handoff was instant; a poll adds up to the poll interval.
+     Irrelevant here -- XMI is replacing polling, so this is minutes to seconds.
+
+  5. RELAY DEPLOYMENT. Simplest is a goroutine in each service process, started
+     where the publisher is started today (hdb.New). FOR UPDATE SKIP LOCKED
+     makes N replicas safe with no coordination, no leader election.
+
+
+=============================================================================
+8. THE ONE-PARAGRAPH VERSION
+=============================================================================
+Today the audit hook hands the event to an in-memory Go channel
+(hank/db/change_events.go:279) before the transaction commits, and the SNS
+publish attempt CONSUMES that handoff -- when the publish fails at
+hank/db/change_events.go:224-227 the event exists nowhere and no retry is
+possible. Replacing that one line with an insert into a change_event_outbox
+table on the SAME transaction handle puts the obligation into Postgres, where
+COMMIT decides both the business row and the event together. A relay then reads
+"WHERE published_at IS NULL", publishes, and marks -- in that order. SNS being
+down no longer destroys anything; it just leaves rows unmarked, and the next
+poll picks them up again. Publish failing stops being terminal and becomes
+merely slow. The buffer-full drop disappears entirely because the buffer is now
+a table bounded by disk rather than 1024 slots, turning silent loss into an
+observable backlog. What it does NOT fix is the claims() gate at
+hank/db/audit.go:152, which returns before the emit is reached at all -- that
+one has to be fixed first or the outbox has nothing to store.

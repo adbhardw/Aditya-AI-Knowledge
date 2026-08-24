@@ -1,0 +1,299 @@
+=============================================================================
+TASK 3 DEEP DIVE -- CAN WE EMIT FLOW AND DATASET-ASSIGNMENT EVENTS TODAY?
+plus the sequencing plan for all three tasks
+=============================================================================
+Date: 2026-08-24
+Repo root: /Users/adbhar/Documents/project-sprint-understanding-1/
+
+HEADLINE: four of the five events XMI wants DO NOT FIRE TODAY, and not because
+of the claims() gate. They fail on a second, independent mechanism: the write
+sites pass an EMPTY STRUCT with the id in a WHERE clause, so AuditLog.ObjectID
+is empty and hank/db/change_events.go:270-276 skips the event with a Warn.
+
+This is not a testing task. It is a fix-the-write-sites task, and it must be
+scoped before it can be tested.
+
+=============================================================================
+1. THE FIVE EVENTS AND THEIR CURRENT STATUS
+=============================================================================
+
+  #  EVENT XMI WANTS               MODEL                     FIRES TODAY?
+  -  --------------------------    ------------------------  -----------------
+  1  Flow node fails               (no node-run model)       NO - no audited
+                                                             model exists
+  2  Flow completes                CleanRoomFlowRun          NO - empty-struct
+                                                             update
+  3  Flow deleted                  CleanRoomFlow / Flow      NO - empty-struct
+                                                             delete
+  4  Dataset assigned to question  CleanRoomQuestionDataSet  YES - but wrong
+                                                             objectType string
+  5  Dataset removed from question CleanRoomQuestionDataSet  NO - empty-struct
+                                                             delete
+
+Only #4 works, and it emits the wrong type name. Details below.
+
+=============================================================================
+2. THE MECHANISM THAT KILLS 2, 3 AND 5
+=============================================================================
+hank/db/change_events.go:270-276:
+
+    // An empty ObjectID means the caller passed an empty struct to
+    // Delete/Update, so the id lives only in the WHERE clause and the event
+    // would be unusable to a consumer. Drop it loudly rather than emitting an
+    // unresolvable id.
+    if a.ObjectID == "" {
+        hlog.LogEntryCtx(ctx).WithFields(...).Warn("change event skipped: empty ObjectID")
+        return
+    }
+
+The guard is correct -- an event with no objectId is useless to a consumer whose
+whole contract is "GET the resource by objectId". The problem is how many write
+sites trip it.
+
+This is a SECOND failure class, distinct from the claims() gate at
+hank/db/audit.go:152 documented in
+2026-08-17_method_find_silently_skipped_change_events.txt. A write can have
+perfectly good auth claims and still emit nothing because of the struct it
+passed to gorm.
+
+=============================================================================
+3. EVENT-BY-EVENT FINDINGS
+=============================================================================
+
+3.1 FLOW COMPLETION / FAILURE  (events #1 and #2)
+
+  ARCHITECTURE -- your hypothesis is CORRECT: unhygienix is the source of truth
+  and is where the event belongs. Verified:
+
+    pegleg/pegleg-server/src/main/java/com/habu/pegleg/flow/activity/HabuFlowActivities.java
+        the Temporal @ActivityInterface: triggerNode, triggerEdge,
+        triggerCompletion, markFlowPaused
+    pegleg/.../flow/activity/HabuFlowActivitiesImpl.java:22-25
+        holds an UnhygienixClient
+    HabuFlowActivitiesImpl.java:33
+        unhygienixClient.triggerNode(...)
+    HabuFlowActivitiesImpl.java:96
+        unhygienixClient.getActivityStatus(...) -- pegleg POLLS unhygienix in a
+        loop with heartbeats and retries
+
+  So pegleg orchestrates and polls; it does NOT own the status. Unhygienix owns
+  the row. Emit from unhygienix. Do NOT add emission to pegleg -- it would
+  duplicate events and put the event source on the orchestrator rather than the
+  system of record.
+
+  THE MODELS ARE FINE:
+    unhygienix/models/flows.go:171-177  CleanRoomFlowRun embeds hdb.Audit (:174)
+                                        and JobAudit (:173, gives JobStatus)
+    unhygienix/models/flows.go:60-64    CleanRoomFlow embeds hdb.Audit (:64)
+    unhygienix/models/flows.go:26-30    Flow embeds hdb.Audit (:30)
+    hank/db/change_events.go:323-324    already mapped:
+                                          CleanRoomFlow    -> FLOW
+                                          CleanRoomFlowRun -> FLOW_RUN
+
+  THE WRITE SITES ARE NOT:
+    unhygienix/db/flows.go:1816-1818
+        func UpdateCleanRoomFlowRunStatus(db *gorm.DB, cleanRoomFlowRunID, status string) error {
+            return db.Model(&models.CleanRoomFlowRun{}).
+                Scopes(IDScope(cleanRoomFlowRunID)).
+                Update("job_status", status).Error
+        }
+        Model(&models.CleanRoomFlowRun{}) is an EMPTY STRUCT. The id is only in
+        IDScope. ObjectID is empty -> event skipped.
+        THIS IS THE FUNCTION THAT MARKS A FLOW RUN COMPLETE OR FAILED.
+
+    Same pattern, same outcome:
+        unhygienix/db/flows.go:1821-1839  UpdateCleanRoomFlowRunStatusAndTimestamps
+        unhygienix/db/flows.go:1842-1844  UpdateCleanRoomFlowRunMessage
+        unhygienix/db/flows.go:1543-1548  UpdateCleanRoomFlowRunWorkflowID
+        unhygienix/db/flows.go:1550-1555  UpdateCleanRoomFlowRunWorkflowRunID
+        unhygienix/db/flows.go:1810-1814  (Updates(map[string]any{...}))
+        unhygienix/db/flows.go:453        tx.Model(&models.CleanRoomFlowRun{})...
+
+  NODE-LEVEL FAILURE (#1) IS A HARDER PROBLEM:
+    unhygienix/models/flows.go:255-261  FlowNode embeds ONLY TimeAudit. NO
+                                        hdb.Audit. It is also a structural
+                                        record (FlowID, NodeID, FlowVersion) --
+                                        it carries no run state at all.
+    There is no CleanRoomFlowNodeRun model. Node execution state is reached
+    through the node's clean room question run, and pegleg discovers it by
+    polling getActivityStatus rather than by reading a node-run row.
+
+    So "emit an event when a flow node fails" has no row to hang off today.
+    Options, in order of preference:
+      (a) Emit at the QUESTION RUN level. A flow node that is a question node
+          resolves to a CleanRoomQuestionRun; a failure there is the real event.
+          Confirm CleanRoomQuestionRun embeds hdb.Audit and check its write
+          sites for the same empty-struct pattern. Cheapest and truest to the
+          system of record.
+      (b) Emit FLOW_RUN with a failed status and a node identifier in the
+          payload. XMI then reads the flow run back and sees which node failed.
+          Fits the existing FLOW_RUN mapping; requires the payload to carry more
+          than objectId, which conflicts with the "no from/to, read back by id"
+          decision from 2026-07-30 (D1).
+      (c) Introduce a node-run model. Correct long term, far too big for this
+          work.
+    RECOMMEND (a), with (b) as the fallback if XMI needs flow-level granularity.
+    THIS NEEDS A DECISION FROM XMI ABOUT WHAT GRANULARITY THEY ACTUALLY CONSUME.
+
+3.2 FLOW DELETED  (event #3)
+
+    unhygienix/db/flows.go:413-427  DeleteCleanRoomFlow(ctx, db, crFlow)
+        :427   err := tx.Scopes(IDScope(crFlow.ID)).Delete(&models.CleanRoomFlow{}).Error
+
+    Note the irony: the function RECEIVES crFlow with a populated ID and then
+    throws it away by passing an empty struct to Delete. Same at :404 for
+    models.Flow{} inside DeleteFlow (:324).
+
+    This is the cheapest fix in the whole document -- pass the struct:
+        tx.Scopes(IDScope(crFlow.ID)).Delete(crFlow)
+    gorm still applies the scope; the difference is that the audit hook can now
+    read the primary key off the model. Verify against
+    hank/db/audit.go getObjectDetails (:250) before assuming.
+
+3.3 DATASET ASSIGNED TO A QUESTION  (event #4) -- the one that works
+
+    MODEL: unhygienix/models/cleanroom.go:485-500  CleanRoomQuestionDataSet
+           embeds hdb.Audit at :487. Carries CleanRoomQuestionID (:488),
+           DataSetID (:489), Status (:492), CleanRoomFlowRunID (:497).
+
+    WRITE: unhygienix/db/cleanroom_question_dataset_fields.go:68+
+           AssignCleanRoomQuestionDataset opens BeginTxDB at :73, then:
+             :80   scopes.Delete(&models.CleanRoomQuestionDataSet{})  <- clears
+                   the previously assigned dataset for that crq+macro.
+                   EMPTY STRUCT -> that un-assignment emits NOTHING.
+             then  tx.Create(crDataSet) -> real ID -> CREATE EVENT FIRES.
+
+    So an assignment emits a create event, but the implicit REPLACEMENT of the
+    previous dataset is invisible. XMI sees "dataset X assigned" and never sees
+    "dataset Y unassigned". For a reassignment they will end up believing both
+    are attached unless they re-read the full list -- which, to be fair, the
+    read-back-by-id contract makes them do anyway. Worth confirming with them.
+
+    NAMING TRAP -- must be fixed before XMI codes against it:
+      The Go type is CleanRoomQuestionDataSet, with a capital S in "Set".
+      It is NOT in businessObjectTypes (hank/db/change_events.go:321-326, which
+      only maps DataImportJob, CleanRoomFlow, CleanRoomFlowRun, Dataset), so it
+      falls through to screamingSnake() at :368.
+      screamingSnake inserts an underscore before an upper-case letter that
+      follows a lower-case one, so the S in "Set" starts a new word:
+
+          CleanRoomQuestionDataSet  ->  CLEAN_ROOM_QUESTION_DATA_SET
+
+      That is almost certainly not what XMI expects, and it will end up in
+      `type` and `subject` too
+      (com.liveramp.cleanroom.clean_room_question_data_set.created).
+      FIX: add an explicit entry to businessObjectTypes, e.g.
+          "CleanRoomQuestionDataSet": "QUESTION_DATASET",
+      This is exactly the case the comment at :353-363 anticipates.
+
+3.4 DATASET REMOVED FROM A QUESTION  (event #5)
+
+    Every removal path uses the empty-struct pattern:
+      unhygienix/db/cleanroom_question_dataset_fields.go:65
+          DeleteCleanRoomQuestionDatasetsByFlowRunID
+          db.Scopes(CleanRoomFlowRunIDScopeExact(flowRunID)).Delete(&models.CleanRoomQuestionDataSet{})
+      unhygienix/db/cleanroom_question_dataset_fields.go:80
+          the implicit un-assign inside AssignCleanRoomQuestionDataset
+      unhygienix/db/cleanroom_question.go:84
+          Delete(models.CleanRoomQuestionDataSet{})
+      unhygienix/db/cleanroom.go:2095-2097
+          DeleteCleanRoomQuestionDatasetInTransaction
+          tx.Scopes(CleanRoomQuestionIDScope(...)).Delete(&models.CleanRoomQuestionDataSet{})
+
+    HARDER THAN 3.2, because these are BULK deletes scoped by question id or
+    flow run id, not by primary key. There is no single object id to put in the
+    event -- one call can remove N rows. Passing a struct does not help.
+    Options:
+      (a) SELECT the affected rows first, then delete, and emit one event per
+          row. Correct, N+1 shaped, and needs the emission to happen in the
+          service layer rather than the hook.
+      (b) Emit a single event on the PARENT (the clean room question) saying
+          "its dataset set changed", and let XMI re-read the question's
+          datasets. Fits the read-back contract and is one event instead of N.
+      (c) gorm v1 cannot give you the deleted rows from a scoped delete without
+          a prior SELECT, so there is no free option.
+    RECOMMEND (b) -- it matches the read-back-by-id contract already agreed with
+    XMI on 2026-07-30, and it keeps the emission in the hook.
+    NEEDS AN XMI DECISION: is a "question datasets changed" event enough, or do
+    they need per-dataset removal events?
+
+=============================================================================
+4. HOW TO TEST, ONCE THE ABOVE IS FIXED
+=============================================================================
+Reuse the existing harness rather than inventing one:
+  2026-08-17_publish15_harness.sh in this folder, plus the localstack SNS setup
+  documented in
+  2026-08-20-aditya-understanding-forebitt-events-sns-config-wiring/2026-08-20_env_audit_localstack_findings.txt
+
+  4.1 DATASET ASSIGNMENT -- easiest, do this first
+      Pure unhygienix API, no Temporal, no pegleg. Assign a dataset to a
+      question, watch for one CLEAN_ROOM_QUESTION_DATA_SET (or QUESTION_DATASET
+      after the mapping fix) created event. Then reassign and confirm whether
+      you see the un-assign. Then remove and confirm the event appears at all.
+      This exercises 3.3 and 3.4 with no orchestration in the loop.
+
+  4.2 FLOW LIFECYCLE -- needs Temporal running
+      Submit a flow, let it complete, watch for FLOW_RUN updated with a terminal
+      job_status. Then force a node failure. The cheapest way to force one is a
+      question that fails validation rather than trying to kill a worker
+      mid-run.
+      IMPORTANT: before spending time on the Temporal setup, apply the 3.1 fixes
+      -- otherwise every one of these produces
+      "change event skipped: empty ObjectID" and you will be debugging the
+      harness instead of the feature.
+
+  4.3 THE GENERIC DETECTION METHOD -- worth running once across unhygienix
+      The grep pattern from 2026-08-17_method_find_silently_skipped_change_events.txt
+      finds claims()-gated skips. Add a second sweep for THIS class:
+
+        grep -rn "Delete(&models\.\|Delete(models\.\|Model(&models\." unhygienix/db/ \
+          | grep -v "_test.go"
+
+      Any hit where the struct literal is EMPTY and the id comes from a Scope is
+      a silently-skipped event. That is the full inventory, and it is worth
+      producing before deciding how much of this to fix.
+
+=============================================================================
+5. SEQUENCING PLAN FOR ALL THREE TASKS
+=============================================================================
+
+BRANCH 1 -- DV-observability/change-events-publisher  (in flight)
+  Merge as-is. Do NOT add the relay or the flow/dataset fixes to it.
+  Two housekeeping items first:
+    - it is 6 commits behind origin/release_1x and 5 ahead
+      (merge-base 6103a64). Rebase before merging.
+    - the PR targets release_1x, which is the only branch
+      .github/workflows/go-build.yml builds.
+  Verify in stage with the existing 15-event harness.
+
+BRANCH 2 -- relay / transactional outbox
+  Cut from release_1x AFTER branch 1 merges. Full spec in
+  aditya_hank_relay_changes/2026-08-24_relay_implementation_spec.txt.
+  Independent of branch 3 -- it changes HOW events are delivered, not WHICH
+  events exist. The two can proceed in parallel once branch 1 is in.
+
+BRANCH 3 -- flow and dataset event coverage (this document)
+  Cut from release_1x AFTER branch 1 merges.
+  Mostly UNHYGIENIX changes, not hank -- with one hank change: the
+  businessObjectTypes entry from 3.3.
+  Ordered by cost:
+    1. hank: add "CleanRoomQuestionDataSet" -> "QUESTION_DATASET" mapping
+       (one line, but it is a WIRE CONTRACT change -- agree the string with XMI
+       before merging, because changing it later breaks their filters)
+    2. unhygienix: pass the struct instead of an empty literal in
+       DeleteCleanRoomFlow (:427) and DeleteFlow (:404)
+    3. unhygienix: fix UpdateCleanRoomFlowRunStatus (:1816) and siblings so the
+       flow-run terminal status emits
+    4. decide 3.1 node-granularity and 3.4 bulk-delete shape WITH XMI
+    5. implement whichever they choose
+
+  WHY 3 IS SEPARATE FROM 2: branch 2 makes delivery reliable for events that
+  exist; branch 3 makes the events exist. Neither depends on the other, and
+  merging them into one PR would make the review much harder.
+
+WHAT TO RAISE WITH XMI BEFORE STARTING BRANCH 3 -- three questions:
+  Q1. Node-level failure or flow-run-level failure? (3.1)
+  Q2. Per-dataset removal events, or one "question datasets changed" event? (3.4)
+  Q3. Confirm the object type string for the question-dataset link. (3.3)
+Without these three answers branch 3 cannot be scoped, so ask them now, in
+parallel with branch 1 merging.

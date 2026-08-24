@@ -1,0 +1,525 @@
+=============================================================================
+HANK CHANGE-EVENT RELAY -- IMPLEMENTATION SPEC (branch 2)
+Transactional outbox to replace the in-memory channel
+=============================================================================
+Date: 2026-08-24
+Repo root: /Users/adbhar/Documents/project-sprint-understanding-1/
+Branch plan: cut from release_1x AFTER DV-observability/change-events-publisher
+             has merged and been verified in stage.
+
+Background reading, both in
+2026-08-20-aditya-understanding-forebitt-events-sns-config-wiring/ :
+  - 2026-08-21_change_events_outbox_step_trace.txt      (before/after trace)
+  - 2026-08-21_outbox_relay_and_go_transactions_qa.txt  (Q&A, relay mechanics)
+
+=============================================================================
+0. WHAT PROBLEM THIS SOLVES (one paragraph)
+=============================================================================
+Today the audit hook hands the event to an in-memory Go channel at
+hank/db/change_events.go:279, BEFORE the transaction commits. Four consequences:
+an event can be published for a transaction that later rolls back; a failed SNS
+publish at hank/db/change_events.go:224-227 destroys the event with no retry; a
+full buffer silently drops at :282-284; and a SIGKILL loses everything in p.buf.
+Writing the event as a ROW ON THE SAME TRANSACTION makes COMMIT the single
+decision point for both the business row and the event, and a background relay
+then delivers it with at-least-once semantics.
+
+=============================================================================
+1. SCOPE -- what changes where
+=============================================================================
+
+  REPO / SERVICE      CHANGE                                        SIZE
+  ------------------  --------------------------------------------  --------
+  hank                new model, new relay, one line swapped in      ~250 LOC
+                      change_events.go, one line in service.go
+  forebitt            migration to create change_event_outbox        1 migration
+                      + hank version bump
+  unhygienix          same migration + hank version bump             1 migration
+  picanmix            same migration + hank version bump             1 migration
+  (any other hank
+   consumer with
+   HANK_CHANGE_EVENTS
+   _ENABLED=true)     same migration + hank version bump             1 migration
+
+  NO CHANGE REQUIRED: XMI consumer, SNS topic, SQS queues, terraform filter
+  policies, CloudEvent shape, message attributes. See section 7.
+
+CRITICAL CONSTRAINT: the outbox table must live in the SAME DATABASE as the
+business row, because one COMMIT only spans one database. A shared central
+events database would re-create the two-commit problem it is meant to remove.
+Therefore: one change_event_outbox table PER SERVICE, in that service's own
+schema.
+
+=============================================================================
+2. WHAT I NEED FROM YOU BEFORE IMPLEMENTING
+=============================================================================
+These are the open inputs. Everything else in this doc is decided.
+
+  D1. Which services get the table in branch 2?
+      Minimum is whichever services currently run with
+      HANK_CHANGE_EVENTS_ENABLED=true. Confirm the list. If it is forebitt
+      only for now, the migration ships to forebitt only and other services
+      pick it up when they enable change events.
+
+  D2. Migration tooling per service. hank ships the MODEL; each service ships
+      the MIGRATION. Confirm whether these repos use hank's AutoMigrate
+      (WithAutoMigrate, hank/db/service.go:17) or a versioned migration
+      directory (picanmix has data_migrations/). I need to know which, per
+      service, to write the migration correctly.
+
+  D3. Poll interval and batch size defaults.
+      Proposed: 5s interval, batch 100. Both env-overridable. Confirm or
+      override -- see section 6 for the connection-holding tradeoff on batch
+      size.
+
+  D4. Retention. How long do PUBLISHED rows stay before the reaper deletes
+      them? Proposed 7 days. This is an audit/debugging tradeoff, not a
+      technical one.
+
+  D5. Do we ship the poisoned-row handling (attempts column) in branch 2, or
+      defer it? Strong recommendation: SHIP IT IN BRANCH 2. See section 5.2 --
+      without it one oversized payload stalls the entire stream indefinitely
+      and looks exactly like an SNS outage.
+
+  D6. Is there an existing Datadog dashboard / monitor for change events I
+      should add the backlog metrics to, or do I create new ones?
+
+=============================================================================
+3. HANK CHANGES
+=============================================================================
+
+3.1 NEW MODEL -- hank/db/change_event_outbox.go
+
+    // ChangeEventOutbox is the transactional outbox row.
+    //
+    // MUST NOT embed hdb.Audit. If it did, inserting an outbox row would fire
+    // AfterCreate -> publishChangeEvent -> insert another outbox row, forever.
+    // gorm v1 dispatches hooks via scope.CallMethod("AfterCreate"); a model
+    // without the embed simply has no such method and the chain stops.
+    // Do not add Audit "for consistency".
+    type ChangeEventOutbox struct {
+        ID          string     `gorm:"primary_key;type:varchar(40)"`
+        Payload     []byte     `gorm:"type:jsonb;not null"`
+        Attributes  []byte     `gorm:"type:jsonb;not null"`
+        RequestID   string     `gorm:"type:varchar(64)"`
+        Attempts    int        `gorm:"not null;default:0"`
+        LastError   string     `gorm:"type:text"`
+        CreatedAt   time.Time  `gorm:"not null"`
+        PublishedAt *time.Time
+    }
+
+    func (ChangeEventOutbox) TableName() string { return "change_event_outbox" }
+
+    Notes on columns:
+      ID          -- IS the CloudEvents id generated at
+                     hank/db/change_events.go:307. Reusing it means the primary
+                     key and the consumer's dedupe key are the same value.
+      Attributes  -- the SNS message attributes built at
+                     hank/db/change_events.go:198-208. They must be persisted,
+                     not recomputed, because SNS subscription filter policies
+                     match on attributes and the relay has no other source.
+      RequestID   -- feeds MessageGroupId. hank/aws/sns derives it from the
+                     request id on the context
+                     (hank/db/change_events.go:211-217), and the relay runs on
+                     a background context, so the value has to travel in the row.
+      Attempts /
+      LastError   -- poisoned-row handling, section 5.2.
+
+3.2 REQUIRED INDEXES (in each service's migration, not in hank)
+
+    -- the poll index. PARTIAL is not optional: without the WHERE clause the
+    -- poll scans a forever-growing table every tick.
+    CREATE INDEX idx_change_event_outbox_unpublished
+        ON change_event_outbox (created_at)
+        WHERE published_at IS NULL;
+
+    -- the reaper index
+    CREATE INDEX idx_change_event_outbox_published_at
+        ON change_event_outbox (published_at)
+        WHERE published_at IS NOT NULL;
+
+3.3 THE ONE-LINE SWAP -- hank/db/change_events.go:278-285
+
+    REMOVE:
+        select {
+        case p.buf <- queuedEvent{ev: p.toCloudEvent(a, orgID, requestID), requestID: requestID}:
+        default:
+            hlog.LogEntryCtx(ctx).WithFields(...).Warn("change event dropped: buffer full")
+        }
+
+    REPLACE WITH:
+        ev := p.toCloudEvent(a, orgID, requestID)
+        payload, err := json.Marshal(ev)
+        if err != nil { log; return }
+        attrs, err := json.Marshal(p.attributesFor(ev))
+        if err != nil { log; return }
+
+        row := ChangeEventOutbox{
+            ID: ev.ID, Payload: payload, Attributes: attrs,
+            RequestID: requestID, CreatedAt: time.Now(),
+        }
+        // scope.DB() IS the caller's transaction handle -- see 3.4.
+        if err := scope.DB().Create(&row).Error; err != nil {
+            // Still logged, never returned. An outbox insert failure must not
+            // roll back the customer's write: the hook runs before
+            // gorm:commit_or_rollback_transaction and a returned error would
+            // roll the whole transaction back.
+            hlog.LogEntryCtx(ctx).Errorf("change event outbox insert failed: %v", err)
+        }
+
+    Refactor note: the attribute construction currently lives inline in
+    publishOne at hank/db/change_events.go:198-208. Extract it to
+    attributesFor(ev) so the hook and the relay agree by construction.
+
+3.4 WHY scope.DB() IS THE TRANSACTION -- verified, do not re-derive
+
+    hank/db/audit.go:230-234  BeginTxDB = db.BeginTx(ctx, opts), so the handle
+                              wraps a *sql.Tx, and InstantSet("context", ctx)
+                              is what claims() later reads.
+    gorm callback_create.go:9-19
+                              gorm:after_create is registered IMMEDIATELY
+                              BEFORE gorm:commit_or_rollback_transaction, so the
+                              hook runs inside the transaction.
+    gorm scope.go:403-411     scope.Begin() only opens a transaction when
+                              SQLDB() is a *sql.DB. Inside BeginTxDB it is
+                              already a *sql.Tx, the assertion fails, no nested
+                              transaction starts.
+    gorm callback_save.go:12-14
+                              CommitOrRollback no-ops because
+                              "gorm:started_transaction" was never set.
+
+    Net: the hook always runs inside whatever transaction is active -- implicit
+    single-statement or explicit BeginTxDB -- and the outbox row joins it.
+
+3.5 NEW RELAY -- hank/db/change_event_relay.go
+
+    func (r *relay) run(ctx context.Context) {
+        backoff := r.interval
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case <-time.After(backoff):
+            }
+            progressed, failed := r.drainAll(ctx)
+            switch {
+            case failed:
+                backoff = min(backoff*2, r.maxBackoff)   // 5s -> 10s -> ... -> 60s
+            default:
+                backoff = r.interval
+                _ = progressed
+            }
+        }
+    }
+
+    func (r *relay) drainOnce(ctx context.Context) (full bool, failed bool) {
+        tx := r.db.Begin()
+        defer func() { if rec := recover(); rec != nil { tx.Rollback() } }()
+
+        var rows []ChangeEventOutbox
+        if err := tx.Raw(`
+            SELECT * FROM change_event_outbox
+            WHERE published_at IS NULL
+              AND attempts < ?
+            ORDER BY created_at
+            LIMIT ?
+            FOR UPDATE SKIP LOCKED`, r.maxAttempts, r.batchSize).Scan(&rows).Error; err != nil {
+            tx.Rollback()
+            return false, true
+        }
+        if len(rows) == 0 { tx.Rollback(); return false, false }
+
+        var done []string
+        var bumped []string
+        var lastErr string
+        for _, row := range rows {
+            pubCtx := context.Background()
+            if row.RequestID != "" {
+                pubCtx = contexts.SetReqIdCtx(pubCtx, row.RequestID)
+            }
+            if err := r.publishRow(pubCtx, row); err != nil {
+                lastErr = err.Error()
+                bumped = append(bumped, row.ID)
+                failed = true
+                break               // stop the batch; ordering is preserved
+            }
+            done = append(done, row.ID)
+        }
+
+        if len(done) > 0 {
+            tx.Exec(`UPDATE change_event_outbox SET published_at = now()
+                     WHERE id IN (?)`, done)
+        }
+        if len(bumped) > 0 {
+            tx.Exec(`UPDATE change_event_outbox
+                     SET attempts = attempts + 1, last_error = ?
+                     WHERE id IN (?)`, lastErr, bumped)
+        }
+        tx.Commit()
+        return len(rows) == r.batchSize, failed
+    }
+
+    THE ORDER AT THE END IS THE WHOLE CONTRACT AND MUST NOT BE INVERTED:
+        publish -> mark : crash in between = DUPLICATE = at-least-once [WANTED]
+        mark -> publish : crash in between = LOSS      = at-most-once  [WRONG]
+    Duplicates are already handled -- XMI dedupes on the CloudEvents id.
+
+    FOR UPDATE SKIP LOCKED is what allows N pods to run relays with no leader
+    election: pod A locks rows 1-100, pod B skips them and takes 101-200.
+    Postgres-specific, which is fine for all three services.
+
+3.6 REAPER -- same file, separate slower ticker (hourly)
+
+    DELETE FROM change_event_outbox
+    WHERE published_at IS NOT NULL
+      AND published_at < now() - interval '<D4> days';
+
+    Delete in bounded chunks (LIMIT 10000 in a loop) so a large first run does
+    not hold a long transaction.
+
+3.7 STARTUP -- hank/db/service.go:73-84
+
+    The change is ONE LINE inside the existing block. Today:
+
+        if ceCfg := ChangeEventConfigFromEnv(); ceCfg.Enabled && ceCfg.TopicARN != "" {
+            if p, err := newPublisher(ceCfg); err != nil {
+                logrus.Errorf("change events disabled: %v", err)
+            } else {
+                go p.run()                                  // <-- line 78
+                database.InstantSet(changeEventsKey, p)      // <-- line 81
+                logrus.Infof("change events enabled: ...")
+            }
+        }
+
+    Line 78 becomes:
+
+                go newRelay(ceCfg, database, p.sns).run(context.Background())
+
+    Everything else stays: same HANK_CHANGE_EVENTS_* opt-in
+    (hank/db/change_events.go:47-57), same never-fatal error handling, same
+    InstantSet at :81 so the hooks reach the publisher via
+    scope.DB().Get(changeEventsKey) at hank/db/change_events.go:237.
+
+    Consequence worth stating plainly: the relay is NOT a new deployment, NOT a
+    sidecar, NOT a cron job, NOT a new service. It is a goroutine inside a
+    process that already exists, started at the line that already starts one.
+
+3.8 NEW ENV VARS (same os.Getenv convention as hank/db/change_events.go:47-57)
+
+    HANK_CHANGE_EVENTS_POLL_INTERVAL   default 5s
+    HANK_CHANGE_EVENTS_BATCH_SIZE      default 100
+    HANK_CHANGE_EVENTS_MAX_ATTEMPTS    default 10
+    HANK_CHANGE_EVENTS_RETENTION_DAYS  default 7
+    HANK_CHANGE_EVENTS_MAX_BACKOFF     default 60s
+
+    HANK_CHANGE_EVENTS_BUFFER_SIZE becomes unused. Keep it parsed and ignored
+    for one release so no deployment breaks on an unknown variable, then remove.
+
+=============================================================================
+3.9 CORRECTION -- WHEN ObjectID IS ACTUALLY POPULATED (affects nothing in the
+     relay, but affects who reaches it)
+=============================================================================
+An earlier framing in this work said "empty struct passed to Update/Delete ->
+no event". That is too coarse and it mispredicts forebitt, so the precise rule
+is recorded here. It does not change any relay code; it changes which writes
+ever produce an outbox row in the first place.
+
+For UPDATES gorm MUTATES scope.Value BEFORE the audit hook runs.
+gorm v1.9.11 callback_update.go:11-20 registers, in order:
+    gorm:assign_updating_attributes    <- :12, FIRST
+    gorm:begin_transaction
+    gorm:before_update
+    gorm:update
+    gorm:after_update                  <- :18, the audit hook
+    gorm:commit_or_rollback_transaction
+assignUpdatingAttributesCallback calls scope.updatedAttrsWithValues(attrs),
+which at gorm scope.go:919 calls field.Set(value) -- writing the update
+payload's fields onto the model instance. convertInterfaceToMap at
+gorm scope.go:897 includes a field only `if !field.IsBlank`.
+
+For DELETES no such step exists. gorm callback_delete.go:9-15 registers only
+begin_transaction, before_delete, delete, after_delete, commit_or_rollback.
+Nothing populates scope.Value.
+
+  CALL SHAPE                                  ObjectID    OUTBOX ROW WRITTEN?
+  ------------------------------------------  ----------  -------------------
+  Updates(<struct with non-blank ID>)         merged in   YES
+  Updates(map{...}) with no "ID" key          blank       no
+  Update("col", val)                          blank       no
+  Delete(&models.X{})                         blank       no
+  Delete(x) where x.ID is set                 present     YES
+  Create(x)                                   set by
+                                              BeforeCreate YES
+
+WHY forebitt WORKS TODAY:
+    forebitt/db/job_v2.go and siblings do
+        tx.Model(&models.DataImportJob{}).Updates(*job)
+    *job carries a non-blank ID, so gorm merges it into the empty literal and
+    the hook sees it. The empty struct in Model() is irrelevant; what matters
+    is what Updates() carries.
+
+WHY THIS MATTERS FOR THE RELAY WORK:
+    The outbox insert at 3.3 replaces the channel send, and it sits AFTER both
+    gates in publishChangeEvent -- the object-type allow-list at
+    hank/db/change_events.go:264-266 and the empty-ObjectID guard at :270-276.
+    So the relay inherits exactly today's event SET. It makes delivery
+    reliable; it does not make a skipped event appear.
+    Widening the event set is branch 3, tracked separately in
+    2026-08-17-aditya-understanding-hank-change-events/2026-08-24_flow_file_changes_evenet.txt.
+
+    DO NOT "fix" the empty-ObjectID guard as part of the relay work. An outbox
+    row with no objectId is worse than no row: it is durable, retried forever,
+    and useless to a consumer whose contract is GET-by-objectId.
+
+=============================================================================
+4. PER-SERVICE CHANGES (forebitt / unhygienix / picanmix)
+=============================================================================
+Per service, exactly two things:
+
+  1. MIGRATION creating change_event_outbox plus the two indexes from 3.2.
+
+     CREATE TABLE change_event_outbox (
+         id            varchar(40) PRIMARY KEY,
+         payload       jsonb       NOT NULL,
+         attributes    jsonb       NOT NULL,
+         request_id    varchar(64),
+         attempts      int         NOT NULL DEFAULT 0,
+         last_error    text,
+         created_at    timestamptz NOT NULL DEFAULT now(),
+         published_at  timestamptz
+     );
+     -- plus both indexes from section 3.2
+
+  2. HANK VERSION BUMP in go.mod. All three currently pin
+     github.com/deklareddotcom/hank v1.23.1-0.20250813161745-c53aa6f6741a
+     (forebitt/go.mod:10, unhygienix/go.mod:16, picanmix/go.mod:12).
+
+NO code change in any service. The hook already calls publishChangeEvent from
+hank/db/audit.go:165/:201/:220; only what that function does internally changes.
+
+DEPLOYMENT ORDER, and it matters:
+     migration FIRST, then the hank bump.
+     If the code ships before the table exists, every audited write logs
+     "change event outbox insert failed: relation does not exist". By design
+     that does NOT roll back customer writes (3.3), so it degrades to today's
+     behaviour minus the SNS publish -- events are lost but nothing breaks.
+     Still, avoid it: run the migration first.
+
+=============================================================================
+5. FAILURE MODES AFTER THE CHANGE
+=============================================================================
+
+5.1 SNS OUTAGE
+    Writes unaffected -- the request path no longer touches SNS at all.
+    Rows accumulate with published_at NULL. The relay retries with exponential
+    backoff. On recovery the next poll drains the backlog oldest-first
+    (ORDER BY created_at) and drainOnce loops immediately while batches come
+    back full. ZERO LOSS, delivery delayed by the outage. No human action.
+
+5.2 POISONED ROW -- the failure mode that needs the attempts column
+    With ORDER BY created_at plus break-on-error, ONE permanently unpublishable
+    row blocks every row behind it FOREVER. Realistic cause: a payload above
+    SNS's 256KB message limit. It will never succeed, the relay retries it every
+    tick, and nothing behind it ever ships. The backlog grows without bound and
+    is INDISTINGUISHABLE from an SNS outage.
+    Handling: increment attempts on failure; the poll excludes
+    attempts >= HANK_CHANGE_EVENTS_MAX_ATTEMPTS; alert on rows that reach the
+    cap. This converts an invisible total stall into a visible, bounded,
+    per-row failure. This is D5 and I recommend shipping it in branch 2.
+
+5.3 POD KILLED
+    After COMMIT, before publish -> rows are on disk; relay resumes on restart.
+    After publish, before UPDATE -> row still NULL, republished, XMI dedupes on
+    the CloudEvents id. That is at-least-once behaving exactly as defined.
+
+5.4 TRANSACTION ROLLBACK
+    The outbox rows roll back with the business rows. The relay never sees them.
+    This is an UPGRADE over today, where the phantom-event case is only
+    mitigated by the consumer read-back contract
+    (hank/db/change_events.go:42-45), not prevented.
+
+=============================================================================
+6. COST AND THE ONE REAL OPERATIONAL RISK
+=============================================================================
+Not net-new: the goroutine already exists (hank/db/service.go:78), the SNS
+calls already happen (hank/db/change_events.go:219), the CloudEvent is already
+built (:288). What changes is where the goroutine reads its work from.
+
+  Added                                    Weight
+  ---------------------------------------  ---------------------------------
+  1 poll per tick                          Negligible WITH the partial index:
+                                           an empty backlog means an empty
+                                           index, sub-ms, returns 0 rows.
+  1 UPDATE per drained batch               One statement per 100 rows.
+  2 inserts per audited write, not 1       THE REAL COST, and it is the HOOK,
+                                           on the request path. The data
+                                           connection example goes from 11
+                                           rows to 22.
+  1 pooled connection held during a drain  See below.
+
+THE ONE REAL RISK -- connection holding, not CPU. FOR UPDATE requires the
+relay's transaction to stay open for the whole batch, INCLUDING the SNS round
+trips. At 100 rows x 50ms that is 5 seconds holding one pooled connection and
+100 row locks. Mitigations: smaller batch (25), or SNS PublishBatch (10 per
+call), or both. This is D3 -- decide deliberately rather than discover it under
+load.
+
+Sizing: at 1000 audited writes/hour that is ~0.3 rows/sec against a relay that
+handles 20/sec at the proposed defaults. Two orders of magnitude of headroom;
+in steady state the relay runs one query returning zero rows and sleeps.
+
+=============================================================================
+7. WHAT DOES NOT CHANGE
+=============================================================================
+  - hank/db/audit.go:165 / :201 / :220 -- the call sites are untouched
+  - the CloudEvent envelope, its id (:307), and the message attributes
+  - the SNS topic, the SQS queues, the terraform filter policies
+  - the XMI consumer: same payload, same dedupe key (CloudEvents id), same
+    read-back-by-objectId contract
+  - the allow-list at hank/db/change_events.go:264-266
+  - the empty-ObjectID skip at :270-276
+
+=============================================================================
+8. OBSERVABILITY TO SHIP WITH IT (non-negotiable)
+=============================================================================
+The entire value proposition is that silent loss became a visible backlog. That
+is only true if someone is looking.
+
+    -- backlog size
+    SELECT count(*) FROM change_event_outbox WHERE published_at IS NULL;
+
+    -- age of the oldest unpublished row  <-- THE BETTER ALERT
+    SELECT now() - min(created_at) FROM change_event_outbox
+      WHERE published_at IS NULL;
+
+    -- poisoned rows
+    SELECT count(*) FROM change_event_outbox
+      WHERE published_at IS NULL AND attempts >= 10;
+
+Count spikes on any burst; AGE only grows when delivery is genuinely stuck.
+Alert on age, graph the count.
+
+=============================================================================
+9. TEST PLAN
+=============================================================================
+  Unit (hank):
+    - hook writes exactly one outbox row per audited create/update/delete
+    - ROLLBACK leaves zero outbox rows            <-- the core new guarantee
+    - COMMIT leaves N rows, all published_at NULL
+    - relay publishes then marks; publish error leaves published_at NULL and
+      increments attempts
+    - relay does NOT mark rows it did not publish (the break case)
+    - poll excludes attempts >= max
+    - outbox insert failure does not roll back the business write
+
+  Integration (localstack SNS, per the existing harness in
+  2026-08-17-aditya-understanding-hank-change-events/2026-08-17_publish15_harness.sh):
+    - create a data connection, assert 11 outbox rows appear then drain to zero
+    - kill SNS mid-drain, assert rows stay NULL, restore, assert they drain
+    - force a rollback, assert zero rows and zero SNS messages
+    - oversized payload, assert attempts climbs to the cap and rows BEHIND it
+      still publish
+
+  Stage:
+    - run with the relay for a day, watch backlog age stay near zero
+    - confirm XMI receives the same events as branch 1 did, with the same ids

@@ -1,0 +1,278 @@
+=============================================================================
+FLOW EVENTS -- COMPLETE CHANGE LIST
+What must change for flow lifecycle events to actually be emitted
+=============================================================================
+Date: 2026-08-24
+Repo root: /Users/adbhar/Documents/project-sprint-understanding-1/
+Target branch: cut from unhygienix master; the one hank line goes in the
+               hank branch-3 PR.
+
+=============================================================================
+0. THE TWO INDEPENDENT GATES -- BOTH MUST PASS
+=============================================================================
+An audited write emits a change event only if it clears BOTH of these. Every
+flow write site today fails at least one, and most fail both. Fixing one
+without the other produces nothing, which is why this has to be done as a pair.
+
+GATE 1 -- claims()          hank/db/audit.go:33-41
+    func claims(scope *gorm.Scope) (*token.AuthClaims, context.Context, bool) {
+        dbContext, _ := scope.DB().Get("context")
+        if dbContext == nil {
+            return nil, nil, false          // <-- gate closes here
+        }
+        ...
+    }
+    "context" is set ONLY by hdb.BeginTxDB (hank/db/audit.go:230-234, via
+    tx.InstantSet("context", ctx)). A bare `db *gorm.DB` handle never has it.
+    The hook then returns at hank/db/audit.go:171 (AfterUpdate) /
+    :152 (AfterCreate) / :207 (AfterDelete) with `if !parsed { return nil }`
+    BEFORE publishChangeEvent is ever reached.
+
+GATE 2 -- ObjectID          hank/db/change_events.go:270-276
+    AuditLog.ObjectID comes from getObjectDetails(scope.Value)
+    (hank/db/audit.go:59 -> :250-262), which JSON-marshals scope.Value and
+    reads the key "ID". If it is empty the event is skipped with
+    Warn("change event skipped: empty ObjectID").
+
+0.1 WHEN IS scope.Value POPULATED? -- the precise rule
+    This is subtler than "don't pass an empty struct", and getting it wrong is
+    why the DataImportJob path works while the flow path does not.
+
+    For UPDATES gorm MUTATES scope.Value before the hook runs.
+    Callback order, gorm v1.9.11 callback_update.go:11-20:
+        gorm:assign_updating_attributes   <- :12, runs FIRST
+        gorm:begin_transaction
+        gorm:before_update
+        gorm:update
+        gorm:after_update                 <- :18, the audit hook
+        gorm:commit_or_rollback_transaction
+    assignUpdatingAttributesCallback -> scope.updatedAttrsWithValues(attrs),
+    which at gorm scope.go:919 calls field.Set(value) -- writing the update
+    payload's fields ONTO the model instance. convertInterfaceToMap at
+    gorm scope.go:897 includes a field only `if !field.IsBlank`.
+
+    For DELETES there is NO such step. gorm callback_delete.go:9-15 registers
+    only begin_transaction, before_delete, delete, after_delete,
+    commit_or_rollback. Nothing ever populates scope.Value.
+
+    RESULTING RULE:
+
+      CALL SHAPE                                  ObjectID   EVENT
+      ------------------------------------------  ---------  --------
+      Updates(<struct with non-blank ID>)         merged in  FIRES
+      Updates(map{...}) with no "ID" key          blank      skipped
+      Update("col", val)                          blank      skipped
+      Delete(&models.X{})                         blank      skipped
+      Delete(x) where x.ID is set                 present    FIRES
+      Create(x)                                   set by
+                                                  BeforeCreate  FIRES
+
+    THIS IS WHY forebitt WORKS:
+        forebitt: tx.Model(&models.DataImportJob{}).Updates(*job)
+        *job carries a non-blank ID, so gorm merges it into the empty struct
+        and the hook sees it. The empty literal in Model() is irrelevant --
+        what matters is what Updates() carries.
+
+    AND WHY unhygienix FLOWS DO NOT:
+        db.Model(&models.CleanRoomFlowRun{}).Scopes(IDScope(id)).Update("job_status", status)
+        The update map is {"job_status": ...}. No ID anywhere. scope.Value.ID
+        stays "". Skipped.
+
+=============================================================================
+1. CHANGE LIST -- unhygienix/db/flows.go
+=============================================================================
+models.CleanRoomFlowRun embeds UUID (unhygienix/models/flows.go:172), and
+models.UUID is `struct { ID string }` (unhygienix/models/audit.go:15-17), so
+the fix is to construct the model WITH its id instead of empty.
+
+Note: a non-zero primary key makes gorm add its own `id = ?` predicate
+(scope.whereSQL / PrimaryKeyZero), so IDScope becomes redundant. Keeping it is
+harmless -- same column, same value -- and is the lower-risk edit. Shown below
+with IDScope retained.
+
+--- 1.1 FLOW RUN TERMINAL STATUS -- the flow-completes / flow-fails event -----
+
+  unhygienix/db/flows.go:1816-1818   UpdateCleanRoomFlowRunStatus
+    BEFORE:
+      func UpdateCleanRoomFlowRunStatus(db *gorm.DB, cleanRoomFlowRunID, status string) error {
+          return db.Model(&models.CleanRoomFlowRun{}).Scopes(IDScope(cleanRoomFlowRunID)).Update("job_status", status).Error
+      }
+    AFTER:
+      func UpdateCleanRoomFlowRunStatus(ctx context.Context, db *gorm.DB, cleanRoomFlowRunID, status string) error {
+          tx := hdb.BeginTxDB(ctx, db, &sql.TxOptions{})          // GATE 1
+          err := tx.Model(&models.CleanRoomFlowRun{UUID: models.UUID{ID: cleanRoomFlowRunID}}).  // GATE 2
+              Scopes(IDScope(cleanRoomFlowRunID)).
+              Update("job_status", status).Error
+          if err != nil { tx.Rollback(); return err }
+          return tx.Commit().Error
+      }
+
+  unhygienix/db/flows.go:1821-1839   UpdateCleanRoomFlowRunStatusAndTimestamps
+    Same treatment. This is the one that carries start_at / end_at, and it is
+    the MOST IMPORTANT single function in this document -- it is what marks a
+    flow run COMPLETED or FAILED. Keep the existing `updates` map; only the
+    Model() argument, the ctx parameter and the tx wrapper change.
+
+  unhygienix/db/flows.go:1842-1847   UpdateCleanRoomFlowRunMessage
+    Same treatment. Carries the failure text, so XMI will want it alongside a
+    failed status.
+
+  unhygienix/db/flows.go:1543-1548   UpdateCleanRoomFlowRunWorkflowID
+  unhygienix/db/flows.go:1550-1555   UpdateCleanRoomFlowRunWorkflowRunID
+    Same pattern. LOWER PRIORITY -- these record Temporal ids at submit time,
+    not lifecycle transitions. Fix for consistency, but they are not events
+    XMI asked for. Consider whether emitting them is noise.
+
+  unhygienix/db/flows.go:1809-1814   SetCleanRoomFlowRunPaused
+    Same pattern (Updates(map) with no ID). Emit only if XMI wants pause/resume
+    as an event -- your call.
+
+  NOT A BUG: unhygienix/db/flows.go:453 is
+      tx.Model(&models.CleanRoomFlowRun{}).Scopes(...).Pluck("id", &runIDs)
+  Pluck is a READ. No hook fires, nothing to fix. (Listed here because it
+  matches the same grep and will otherwise be "fixed" by someone.)
+
+--- 1.2 FLOW DELETED ---------------------------------------------------------
+
+  unhygienix/db/flows.go:427         DeleteCleanRoomFlow
+    The function already RECEIVES crFlow with a populated ID and throws it away.
+    BEFORE:  err := tx.Scopes(IDScope(crFlow.ID)).Delete(&models.CleanRoomFlow{}).Error
+    AFTER:   err := tx.Scopes(IDScope(crFlow.ID)).Delete(crFlow).Error
+    GATE 1 already passes -- :414 opens hdb.BeginTxDB(ctx, db, ...). This is a
+    ONE-WORD FIX and the cheapest event in the whole document.
+
+  unhygienix/db/flows.go:404         DeleteFlow
+    BEFORE:  err = tx.Scopes(IDScope(flowModel.ID)).Delete(&models.Flow{}).Error
+    AFTER:   err = tx.Scopes(IDScope(flowModel.ID)).Delete(flowModel).Error
+    GATE 1 already passes (:325 opens the tx). Same one-word fix.
+
+=============================================================================
+2. CALL-SITE CHANGES -- unhygienix/api/server/flows_run.go
+=============================================================================
+Adding ctx to the db functions in 1.1 means threading it at every call site.
+All of these are inside gRPC handlers that already have a ctx in scope, so
+each is a one-argument edit:
+
+  flows_run.go:217, :269, :528, :580, :887, :1216   UpdateCleanRoomFlowRunStatusAndTimestamps
+  flows_run.go:226, :278, :537, :589, :896          UpdateCleanRoomFlowRunMessage
+  flows_run.go:1823                                 UpdateCleanRoomFlowRunStatus
+
+Run this to confirm the full set before editing -- the list above is from a
+grep and new call sites may have landed:
+
+  grep -rn "UpdateCleanRoomFlowRunStatus(\|UpdateCleanRoomFlowRunStatusAndTimestamps(\|UpdateCleanRoomFlowRunMessage(" \
+    unhygienix/api/server/ unhygienix/db/ | grep -v _test.go
+
+=============================================================================
+3. WHAT CANNOT BE FIXED THIS WAY -- flow NODE failure
+=============================================================================
+  unhygienix/models/flows.go:255-261
+      type FlowNode struct {
+          TimeAudit
+          FlowID           string `gorm:"primaryKey;..."`
+          NodeID           string `gorm:"primaryKey;..."`
+          ReferenceVersion int32
+          FlowVersion      int32
+      }
+
+  TWO blockers, and the second is fatal to the obvious fix:
+
+  (a) No hdb.Audit embed, so no hooks fire at all. Adding it means a migration
+      for four columns (audit_created_at, audit_updated_at,
+      audit_created_by_user, audit_updated_by_user).
+
+  (b) NO `ID` FIELD. The primary key is composite (FlowID, NodeID,
+      FlowVersion). getObjectDetails (hank/db/audit.go:250-262) only ever looks
+      for values["ID"], so even WITH hdb.Audit added and the migration run,
+      every event would still be skipped at GATE 2. Adding Audit is necessary
+      but not sufficient.
+
+  (c) More decisively: FlowNode is a STRUCTURAL / versioning record. A node
+      failing at runtime does not write a FlowNode row at all, so there is
+      nothing to hook even if (a) and (b) were solved.
+
+  WHERE NODE EXECUTION STATE ACTUALLY LIVES:
+      pegleg's Temporal workflow triggers a node and then POLLS unhygienix:
+        pegleg/pegleg-server/src/main/java/com/habu/pegleg/flow/activity/HabuFlowActivities.java
+            @ActivityInterface: triggerNode / triggerEdge / triggerCompletion / markFlowPaused
+        .../flow/activity/HabuFlowActivitiesImpl.java:22-25   holds UnhygienixClient
+        .../flow/activity/HabuFlowActivitiesImpl.java:33      unhygienixClient.triggerNode(...)
+        .../flow/activity/HabuFlowActivitiesImpl.java:96      unhygienixClient.getActivityStatus(...)
+      Pegleg orchestrates and polls; unhygienix owns the row. EMIT FROM
+      UNHYGIENIX, NOT PEGLEG -- emitting from pegleg would duplicate events and
+      put the source on the orchestrator rather than the system of record.
+
+  RECOMMENDED APPROACH FOR NODE FAILURE:
+      Emit at the CleanRoomQuestionRun level. A flow node that is a question
+      node resolves to a clean room question run, and a failure there is the
+      real, already-persisted event. Before committing to this, run the same
+      two-gate audit on CleanRoomQuestionRun:
+        1. does it embed hdb.Audit?
+        2. do its status write sites pass ctx and carry the ID?
+      Expect the same empty-struct pattern; the fix would be identical to 1.1.
+
+=============================================================================
+4. THE ONE HANK CHANGE (goes in the hank PR, not unhygienix)
+=============================================================================
+  hank/db/change_events.go:321-326
+      var businessObjectTypes = map[string]string{
+          "DataImportJob":    "DATA_CONNECTION",
+          "CleanRoomFlow":    "FLOW",
+          "CleanRoomFlowRun": "FLOW_RUN",
+          "Dataset":          "DATASET",
+      }
+
+  FLOW and FLOW_RUN are already mapped -- nothing to do for the flow events.
+
+  ADD for the dataset-assignment work (see the companion deep dive):
+      "CleanRoomQuestionDataSet": "<agreed string>",
+  Without it, screamingSnake (hank/db/change_events.go:368) emits
+  CLEAN_ROOM_QUESTION_DATA_SET, because the capital S in "DataSet" starts a new
+  word. This is a WIRE CONTRACT value -- it lands in `type` and `subject` too --
+  so fix it before XMI writes filter policies against it.
+
+=============================================================================
+5. ORDER OF WORK
+=============================================================================
+  1. flows.go:427 and :404 -- one-word Delete fixes. Flow-deleted events start
+     working immediately; GATE 1 already passes on both. Ship these first as a
+     standalone verification that the pipeline works end to end.
+  2. flows.go:1821 UpdateCleanRoomFlowRunStatusAndTimestamps + its 6 call sites.
+     This is flow completion and failure -- the highest-value event.
+  3. flows.go:1816 and :1842 + their call sites.
+  4. hank businessObjectTypes entry (only needed for the dataset work).
+  5. Audit CleanRoomQuestionRun and decide the node-failure approach.
+  6. flows.go:1543 / :1550 / :1809 only if those transitions are wanted.
+
+=============================================================================
+6. TEST
+=============================================================================
+  After step 1, with HANK_CHANGE_EVENTS_ENABLED=true against localstack (setup
+  in 2026-08-20-aditya-understanding-forebitt-events-sns-config-wiring/2026-08-20_env_audit_localstack_findings.txt,
+  harness in 2026-08-17_publish15_harness.sh):
+    - delete a clean room flow -> expect one FLOW deleted event with a real
+      objectId
+    - grep the service log for "change event skipped: empty ObjectID" -- it
+      must NOT appear for that write
+  After step 2:
+    - submit a flow, let it complete -> expect FLOW_RUN updated with the
+      terminal job_status
+    - force a failure -> expect FLOW_RUN updated plus the run message
+  Regression guard: assert that the log line
+  "change event skipped: empty ObjectID" is absent across the whole run.
+
+=============================================================================
+7. FINDING THE REST -- the two-gate sweep
+=============================================================================
+  GATE 2 candidates (empty struct literals):
+      grep -rn "Delete(&models\.\|Delete(models\.\|Model(&models\." unhygienix/db/ \
+        | grep -v _test.go
+      Any hit where the literal is EMPTY and the id comes only from a Scope is
+      a silently-skipped event -- unless it is a read (Find/Pluck/First/Count).
+
+  GATE 1 candidates (no ctx / no BeginTxDB):
+      grep -rn "^func .*(db \*gorm.DB" unhygienix/db/ | grep -v _test.go
+      Any write function whose signature takes a bare `db *gorm.DB` and no ctx
+      cannot pass claims(), regardless of ObjectID.
+
+  Run both and produce the inventory before scoping how much of this to fix.
