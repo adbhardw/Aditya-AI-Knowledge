@@ -119,7 +119,7 @@ Same model, opposite instruction.
 
 ## FINDING — an unfollowable instruction in Job B
 
-`intent_analyzer.py:226`, inside Job B's system prompt:
+`intent_analyzer.py:227`, inside Job B's system prompt:
 
 > Do not infer PII from column names. PII is only what dataset field flags say.
 

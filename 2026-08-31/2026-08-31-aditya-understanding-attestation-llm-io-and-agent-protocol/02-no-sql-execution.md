@@ -50,11 +50,11 @@ Facts extracted from the tree, and who consumes each:
 
 | Fact | Consumer |
 |---|---|
-| columns named | PII check (`tools/field_policy.py:96`) |
+| columns named | PII check (`tools/field_policy.py:104`) |
 | tables named | Job A prompt (`agents/intent_analyzer.py:359`) |
 | presence of `GROUP BY` | re-identification check (`field_policy.py:132`) |
 | presence of aggregation | `k_min` (`field_policy.py:165`) |
-| `HAVING COUNT(...) >= N` | `k_min` threshold (`field_policy.py:83-88`) |
+| `HAVING COUNT(...) >= N` | `k_min` threshold (`field_policy.py:65-69`) |
 
 ---
 
@@ -71,7 +71,7 @@ looking were permitted.
 ## The cost
 
 Everything rests on the field flags being correct. If a dataset is configured
-without `isPii: true` on a name column, `field_policy.py:106` skips it and the
+without `isPii: true` on a name column, `field_policy.py:111` skips it and the
 query passes. The agent has no independent way to notice — it cannot sample the
 column and observe that it contains names.
 
